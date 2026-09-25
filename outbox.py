@@ -48,24 +48,44 @@ def _watch_leg(watch: dict, plural_key: str, singular_key: str) -> str:
     return str(single) if single is not None else "?"
 
 
+MIN_HISTORY_DAYS = 3  # distinct observation days before calling a fare a low
+
+
 def _history_lines(history, price) -> list[str]:
-    """Dated price context from stored observations (never computed by the
-    relaying agent), so the alert can be checked rather than trusted."""
+    """Dated price context from STORED observations (never computed by the
+    relaying agent), so the alert can be checked rather than trusted.
+
+    The rechecked fare itself is not in the stored history; it is compared
+    against it. "Lowest" is only claimed with enough distinct days of data.
+    """
     if not history:
         return []
+    route = ""
+    if history.get("origin") and history.get("destination"):
+        route = f"{history['origin']} -> {history['destination']}, "
+    scope = (f"{route}{history['depart_from']} to {history['depart_to']} "
+             f"departures, {history['duration']}-night trips, last "
+             f"{history['lookback_days']} days")
     if not history.get("checks"):
-        return ["History: no earlier checks for these dates yet."]
-    head = (f"History ({history['depart_from']} to {history['depart_to']} "
-            f"departures, {history['duration']}-night trips, "
-            f"{history['checks']} checks since {history['since']}):")
-    verdict = " = lowest seen" if price <= history["low"] else ""
-    stats = (f"  {history['lookback_days']}-day low ${history['low']:,.0f} "
-             f"({history['low_day']}) | median daily low "
-             f"${history['median_daily_low']:,.0f} | this fare "
-             f"${price:,.0f}{verdict}")
+        return [f"Stored history ({scope}): none yet."]
+    head = (f"Stored history ({scope}): {history['checks']} fares seen on "
+            f"{history['days']} day(s) since {history['since']}.")
+    stats = (f"  Low ${history['low']:,.0f} ({history['low_day']}) | median "
+             f"daily low ${history['median_daily_low']:,.0f}")
     recent = "  Recent daily lows: " + " | ".join(
         f"{day[5:]} ${p:,.0f}" for day, p in history["recent"])
-    return [head, stats, recent]
+    if history["days"] < MIN_HISTORY_DAYS:
+        verdict = (f"  This recheck ${price:,.0f}: too little history "
+                   f"({history['days']} day(s)) to call it a low.")
+    elif price < history["low"]:
+        verdict = (f"  This recheck ${price:,.0f}: below every stored fare "
+                   f"in this window.")
+    elif price == history["low"]:
+        verdict = (f"  This recheck ${price:,.0f}: ties the stored low.")
+    else:
+        verdict = (f"  This recheck ${price:,.0f}: "
+                   f"${price - history['low']:,.0f} above the stored low.")
+    return [head, stats, recent, verdict]
 
 
 def render_alert_message(watch, confirmation, fingerprint, first_seen_at,
@@ -118,8 +138,12 @@ def enqueue_from_confirmation(db, watch, candidate, confirmation) -> tuple[str, 
     message = render_alert_message(
         watch, confirmation, candidate["fingerprint"],
         store.first_seen(db, candidate["fingerprint"]),
-        history=store.price_history(db, watch_id, confirmation["depart_date"],
-                                    confirmation["return_date"]))
+        history=store.price_history(
+            db, watch_id, confirmation["depart_date"],
+            confirmation["return_date"],
+            origin=confirmation.get("origin") or candidate.get("origin"),
+            destination=(confirmation.get("destination")
+                         or candidate.get("destination"))))
     return store.enqueue_alert(
         db,
         alert_id=alert_id,
@@ -178,7 +202,10 @@ def recheck_retries(db, watches, guard, slot, deadline_fn=None) -> dict:
                 store.first_seen(db, row["fingerprint"]),
                 history=store.price_history(
                     db, row["watch_id"], confirmation["depart_date"],
-                    confirmation["return_date"]))
+                    confirmation["return_date"],
+                    origin=confirmation.get("origin") or row.get("origin"),
+                    destination=(confirmation.get("destination")
+                                 or row.get("destination"))))
             store.update_outbox_message(db, row["alert_id"], message,
                                         confirmation["price_usd"])
             retry_ids.append(row["alert_id"])

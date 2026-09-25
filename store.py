@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS observations (
     observed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_obs_watch_fp ON observations (watch_id, fingerprint, observed_at);
+CREATE INDEX IF NOT EXISTS idx_obs_watch_time ON observations (watch_id, observed_at);
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     observation_id INTEGER NOT NULL REFERENCES observations(id),
@@ -523,13 +524,16 @@ def latest_health(db: sqlite3.Connection, check_name: str) -> sqlite3.Row | None
 
 
 def price_history(db: sqlite3.Connection, watch_id: str, depart_date: str,
-                  return_date: str, *, lookback_days: int = 14,
+                  return_date: str, *, origin: str | None = None,
+                  destination: str | None = None, lookback_days: int = 14,
                   depart_slack_days: int = 3, recent: int = 5) -> dict:
-    """Observed prices for the same watch, departures within +-slack days of
+    """Observed prices for the same watch and (when given) the same
+    origin->destination airport pair, departures within +-slack days of
     *depart_date*, and the same trip length, over the last *lookback_days*.
 
     Everything comes from stored observations, so an alert can show real,
-    dated numbers instead of a claim. Daily lows are per UTC observation day.
+    dated numbers instead of a claim. Daily lows are per UTC observation day
+    (observed_at is always written as canonical UTC by utcnow_iso/run_start).
     """
     dep = datetime.fromisoformat(depart_date).date()
     ret = datetime.fromisoformat(return_date).date()
@@ -538,20 +542,25 @@ def price_history(db: sqlite3.Connection, watch_id: str, depart_date: str,
     hi = (dep + timedelta(days=depart_slack_days)).isoformat()
     since = (datetime.now(timezone.utc)
              - timedelta(days=lookback_days)).isoformat()
+    route_sql, route_args = "", []
+    if origin and destination:
+        route_sql = " AND origin = ? AND destination = ?"
+        route_args = [origin, destination]
     rows = db.execute(
-        """SELECT substr(observed_at, 1, 10) AS day, MIN(price_usd) AS low,
-                  COUNT(*) AS n
-           FROM observations
-           WHERE watch_id = ? AND price_usd IS NOT NULL
-             AND observed_at >= ? AND depart_date BETWEEN ? AND ?
-             AND CAST(julianday(return_date) - julianday(depart_date)
-                      AS INTEGER) = ?
-           GROUP BY day ORDER BY day""",
-        (watch_id, since, lo, hi, duration)).fetchall()
+        f"""SELECT substr(observed_at, 1, 10) AS day, MIN(price_usd) AS low,
+                   COUNT(*) AS n
+            FROM observations
+            WHERE watch_id = ? AND price_usd IS NOT NULL
+              AND observed_at >= ? AND depart_date BETWEEN ? AND ?
+              AND CAST(julianday(return_date) - julianday(depart_date)
+                       AS INTEGER) = ?{route_sql}
+            GROUP BY day ORDER BY day""",
+        (watch_id, since, lo, hi, duration, *route_args)).fetchall()
     daily = [(r["day"], float(r["low"])) for r in rows]
     checks = sum(int(r["n"]) for r in rows)
     out = {"lookback_days": lookback_days, "depart_from": lo, "depart_to": hi,
-           "duration": duration, "checks": checks, "daily_lows": daily}
+           "duration": duration, "checks": checks, "days": len(daily),
+           "daily_lows": daily, "origin": origin, "destination": destination}
     if daily:
         low_day, low = min(daily, key=lambda x: (x[1], x[0]))
         lows = sorted(p for _, p in daily)
