@@ -47,13 +47,12 @@ from outbox import (  # noqa: E402
     enqueue_from_confirmation,
     recheck_retries,
 )
-from poller import broad_scan, narrow_query  # noqa: E402
+from poller import narrow_query  # noqa: E402
 from scorer import score_new_observations  # noqa: E402
 from store import (  # noqa: E402
     DeadlineExceeded,
     acquire_lock,
     add_alert,
-    add_broad_scan,
     add_health,
     claim_slot,
     deadline_streak,
@@ -388,21 +387,20 @@ def _add_scheduled(p) -> None:
 
 def cmd_broad(args, db, watches, guard, *, drained=None, deadline_fn=None,
               slot=None):
-    w = get_watch(watches, args.watch)
-    _check_deadline(deadline_fn)
-    combos = broad_scan(w, duration_days=args.duration)
-    summary = {"watch": w["id"], "duration_days": args.duration,
-               "combos": combos if combos else None,
-               "unknown": combos is None}
-    if combos:
-        now = utcnow_iso()
-        for c in combos:
-            add_broad_scan(db, watch_id=w["id"], depart_date=c["depart_date"],
-                           return_date=c["return_date"], trip_days=args.duration,
-                           price_usd=c["price_usd"], observed_at=now)
-        summary["combos"] = combos[:10]
-        summary["total_combos"] = len(combos)
-    print(json.dumps(summary, indent=2))
+    slot = slot if slot is not None else slot_id()
+    # Alerts drained at the start of the run are relayed on every path.
+    handoff = _handoff_payload(db, slot, _ids(drained))
+    # A flex-date sweep sends one request per date (up to 93 per chunk, 180+
+    # for the 3-9 month window), which exceeds the whole background budget
+    # (48/day) and would stop mid-sweep having persisted nothing. Collection
+    # uses the sentinel/background grid instead; broad stays off until it is
+    # rebuilt as resumable, budget-sized chunks.
+    print(json.dumps({"status": "noop", "reason": "broad_scan_disabled",
+                      "detail": "a sweep exceeds the daily background "
+                                "budget; the sentinel/background grid "
+                                "covers the window instead",
+                      "watch": getattr(args, "watch", None),
+                      "handoff": handoff}, indent=2))
     return 0
 
 

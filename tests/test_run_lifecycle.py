@@ -241,6 +241,25 @@ class RunLifecycleTests(unittest.TestCase):
         store.finish_slot(db, 116, "deadline")
         self.assertEqual(store.deadline_streak(db, max_gap=4), 1)
 
+    def test_broad_emits_drained_and_sends_nothing(self):
+        """broad is disabled (a sweep exceeds the background budget) but
+        still prints the alerts drained at the start of the run."""
+        import contextlib
+        import io
+        import json as _json
+        db, guard = self._ctx()
+        seed_pending(db)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = fm_run.run_guarded("broad", args_for("broad", False), db,
+                                    [WATCH], guard, fm_run.cmd_broad)
+        self.assertEqual(rc, 0)
+        doc = _json.loads(out.getvalue())
+        self.assertEqual(doc["reason"], "broad_scan_disabled")
+        self.assertEqual([a["alert_id"] for a in doc["handoff"]["alerts"]],
+                         ["w1:drain1"])
+        self.assertEqual(guard.spent_today(), 0)
+
     def test_deadline_shorter_than_lock_ttl(self):
         """The deadline must stay below the lock TTL so a stopped run
         never wedges the lock for the next slot."""

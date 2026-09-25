@@ -683,47 +683,87 @@ class PrepareHandoffV3Tests(unittest.TestCase):
         return store.outbox_get(db, aid)
 
     def test_handoff_count_cap_and_slot_gap_inside_update(self):
+        """Within one price event the gap and the count cap are enforced in
+        the UPDATE; a rearm (meaningful drop) is a NEW event with a fresh
+        allowance, so it can never get stuck pending (audit #11)."""
         db, _ = fresh_db(self)
         aid = outbox.make_alert_id("w1", "2026-W40")
         seed_outbox_row(db, aid, 495.0)
         store.prepare_handoff(db, 100, [aid])  # handoff_count = 1
-        row = self._rearm(db, aid, 460.0)      # meaningful drop -> pending
-        self.assertEqual(row["state"], "pending")
-        self.assertEqual(row["handoff_count"], 1)
-
-        # Slot 101: last handoff (slot 100) is inside the 3-slot gap.
+        # Same event back to pending (e.g. a retried state): gap applies.
+        db.execute("UPDATE outbox SET state='pending' WHERE alert_id=?", (aid,))
+        db.commit()
         self.assertEqual(store.prepare_handoff(db, 101, [aid]), [])
-        self.assertEqual(store.outbox_get(db, aid)["state"], "pending")
-        self.assertEqual(store.outbox_get(db, aid)["handoff_count"], 1)
-
-        # Slot 104: gap satisfied -> prepared, count becomes 2.
         prepared = store.prepare_handoff(db, 104, [aid])
         self.assertEqual([r["alert_id"] for r in prepared], [aid])
-        row = store.outbox_get(db, aid)
-        self.assertEqual(row["state"], "handoff_prepared")
-        self.assertEqual(row["handoff_count"], 2)
-
-        # Re-arm again, then prepare at slot 110: the count cap (2) blocks it.
-        row = self._rearm(db, aid, 425.0)
-        self.assertEqual(row["handoff_count"], 2)
+        self.assertEqual(store.outbox_get(db, aid)["handoff_count"], 2)
+        # Cap: a third handoff of the same event is blocked.
+        db.execute("UPDATE outbox SET state='pending' WHERE alert_id=?", (aid,))
+        db.commit()
         self.assertEqual(store.prepare_handoff(db, 110, [aid]), [])
-        row = store.outbox_get(db, aid)
-        self.assertEqual(row["state"], "pending")      # untouched
-        self.assertEqual(row["handoff_count"], 2)      # not incremented
+        self.assertEqual(store.outbox_get(db, aid)["handoff_count"], 2)
+        # A meaningful drop re-arms as a new event: fresh count, no gap.
+        row = self._rearm(db, aid, 440.0)
+        self.assertEqual((row["state"], row["handoff_count"],
+                          row["prepared_slot"]), ("pending", 0, None))
+        prepared = store.prepare_handoff(db, 111, [aid])
+        self.assertEqual([r["alert_id"] for r in prepared], [aid])
 
-    def test_drain_respects_gap_and_cap(self):
+    def test_drain_returns_only_rows_it_prepared(self):
+        """Draining twice in one slot does not re-emit rows the first
+        drain already prepared (audit #9)."""
+        db, _ = fresh_db(self)
+        a1 = outbox.make_alert_id("w1", "2026-W40")
+        a2 = outbox.make_alert_id("w1", "2026-W41")
+        seed_outbox_row(db, a1, 495.0)
+        first = outbox.drain_pending(db, 100)
+        self.assertEqual([r["alert_id"] for r in first], [a1])
+        seed_outbox_row(db, a2, 480.0)
+        second = outbox.drain_pending(db, 100)
+        self.assertEqual([r["alert_id"] for r in second], [a2])
+
+    def test_retired_week_rearms_on_new_deal(self):
         db, _ = fresh_db(self)
         aid = outbox.make_alert_id("w1", "2026-W40")
         seed_outbox_row(db, aid, 495.0)
         store.prepare_handoff(db, 100, [aid])
-        self._rearm(db, aid, 460.0)
-        # Drain inside the gap prepares nothing...
-        self.assertEqual(outbox.drain_pending(db, 101), [])
-        self.assertEqual(store.outbox_get(db, aid)["state"], "pending")
-        # ...and past the gap it prepares.
-        drained = outbox.drain_pending(db, 104)
-        self.assertEqual([r["alert_id"] for r in drained], [aid])
-        self.assertEqual(store.outbox_get(db, aid)["handoff_count"], 2)
+        self.assertTrue(store.retire_outbox(db, aid, "gone"))
+        row = self._rearm(db, aid, 490.0)  # not a big drop, but week retired
+        self.assertEqual((row["state"], row["handoff_count"]), ("pending", 0))
+
+    def test_confirmed_week_rearms_only_on_meaningful_drop(self):
+        db, _ = fresh_db(self)
+        aid = outbox.make_alert_id("w1", "2026-W40")
+        seed_outbox_row(db, aid, 495.0)
+        store.prepare_handoff(db, 100, [aid])
+        self.assertTrue(store.set_outbox_user_confirmed(db, aid, "yaozu"))
+        _, action = store.enqueue_alert(
+            db, alert_id=aid, watch_id="w1", fingerprint=FP, price_usd=490.0,
+            depart_date=DEP, return_date=RET, airline="UA", stops=0,
+            booking_url="", message_text="m", origin="SFO", destination="JFK")
+        self.assertEqual(action, "deduped")
+        self.assertEqual(store.outbox_get(db, aid)["state"], "user_confirmed")
+        row = self._rearm(db, aid, 450.0)
+        self.assertEqual((row["state"], row["confirmed_by"]), ("pending", None))
+
+    def test_confirm_and_retire_race(self):
+        """Expected-state predicates live in the UPDATE: after a human
+        confirmation lands, a stale retire does nothing (audit #21)."""
+        db, _ = fresh_db(self)
+        aid = outbox.make_alert_id("w1", "2026-W40")
+        seed_outbox_row(db, aid, 495.0)
+        store.prepare_handoff(db, 100, [aid])
+        real_get = store.outbox_get
+        stale = real_get(db, aid)  # read BEFORE the confirmation
+        self.assertTrue(store.set_outbox_user_confirmed(db, aid, "yaozu"))
+        from unittest import mock
+        with mock.patch.object(store, "outbox_get", return_value=stale):
+            self.assertFalse(store.retire_outbox(db, aid, "stale"))
+            self.assertFalse(store.update_outbox_state(
+                db, aid, "relay_attempted_unconfirmed"))
+        row = real_get(db, aid)
+        self.assertEqual((row["state"], row["confirmed_by"]),
+                         ("user_confirmed", "yaozu"))
 
     def test_retry_cap_is_two(self):
         db, _ = fresh_db(self)

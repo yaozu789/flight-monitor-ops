@@ -607,10 +607,11 @@ def enqueue_alert(db: sqlite3.Connection, *, alert_id: str, watch_id: str,
                   destination: str | None = None) -> tuple[str, str]:
     """Durably queue an alert as pending.
 
-    Idempotent on alert_id. If the same deal is already outboxed and the new
-    price dropped by at least max($15, 5%) below the last outboxed price, the
-    row re-arms to pending (meaningful-drop dedup). Otherwise the duplicate
-    is ignored. Returns (alert_id, action) with action in
+    Idempotent on alert_id. An existing week re-arms to pending as a new
+    event (fresh retry allowance) when the new price is at least
+    max($15, 5%) below the last outboxed price -- or unconditionally when
+    the week's earlier alert was retired. Otherwise the duplicate is
+    ignored. Returns (alert_id, action) with action in
     {"inserted", "deduped", "rearmed"}.
     """
     now = utcnow_iso()
@@ -629,30 +630,37 @@ def enqueue_alert(db: sqlite3.Connection, *, alert_id: str, watch_id: str,
              price_usd, now, now))
         db.commit()
         return alert_id, "inserted"
-    if row["state"] in ("pending", "handoff_prepared",
-                        "relay_attempted_unconfirmed"):
-        baseline = row["last_price_usd"] if row["last_price_usd"] is not None \
-            else row["price_usd"]
-        if baseline is None:
-            return alert_id, "deduped"
+    baseline = row["last_price_usd"] if row["last_price_usd"] is not None \
+        else row["price_usd"]
+    if row["state"] == "retired":
+        # The earlier fare disappeared (or kept rechecking unknown); a newly
+        # verified under-cap fare that week is a new event.
+        rearm = True
+    elif baseline is None:
+        rearm = False
+    else:
+        # Active or user-confirmed: only a meaningful drop is news.
         threshold = max(SIGNIFICANT_DROP_USD, SIGNIFICANT_DROP_PCT * baseline)
-        if price_usd <= baseline - threshold:
-            # A cheaper deal in the same departure week may be a different
-            # itinerary: replace ALL itinerary fields, not just the price,
-            # so later rechecks verify the flight actually being alerted.
-            db.execute(
-                """UPDATE outbox
-                   SET state='pending', fingerprint=?, origin=?, destination=?,
-                       depart_date=?, return_date=?, airline=?, stops=?,
-                       price_usd=?, booking_url=?, message_text=?,
-                       last_price_usd=?, updated_at=?
-                   WHERE alert_id=?""",
-                (fingerprint, origin, destination, depart_date, return_date,
-                 airline, stops, price_usd, booking_url, message_text,
-                 price_usd, now, alert_id))
-            db.commit()
-            return alert_id, "rearmed"
-    return alert_id, "deduped"
+        rearm = price_usd <= baseline - threshold
+    if not rearm:
+        return alert_id, "deduped"
+    # A new price event: replace ALL itinerary fields (it may be a different
+    # flight) and start a fresh retry allowance. Keeping the old
+    # handoff_count left a row that had used its 2 handoffs stuck pending.
+    db.execute(
+        """UPDATE outbox
+           SET state='pending', fingerprint=?, origin=?, destination=?,
+               depart_date=?, return_date=?, airline=?, stops=?,
+               price_usd=?, booking_url=?, message_text=?,
+               last_price_usd=?, handoff_count=0, prepared_slot=NULL,
+               prepared_at=NULL, unknown_count=0, confirmed_by=NULL,
+               updated_at=?
+           WHERE alert_id=?""",
+        (fingerprint, origin, destination, depart_date, return_date,
+         airline, stops, price_usd, booking_url, message_text,
+         price_usd, now, alert_id))
+    db.commit()
+    return alert_id, "rearmed"
 
 
 def outbox_get(db: sqlite3.Connection, alert_id: str) -> dict | None:
@@ -687,29 +695,32 @@ def prepare_handoff(db: sqlite3.Connection, slot: int,
     where_extra = ("AND handoff_count < ? "
                    "AND (prepared_slot IS NULL OR prepared_slot <= ?)")
     params_extra = (RETRY_MAX_ATTEMPTS, slot - RETRY_MIN_SLOT_GAP)
+    # RETURNING: only rows THIS call transitioned. Selecting every
+    # prepared row of the slot re-emitted rows prepared by an earlier call
+    # in the same slot (duplicate relays).
     if new_ids is None:
-        db.execute(
+        cur = db.execute(
             f"""UPDATE outbox
                SET state='handoff_prepared', handoff_count=handoff_count + 1,
                    prepared_slot=?, prepared_at=?, updated_at=?
-               WHERE state='pending' {where_extra}""",
+               WHERE state='pending' {where_extra}
+               RETURNING *""",
             (slot, now, now, *params_extra))
     elif new_ids:
         marks = ",".join("?" for _ in new_ids)
-        db.execute(
+        cur = db.execute(
             f"""UPDATE outbox
                 SET state='handoff_prepared', handoff_count=handoff_count + 1,
                     prepared_slot=?, prepared_at=?, updated_at=?
                 WHERE state='pending' {where_extra}
-                  AND alert_id IN ({marks})""",
+                  AND alert_id IN ({marks})
+                RETURNING *""",
             (slot, now, now, *params_extra, *new_ids))
     else:
         return []
+    rows = [dict(r) for r in cur.fetchall()]
     db.commit()
-    return [dict(r) for r in db.execute(
-        """SELECT * FROM outbox
-           WHERE state='handoff_prepared' AND prepared_slot=?
-           ORDER BY price_usd ASC""", (slot,))]
+    return sorted(rows, key=lambda r: (r["price_usd"] is None, r["price_usd"]))
 
 
 def reprepare_retries(db: sqlite3.Connection, slot: int,
@@ -765,10 +776,13 @@ def update_outbox_state(db: sqlite3.Connection, alert_id: str, new_state: str,
         return False
     if new_state == "user_confirmed" and actor != "user":
         return False
-    db.execute("UPDATE outbox SET state=?, updated_at=? WHERE alert_id=?",
-               (new_state, utcnow_iso(), alert_id))
+    # Expected-state predicate IN the update: a concurrent change (e.g. a
+    # human confirmation) between the read above and this write wins.
+    cur = db.execute(
+        "UPDATE outbox SET state=?, updated_at=? WHERE alert_id=? AND state=?",
+        (new_state, utcnow_iso(), alert_id, row["state"]))
     db.commit()
-    return True
+    return cur.rowcount > 0
 
 
 def note_unknown_recheck(db: sqlite3.Connection, alert_id: str) -> int:
@@ -801,11 +815,14 @@ def set_outbox_user_confirmed(db: sqlite3.Connection, alert_id: str,
         return False
     if row["state"] not in ("handoff_prepared", "relay_attempted_unconfirmed"):
         return False
-    db.execute(
+    cur = db.execute(
         """UPDATE outbox SET state='user_confirmed', confirmed_by=?,
-           updated_at=? WHERE alert_id=?""",
+           updated_at=? WHERE alert_id=?
+             AND state IN ('handoff_prepared', 'relay_attempted_unconfirmed')""",
         (actor, utcnow_iso(), alert_id))
     db.commit()
+    if cur.rowcount == 0:
+        return False  # retired or changed concurrently
     add_health(db, "outbox_confirm", True,
                f"{alert_id} confirmed by {actor}")
     return True
@@ -834,9 +851,14 @@ def retire_outbox(db: sqlite3.Connection, alert_id: str, reason: str) -> bool:
     if row["state"] not in ("pending", "handoff_prepared",
                             "relay_attempted_unconfirmed"):
         return False
-    db.execute("UPDATE outbox SET state='retired', updated_at=? WHERE alert_id=?",
-               (utcnow_iso(), alert_id))
+    cur = db.execute(
+        """UPDATE outbox SET state='retired', updated_at=? WHERE alert_id=?
+             AND state IN ('pending', 'handoff_prepared',
+                           'relay_attempted_unconfirmed')""",
+        (utcnow_iso(), alert_id))
     db.commit()
+    if cur.rowcount == 0:
+        return False  # confirmed (terminal) or changed concurrently
     add_health(db, "outbox_retire", True, f"{alert_id}: {reason}")
     return True
 
