@@ -56,9 +56,11 @@ class FakeResponse:
     """Duck-typed stand-in for curl_cffi's Response (only what fli reads)."""
 
     def __init__(self, text: str = FIXTURE_HTML, status_code: int = 200,
-                 headers: dict | None = None):
+                 headers: dict | None = None,
+                 url: str = "https://www.google.com/travel/flights"):
         self.text = text
         self.status_code = status_code
+        self.url = url
         self.headers = headers or {}
 
     def raise_for_status(self) -> None:
