@@ -1,13 +1,23 @@
 # How changes land
 
-1. **Muse** works on a branch (`muse/<topic>`), commits, pushes, and opens a pull request.
-2. **CI** (`.github/workflows/tests.yml`) runs the offline test suite on a clean checkout. Test counts come from CI, not from anyone's report.
-3. **Claude / Codex** review the PR diff.
-4. **Yaozu merges.** Nobody else merges to `main`.
-5. **Muse deploys only a merged commit from `main`** to its runtime, and only after Yaozu says so. No auto-pull, no schedule changes without approval.
+| Role | Who |
+|---|---|
+| Write code + tests, open PRs | **Claude Code** (on Yaozu's Mac) |
+| Main code review | **Codex** (gpt-6-astra); **Cursor** (non-Claude model) as backup |
+| Runtime-fit review, deploy, run, report | **Muse** (hosts the monitor) |
+| Test verdict | **CI** (`.github/workflows/tests.yml`, clean checkout) |
+| Decisions, deploy approval | **Yaozu** |
+
+1. Claude works on a `claude/<topic>` branch and opens a PR.
+2. CI runs the offline suite. The pass/fail count comes from CI, not from anyone's report.
+3. Codex reviews (Cursor if Codex is out of quota). The author is never the main reviewer. Findings get fixed on the branch and re-reviewed until "no blocking objections".
+4. Claude merges once CI is green and review has no blocking objections. Yaozu may merge or veto at any point.
+5. Muse reviews for runtime fit when a change touches how it runs the monitor (paths, Python version, how the scheduled turn invokes `run.py`). Muse reports runtime facts (quota, logs, whether runs fired) as **GitHub issues**.
+6. **Muse deploys only a merged `main` commit, and only after Yaozu approves.** No auto-pull. No schedule, destination, limit, or credential change without Yaozu's OK.
 
 Rules:
-- Never commit `data/`, `*.db`, `.env`, tokens, or the healthchecks ping URL (runtime env var `HEALTHCHECKS_PING_URL` only).
-- Test fixtures must live inside this repo. No absolute paths to any machine.
+- Never commit `data/`, `*.db`, `.env`, tokens, or the healthchecks ping URL. The URL lives only in the runtime env var `HEALTHCHECKS_PING_URL`.
+- Test fixtures live inside this repo. No absolute paths to any machine.
 - Dependencies go in `requirements.txt` with exact pins.
-- Design source of truth: `Flight_monitor_final_spec.md` (kept outside the repo in Yaozu's project folder; ask for changes via PR description).
+- A new test must fail on the code before its fix.
+- Design source of truth: `Flight_monitor_final_spec.md` in Yaozu's project folder (outside this repo).
