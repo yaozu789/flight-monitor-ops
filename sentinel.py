@@ -313,6 +313,13 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
 
 # ---------------------------------------------------------------- pacing
 
+def daily_headroom(guard) -> int:
+    """Non-verify attempts still spendable today (the verify reserve is
+    held back for the verifier)."""
+    return (DAILY_CEILING - guard.spent_today()
+            - max(0, VERIFY_RESERVE - guard.spent_today("verify")))
+
+
 def per_run_allowance(guard, slot, cadence_slots: int = 1) -> int:
     """Adaptive pacing across the 48 daily slots.
 
@@ -322,8 +329,7 @@ def per_run_allowance(guard, slot, cadence_slots: int = 1) -> int:
     when the budget is exhausted (remaining <= 0) the allowance is 0, so
     the run stops instead of burning a floor of 4 attempts it cannot afford.
     """
-    remaining = (DAILY_CEILING - guard.spent_today()
-                 - max(0, VERIFY_RESERVE - guard.spent_today("verify")))
+    remaining = daily_headroom(guard)
     if remaining <= 0:
         return 0
     # Runs left today at the configured cadence (every cadence_slots
@@ -502,7 +508,8 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
 
     order = [lambda: sentinels(sentinel_share), bursts, background,
              lambda: sentinels(allowance)]
-    if slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N:
+    if (slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N
+            and daily_headroom(guard) >= 1 + DETAIL_TOP_N):
         # A background check needs 1 + DETAIL_TOP_N sends; the ~3-attempt
         # share of a 30-minute run never fits one. Odd runs borrow up to a
         # whole check (the daily ceiling and verify reserve still apply in

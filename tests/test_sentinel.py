@@ -314,6 +314,15 @@ class TestCollectPriority(SentinelTestBase):
         # it uses it all and no partial sentinel check starts after it.
         self.assertEqual(calls, [("background", 3)])
 
+    def test_no_borrow_when_day_nearly_spent(self):
+        """With under one whole background check of daily headroom left,
+        an odd slot does not borrow (it would stop mid-check)."""
+        g = self.guard()
+        self.patch(sentinel, "daily_headroom", lambda guard: 3)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 3)
+        sentinel.collect(self.db, g, {}, slot=5, run_start=store.utcnow_iso())
+        self.assertEqual(g.run_allowance(), 3)
+
     def test_skipped_cell_is_retried_in_leftover_pass(self):
         """A cell that did not fit the first sentinel share is still
         checked by the leftover pass (it was never started)."""
