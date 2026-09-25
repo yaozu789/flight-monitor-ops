@@ -184,13 +184,16 @@ class Stage4OrchestrationTests(unittest.TestCase):
         self.assertEqual(rows[0]["state"], "handoff_prepared")
         self.assertEqual(rows[0]["prepared_slot"], slot)
 
-    def _run_with_stop(self, stop_exc, trigger_error=None):
+    def _run_with_stop(self, stop_exc, trigger_error=None, extra_patches=(),
+                       seed=None):
         """Drive run_guarded(cmd_check) where the 2nd verification raises
         *stop_exc*; return (rc, parsed stdout JSON docs, db)."""
         import contextlib
         import io
         import json as _json
         db, guard = _ctx(self)
+        if seed is not None:
+            seed(db)
 
         def collect_writes_two(db_, guard_, groups, slot_, run_start, **kw):
             for price, dep in ((400.0, "2026-11-01"), (450.0, "2026-12-01")):
@@ -226,6 +229,7 @@ class Stage4OrchestrationTests(unittest.TestCase):
             patches.append(mock.patch.object(
                 fm_sentinel, "detect_under_cap_triggers",
                 side_effect=trigger_error))
+        patches.extend(extra_patches)
         out = io.StringIO()
         with contextlib.ExitStack() as st:
             for p_ in patches:
@@ -272,6 +276,63 @@ class Stage4OrchestrationTests(unittest.TestCase):
         self.assertEqual(self._relayed_prices(docs), [400.0])
         h = store.latest_health(db, "burst_triggers")
         self.assertFalse(h["ok"])
+
+    def test_retry_phase_stop_emits_drained(self):
+        """A stop in the RETRY pass (before any new verification) still
+        prints the alerts drained at the start of the run."""
+        from budget import BudgetExhausted
+
+        def seed(db):
+            store.enqueue_alert(
+                db, alert_id="w1:drained", watch_id="w1", fingerprint="fpd",
+                price_usd=380.0, depart_date="2026-10-01",
+                return_date="2026-10-08", airline="UA", stops=0,
+                booking_url="https://example.invalid/b",
+                message_text="drained deal", origin="SFO", destination="JFK")
+
+        rc, docs, db = self._run_with_stop(
+            BudgetExhausted("category", "retry_reserve", 12, 12), seed=seed,
+            extra_patches=[mock.patch.object(
+                fm_run, "recheck_retries",
+                side_effect=BudgetExhausted("category", "retry_reserve",
+                                            12, 12))])
+        self.assertEqual(rc, 0)
+        self.assertEqual(docs[-1]["reason"], "budget_exhausted")
+        self.assertEqual(self._relayed_prices(docs), [380.0])
+
+    def test_cleanup_health_failure_does_not_mask_stop(self):
+        """Trigger write AND its health note both fail during stop cleanup:
+        the budget stop still decides the outcome and the deal is emitted."""
+        from budget import BudgetExhausted
+        real_add_health = fm_run.add_health
+
+        def flaky_health(db_, kind, ok, detail):
+            if kind == "burst_triggers":
+                raise RuntimeError("health write failed")
+            return real_add_health(db_, kind, ok, detail)
+
+        rc, docs, db = self._run_with_stop(
+            BudgetExhausted("daily", "verify", 150, 150),
+            trigger_error=RuntimeError("trigger insert failed"),
+            extra_patches=[mock.patch.object(fm_run, "add_health",
+                                             side_effect=flaky_health)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(docs[-1]["reason"], "budget_exhausted")
+        self.assertEqual(self._relayed_prices(docs), [400.0])
+
+    def test_failed_prepare_is_not_relayed(self):
+        """If handoff preparation fails during stop cleanup, the still-
+        pending row is NOT emitted for relay (the next drain handles it)."""
+        from budget import BudgetExhausted
+        rc, docs, db = self._run_with_stop(
+            BudgetExhausted("daily", "verify", 150, 150),
+            extra_patches=[mock.patch.object(
+                fm_run, "prepare_handoff",
+                side_effect=RuntimeError("prepare failed"))])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._relayed_prices(docs), [])
+        row = db.execute("SELECT state FROM outbox").fetchone()
+        self.assertEqual(row["state"], "pending")
 
     def test_tied_observations_score_once(self):
         """Rows of one fingerprint sharing an observed_at (collection stamps
