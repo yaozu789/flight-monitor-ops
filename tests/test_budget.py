@@ -480,6 +480,18 @@ class BudgetV3Test(BudgetTransportTest):
         Session().get("http://example.invalid")
         self.assertIsNone(store.get_throttle_state(self.db))
 
+    def test_stale_success_keeps_newer_throttle(self):
+        """A success that saw an expired throttle must not delete a newer
+        throttle written after it read the row."""
+        store.set_backoff(self.db, "http_429", time.time() - 1, None, "old")
+        seen = store.get_throttle_state(self.db)
+        time.sleep(0.01)
+        store.set_backoff(self.db, "captcha", time.time() + 900, None, "new")
+        self.assertFalse(store.clear_backoff_if_unchanged(self.db, seen))
+        self.assertEqual(store.get_backoff(self.db)["kind"], "captcha")
+        self.assertTrue(store.clear_backoff_if_unchanged(
+            self.db, store.get_throttle_state(self.db)))
+
     def test_redirect_hops_are_each_budgeted(self):
         """Redirects are followed by the wrapper, one reserved send per hop
         (libcurl auto-follow would hide hops from the ledger)."""

@@ -199,10 +199,11 @@ class BudgetGuard:
         with self._reserve_lock:
             return store.get_throttle_state(self._reserve_conn())
 
-    def clear_throttle_state(self) -> None:
-        """A successful response ends a run of consecutive throttles."""
+    def clear_throttle_state(self, seen: dict) -> None:
+        """A successful response ends a run of consecutive throttles -- but
+        only the throttle row it saw; a newer one is left alone."""
         with self._reserve_lock:
-            store.clear_backoff(self._reserve_conn())
+            store.clear_backoff_if_unchanged(self._reserve_conn(), seen)
 
     # -- the atomic reserve ---------------------------------------------
 

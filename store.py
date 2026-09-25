@@ -992,6 +992,17 @@ def set_backoff(db: sqlite3.Connection, kind: str, until_ts: float,
     add_health(db, "throttle", False, f"{kind}: {detail}")
 
 
+def clear_backoff_if_unchanged(db: sqlite3.Connection, seen: dict) -> bool:
+    """Delete the throttle row only if it is still exactly the row *seen*
+    (same until_ts and updated_at), so a stale success cannot erase a newer
+    throttle written concurrently. Returns True when a row was deleted."""
+    cur = db.execute(
+        "DELETE FROM throttle_state WHERE id = 1 AND until_ts = ? "
+        "AND updated_at = ?", (seen["until_ts"], seen["updated_at"]))
+    db.commit()
+    return cur.rowcount > 0
+
+
 def clear_backoff(db: sqlite3.Connection) -> None:
     db.execute("DELETE FROM throttle_state WHERE id = 1")
     db.commit()

@@ -273,7 +273,7 @@ def _do_send(method, orig, self_obj, args, kwargs):
         hops += 1
     # 3. A clean response ends a streak of throttles (expired history row).
     if state is not None:
-        guard.clear_throttle_state()
+        guard.clear_throttle_state(state)
     return resp
 
 
