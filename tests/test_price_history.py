@@ -91,6 +91,35 @@ class PriceHistoryTests(unittest.TestCase):
         self.assertIn("ties the stored low", self.text(470.0, h))
         self.assertIn("$30 above the stored low", self.text(500.0, h))
 
+    def test_chart_link_encodes_stored_data_only(self):
+        """The chart URL carries exactly the stored daily lows, the cap and
+        the recheck -- decodable, no other data, no network call."""
+        import json
+        from urllib.parse import parse_qs, urlparse
+        for d, p in ((3, 520.0), (2, 505.0), (1, 470.0)):
+            self.obs(d, p)
+        h = self.hist()
+        url = outbox.history_chart_url(h, 431.0, cap=500)
+        parsed = urlparse(url)
+        self.assertEqual((parsed.scheme, parsed.netloc, parsed.path),
+                         ("https", "quickchart.io", "/chart"))
+        cfg = json.loads(parse_qs(parsed.query)["c"][0])
+        sets = {d["label"]: d["data"] for d in cfg["data"]["datasets"]}
+        self.assertEqual(sets["daily low (stored)"], [520, 505, 470, None])
+        self.assertEqual(sets["this recheck"], [None, None, None, 431])
+        self.assertEqual(sets["cap $500"], [500] * 4)
+        self.assertEqual(cfg["data"]["labels"][-1], "recheck")
+        self.assertIn("SFO-NRT", cfg["options"]["title"]["text"])
+        text = outbox.render_alert_message(
+            {"id": "japan", "absolute_cap_usd": 500},
+            {**CONF, "price_usd": 431.0}, "fp", "then", history=h)
+        self.assertIn("Chart: https://quickchart.io/chart?c=", text)
+        self.assertLess(len(url), 2000)
+
+    def test_no_chart_without_history(self):
+        self.assertIsNone(outbox.history_chart_url(self.hist(), 431.0, 500))
+        self.assertNotIn("Chart:", self.text(431.0, self.hist()))
+
     def test_no_history_says_so(self):
         self.assertIn("none yet", self.text(431.0, self.hist()))
 
