@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 import store
 import verifier
+from budget import BudgetExhausted
 
 # Enqueue actions that may be emitted to the relay batch. "deduped" means
 # the candidate was already outboxed for this (watch, week) without a
@@ -218,7 +219,8 @@ def drain_pending(db, slot) -> list[dict]:
     return store.prepare_handoff(db, slot, None)
 
 
-def recheck_retries(db, watches, guard, slot, deadline_fn=None) -> dict:
+def recheck_retries(db, watches, guard, slot, deadline_fn=None,
+                    out=None) -> dict:
     """Recheck every eligible retry candidate before a retry handoff.
 
     - confirmed: re-render the message from the FRESH confirmation
@@ -236,9 +238,26 @@ def recheck_retries(db, watches, guard, slot, deadline_fn=None) -> dict:
         watch_map = watches
     else:
         watch_map = {w.get("watch_id", w.get("id")): w for w in watches}
-    retry_ids: list[str] = []
-    retired: list[str] = []
-    unknown: list[str] = []
+    # Results are recorded into *out* (caller-owned) as they happen, so a
+    # run stopped mid-pass (deadline, throttle, daily budget) still hands
+    # off the retries it already confirmed.
+    result = out if out is not None else {}
+    retry_ids = result.setdefault("retry_ids", [])
+    retired = result.setdefault("retired", [])
+    unknown = result.setdefault("unknown", [])
+    try:
+        _recheck_each(db, watch_map, guard, slot, deadline_fn,
+                      retry_ids, retired, unknown)
+    except BudgetExhausted as e:
+        # The retry category's own cap only ends the retry pass; it must
+        # not abort verification and collection for the rest of the run.
+        if getattr(e, "scope", None) != "category":
+            raise
+    return result
+
+
+def _recheck_each(db, watch_map, guard, slot, deadline_fn, retry_ids,
+                  retired, unknown) -> None:
     for row in store.eligible_retry_candidates(db, slot):
         if deadline_fn is not None and deadline_fn():
             raise store.DeadlineExceeded("retry recheck deadline exceeded")
@@ -272,4 +291,3 @@ def recheck_retries(db, watches, guard, slot, deadline_fn=None) -> dict:
                 retired.append(row["alert_id"])
             else:
                 unknown.append(row["alert_id"])
-    return {"retry_ids": retry_ids, "retired": retired, "unknown": unknown}
