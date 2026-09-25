@@ -396,7 +396,6 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
     for cell in store.due_cells(db, role, remaining + len(seen)):
         if cell["id"] in seen:
             continue
-        seen.add(cell["id"])
         if deadline_fn is not None and deadline_fn():
             raise store.DeadlineExceeded(
                 f"{role} phase deadline exceeded")
@@ -404,6 +403,7 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
         # top_n return pages); a half-finished check wastes its sends.
         if allowance - result["attempts"] < 1 + top_n:
             break
+        seen.add(cell["id"])  # only once its check actually starts
         group_cfg = groups_cfg.get(cell["group_id"])
         if group_cfg is None:
             continue
@@ -502,6 +502,14 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
 
     order = [lambda: sentinels(sentinel_share), bursts, background,
              lambda: sentinels(allowance)]
+    if slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N:
+        # A background check needs 1 + DETAIL_TOP_N sends; the ~3-attempt
+        # share of a 30-minute run never fits one. Odd runs borrow up to a
+        # whole check (the daily ceiling and verify reserve still apply in
+        # reserve(), and pacing shrinks later runs to compensate).
+        allowance = min(1 + DETAIL_TOP_N,
+                        max(0, PER_RUN_HARD_CAP - run_start_spent))
+        guard.set_run_allowance(run_start_spent + allowance)
     if slot % 2 == 1:
         # Alternate runs lead with exploration, so a small allowance (about
         # 3 at a 30-minute cadence) still reaches bursts and background.

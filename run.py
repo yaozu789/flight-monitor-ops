@@ -703,6 +703,7 @@ def main() -> int:
     db = None
     try:
         defaults, watches = load_config()
+        cadence_slots(watches)  # reject a bad run_every_minutes before any work
         db = init_db(DB_PATH)
         sync_watches(db, watches, defaults)
         # The transport guard counts ACTUAL HTTP attempts and refuses to send

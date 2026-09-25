@@ -306,13 +306,35 @@ class TestCollectPriority(SentinelTestBase):
             return (400.0, 1 + top_n)
 
         self.patch(sentinel, "check_cell", fake_check)
-        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 4)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 3)
         sentinel.collect(self.db, self.guard(), GROUPS, slot=5,
                          run_start=store.utcnow_iso())
         self.assertEqual(calls[0][0], "background")
-        # 4 attempts: one background check (1 + 3) uses it all; no partial
-        # sentinel check is started after it.
+        # A 3-attempt share is raised to one whole background check (4);
+        # it uses it all and no partial sentinel check starts after it.
         self.assertEqual(calls, [("background", 3)])
+
+    def test_skipped_cell_is_retried_in_leftover_pass(self):
+        """A cell that did not fit the first sentinel share is still
+        checked by the leftover pass (it was never started)."""
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        store.ensure_cells(self.db, [
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 7, "role": "sentinel", "weekday": 0}])
+        calls = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append(category)
+            return (400.0, 1 + top_n)
+
+        self.patch(sentinel, "check_cell", fake_check)
+        # allowance 3: sentinel share ceil(3/2)=2 fits one 2-send check.
+        # allowance 2: share 1 fits none; the leftover pass (2) fits one.
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 2)
+        sentinel.collect(self.db, self.guard(), GROUPS, slot=4,
+                         run_start=store.utcnow_iso())
+        self.assertEqual(calls, ["sentinel"])
 
     def test_run_total_never_exceeds_80(self):
         g = self.guard()
@@ -356,7 +378,7 @@ class TestCollectPriority(SentinelTestBase):
         for _ in range(5):
             g.reserve("verify")
         self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 3)
-        sentinel.collect(self.db, g, {}, slot=5, run_start=store.utcnow_iso())
+        sentinel.collect(self.db, g, {}, slot=4, run_start=store.utcnow_iso())
         self.assertEqual(g.run_allowance(), 5 + 3)
 
     def test_burst_never_passes_60(self):

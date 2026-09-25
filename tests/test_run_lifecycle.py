@@ -354,6 +354,9 @@ class PipelineOrderTests(unittest.TestCase):
         self._patch(_sentinel, "check_cell", fake_check)
         self._patch(_sentinel, "per_run_allowance",
                     lambda guard, slot, *a: 200)
+        # This test is about ORDER, not caps: lift the 80-per-run hard cap
+        # so every phase gets room.
+        self._patch(_sentinel, "PER_RUN_HARD_CAP", 1000)
 
         # An even slot: sentinel-first order (odd slots lead with
         # exploration; see test_odd_slot_leads_with_exploration).
