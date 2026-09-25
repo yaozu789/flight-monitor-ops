@@ -184,6 +184,95 @@ class Stage4OrchestrationTests(unittest.TestCase):
         self.assertEqual(rows[0]["state"], "handoff_prepared")
         self.assertEqual(rows[0]["prepared_slot"], slot)
 
+    def _run_with_stop(self, stop_exc, trigger_error=None):
+        """Drive run_guarded(cmd_check) where the 2nd verification raises
+        *stop_exc*; return (rc, parsed stdout JSON docs, db)."""
+        import contextlib
+        import io
+        import json as _json
+        db, guard = _ctx(self)
+
+        def collect_writes_two(db_, guard_, groups, slot_, run_start, **kw):
+            for price, dep in ((400.0, "2026-11-01"), (450.0, "2026-12-01")):
+                store.add_observation(
+                    db_, watch_id="w1", origin="SFO", destination="JFK",
+                    depart_date=dep, return_date=dep[:8] + "08",
+                    airline="UA", stops=0, cabin="economy", price_usd=price,
+                    booking_url="https://example.invalid/b")
+            return {"attempts": 0, "bursts": 0, "sentinels": 0,
+                    "background": 0, "drop_triggers": 0}
+
+        calls = []
+
+        def verify_then_stop(db_, watch, cand, guard_, **kw):
+            calls.append(1)
+            if len(calls) > 1:
+                raise stop_exc
+            return True, {"price_usd": cand["price_usd"],
+                          "depart_date": cand["depart_date"],
+                          "return_date": cand["return_date"],
+                          "airline": cand["airline"], "stops": cand["stops"],
+                          "booking_url": cand["booking_url"],
+                          "observed_at": store.utcnow_iso()}
+
+        patches = [
+            mock.patch.object(fm_sentinel, "mint_sentinels", return_value=0),
+            mock.patch.object(fm_sentinel, "ensure_background_grid",
+                              return_value=0),
+            mock.patch.object(fm_sentinel, "collect", collect_writes_two),
+            mock.patch.object(fm_run, "verify", verify_then_stop),
+        ]
+        if trigger_error is not None:
+            patches.append(mock.patch.object(
+                fm_sentinel, "detect_under_cap_triggers",
+                side_effect=trigger_error))
+        out = io.StringIO()
+        with contextlib.ExitStack() as st:
+            for p_ in patches:
+                st.enter_context(p_)
+            st.enter_context(contextlib.redirect_stdout(out))
+            args = SimpleNamespace(cmd="check", scheduled=False, watch="w1")
+            rc = fm_run.run_guarded("check", args, db, [WATCH], guard,
+                                    fm_run.cmd_check)
+        docs = [_json.loads(d) for d in
+                out.getvalue().replace("}\n{", "}\x00{").split("\x00")
+                if d.strip()]
+        return rc, docs, db
+
+    def _relayed_prices(self, docs):
+        return [a["price_usd"] for d in docs
+                for a in d.get("handoff", {}).get("alerts", [])]
+
+    def test_stops_still_emit_verified_deal(self):
+        """Budget, deadline and throttle stops mid-verify still PRINT the
+        already-verified deal for the agent to relay (not just mark it
+        handoff_prepared in the DB)."""
+        from budget import BudgetExhausted
+        from transport import ThrottleDetected
+        for exc in (BudgetExhausted("daily", "verify", 150, 150),
+                    store.DeadlineExceeded("run deadline exceeded"),
+                    ThrottleDetected("http_429", 60, "test")):
+            with self.subTest(stop=type(exc).__name__):
+                rc, docs, db = self._run_with_stop(exc)
+                self.assertEqual(rc, 0)
+                self.assertEqual(self._relayed_prices(docs), [400.0])
+                row = db.execute("SELECT state FROM outbox").fetchone()
+                self.assertEqual(row["state"], "handoff_prepared")
+
+    def test_trigger_failure_does_not_mask_stop(self):
+        """A failing burst-trigger write during stop cleanup is recorded,
+        the handoff is still prepared and emitted, and the original stop
+        (budget) decides the outcome, not a crash."""
+        from budget import BudgetExhausted
+        rc, docs, db = self._run_with_stop(
+            BudgetExhausted("daily", "verify", 150, 150),
+            trigger_error=RuntimeError("trigger insert failed"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(docs[-1]["reason"], "budget_exhausted")
+        self.assertEqual(self._relayed_prices(docs), [400.0])
+        h = store.latest_health(db, "burst_triggers")
+        self.assertFalse(h["ok"])
+
     def test_tied_observations_score_once(self):
         """Rows of one fingerprint sharing an observed_at (collection stamps
         a whole run with run_start) yield ONE candidate, not duplicates."""

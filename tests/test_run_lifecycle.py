@@ -110,6 +110,25 @@ class RunLifecycleTests(unittest.TestCase):
         row = store.outbox_get(db, "w1:drain1")
         self.assertEqual(row["state"], "handoff_prepared")
 
+    def test_backoff_noop_emits_drained_handoff(self):
+        """The drained alert is PRINTED in the no-op output, so the agent
+        relays it even though collection was skipped."""
+        import contextlib
+        import io
+        import json as _json
+        db, guard = self._ctx()
+        seed_pending(db)
+        store.set_backoff(db, "http429", time.time() + 3600, 60,
+                          "test backoff")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fm_run.run_guarded("check", args_for("check", False), db,
+                               [WATCH], guard, lambda *a, **k: 0)
+        doc = _json.loads(out.getvalue())
+        self.assertEqual(doc["reason"], "throttle_backoff")
+        self.assertEqual([a["alert_id"] for a in doc["handoff"]["alerts"]],
+                         ["w1:drain1"])
+
     def test_drain_runs_before_slot_noop(self):
         """An already-claimed slot short-circuits collection, but the
         drain already ran."""

@@ -94,6 +94,34 @@ DEADLINE_FAIL_STREAK = 3
 PING_COMMANDS = {"check", "broad"}
 
 
+RELAY_INSTRUCTION = (
+    "Relay each message below VERBATIM to the user via the normal push. "
+    "Do not paraphrase, do not add claims, never use the word 'bookable'. "
+    "After relaying each, record it with: "
+    "python run.py outbox-mark --alert-id <id> "
+    "--state relay_attempted_unconfirmed. "
+    "After the USER confirms a deal, finalize it (human-driven only) with: "
+    "python run.py outbox-confirm --alert-id <id> --by <your name>."
+)
+
+
+def _handoff_payload(db, slot, alert_ids, **extra) -> dict:
+    """The agent-facing relay batch for *alert_ids* (duplicates dropped)."""
+    seen: list[str] = []
+    for aid in alert_ids:
+        if aid not in seen:
+            seen.append(aid)
+    batch = [r for r in (outbox_get(db, aid) for aid in seen) if r is not None]
+    return {
+        "slot_id": slot,
+        "alerts": [{"alert_id": r["alert_id"], "state": r["state"],
+                    "price_usd": r["price_usd"], "message": r["message_text"]}
+                   for r in batch],
+        **extra,
+        "agent_instruction": RELAY_INSTRUCTION,
+    }
+
+
 def _noop(reason: str, **extra) -> int:
     """Emit a machine-readable no-op summary. Exit 0: a bounded no-op is a
     successful run (the scheduler stays quiet)."""
@@ -122,6 +150,24 @@ def _check_deadline(deadline_fn) -> None:
     if deadline_fn is not None and deadline_fn():
         raise DeadlineExceeded(
             f"run deadline ({RUN_DEADLINE_S}s) exceeded")
+
+
+def _ids(rows) -> list[str]:
+    return [r["alert_id"] for r in rows or []]
+
+
+def _stop_handoff(exc) -> dict:
+    """Extra no-op fields carrying the relay batch a stopped cmd_check
+    attached to its exception (empty when there is none)."""
+    payload = getattr(exc, "handoff", None)
+    return {"handoff": payload} if payload and payload["alerts"] else {}
+
+
+def _emit_stop_handoff(exc) -> None:
+    """Print the relay batch of a stop that does not go through _noop."""
+    extra = _stop_handoff(exc)
+    if extra:
+        print(json.dumps({"status": "stopped", **extra}, indent=2))
 
 
 def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int:
@@ -170,12 +216,14 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
                        f"not collecting: {bo['kind']} backoff until "
                        f"{bo['until_ts']:.0f}")
             rc = _noop("throttle_backoff", kind=bo["kind"],
-                       retry_at=bo["until_ts"])
+                       retry_at=bo["until_ts"],
+                       handoff=_handoff_payload(db, slot, _ids(drained)))
             _ping_ok(args, cmd_name, db)
             return rc
         if not claim_slot(db, slot, "collect"):
             rc = _noop("slot_already_completed", slot_id=slot,
-                       detail="check and broad share one collection per slot")
+                       detail="check and broad share one collection per slot",
+                       handoff=_handoff_payload(db, slot, _ids(drained)))
             _ping_ok(args, cmd_name, db)
             return rc
         # Run deadline, shorter than the lock TTL: on exceed the run stops
@@ -198,7 +246,8 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             add_health(db, "throttle", False,
                        f"throttle mid-run ({e.kind}); backoff persisted")
             rc = _noop("throttle_backoff", kind=e.kind,
-                       retry_after_s=e.retry_after_s, slot_id=slot)
+                       retry_after_s=e.retry_after_s, slot_id=slot,
+                       **_stop_handoff(e))
             _ping_ok(args, cmd_name, db)
             return rc
         except BudgetExhausted as e:  # BaseException: caught explicitly
@@ -207,7 +256,8 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
                        f"budget exhausted, collection stopped: {e}")
             rc = _noop("budget_exhausted", slot_id=slot,
                        spent_today=guard.spent_today(),
-                       spent_run=guard.spent_run(), detail=str(e))
+                       spent_run=guard.spent_run(), detail=str(e),
+                       **_stop_handoff(e))
             _ping_ok(args, cmd_name, db)
             return rc
         except DeadlineExceeded as e:
@@ -219,17 +269,20 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             if streak >= DEADLINE_FAIL_STREAK:
                 add_health(db, "run_deadline", False,
                            f"{streak} consecutive deadline stops: {e}")
+                _emit_stop_handoff(e)
                 _ping_fail(args, cmd_name, db)
                 return 1
             add_health(db, "run_deadline", True,
                        f"controlled stop after {RUN_DEADLINE_S}s: {e}")
-            rc = _noop("deadline", slot_id=slot, detail=str(e))
+            rc = _noop("deadline", slot_id=slot, detail=str(e),
+                       **_stop_handoff(e))
             _ping_ok(args, cmd_name, db)
             return rc
         except BaseException as e:  # noqa: BLE001 - crash: /fail, never green
             finish_slot(db, slot, "crashed")
             add_health(db, "crash", False, f"{type(e).__name__}: {e}")
             traceback.print_exc()
+            _emit_stop_handoff(e)
             _ping_fail(args, cmd_name, db)
             return 1
         if rc != 0:
@@ -325,6 +378,32 @@ def cmd_canary(args, db, watches, guard):
     ok, detail = run_canary(db, w)
     print(json.dumps({"ok": ok, "detail": detail}))
     return 0 if ok else 2
+
+
+def _finish_verified(db, slot, run_start, verified_deals, new_ids,
+                     strict=False) -> int:
+    """Steps 7-8: queue burst triggers for verified deals, then prepare
+    their handoffs. Each step is attempted independently; with
+    strict=False (a stop is already propagating) failures are recorded in
+    health instead of raised, so they cannot mask the original stop.
+    Returns the number of triggers queued."""
+    n_triggers = 0
+    try:
+        n_triggers = sentinel.detect_under_cap_triggers(
+            db, verified_deals, run_start, slot)
+    except Exception as e:  # noqa: BLE001
+        if strict:
+            raise
+        add_health(db, "burst_triggers", False, f"{type(e).__name__}: {e}")
+    if new_ids:
+        try:
+            prepare_handoff(db, slot, new_ids)
+        except Exception as e:  # noqa: BLE001
+            if strict:
+                raise
+            add_health(db, "handoff_prepare", False,
+                       f"{type(e).__name__}: {e}")
+    return n_triggers
 
 
 def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
@@ -447,39 +526,27 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
                                        deadline_fn=deadline_fn)
         for wid, ids in same_slot.items():
             per_watch.setdefault(wid, []).extend(ids)
-    finally:
-        # 7-8 run even when budget/deadline/throttle stops the run above, so
-        # deals already verified still queue their burst trigger and hand
-        # off in this slot instead of waiting for the next drain.
-        n_triggers = sentinel.detect_under_cap_triggers(
-            db, verified_deals, run_start, slot)
-        if new_ids:
-            prepare_handoff(db, slot, new_ids)
+    except BaseException as stop:
+        # A budget/deadline/throttle stop (or crash) mid-verify: deals
+        # already verified this slot must still be handed off AND emitted,
+        # or the agent never relays them. Cleanup failures are recorded but
+        # never replace the original stop.
+        _finish_verified(db, slot, run_start, verified_deals, new_ids)
+        try:
+            stop.handoff = _handoff_payload(
+                db, slot, drained_ids + retry_ids + new_ids)
+        except Exception as e:  # noqa: BLE001 - never mask the stop
+            add_health(db, "handoff_emit", False, f"{type(e).__name__}: {e}")
+        raise
+    n_triggers = _finish_verified(db, slot, run_start, verified_deals,
+                                  new_ids, strict=True)
     for wid, ids in per_watch.items():
         summary["watches"][wid] = {"new_alerts": ids}
     summary["triggers_queued"] = n_triggers
-
-    batch = [r for r in
-             (outbox_get(db, aid) for aid in drained_ids + retry_ids + new_ids)
-             if r is not None]
-    summary["handoff"] = {
-        "slot_id": slot,
-        "alerts": [{"alert_id": r["alert_id"], "state": r["state"],
-                    "price_usd": r["price_usd"], "message": r["message_text"]}
-                   for r in batch],
-        "retried": retry_ids,
-        "retired": retries["retired"],
-        "unknown": retries["unknown"],
-        "agent_instruction": (
-            "Relay each message below VERBATIM to the user via the normal push. "
-            "Do not paraphrase, do not add claims, never use the word 'bookable'. "
-            "After relaying each, record it with: "
-            "python run.py outbox-mark --alert-id <id> "
-            "--state relay_attempted_unconfirmed. "
-            "After the USER confirms a deal, finalize it (human-driven only) with: "
-            "python run.py outbox-confirm --alert-id <id> --by <your name>."
-        ),
-    }
+    summary["handoff"] = _handoff_payload(
+        db, slot, drained_ids + retry_ids + new_ids,
+        retried=retry_ids, retired=retries["retired"],
+        unknown=retries["unknown"])
     print(json.dumps(summary, indent=2))
     return 0
 
