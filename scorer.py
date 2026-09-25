@@ -1,38 +1,51 @@
-"""Deal scoring (Phase 1): absolute cap breach + new observed low.
+"""Scorer stage (v2): absolute-cap candidates only.
 
-Rolling-median anomaly scoring arrives in Phase 2 (needs history).
+Reads this run's observations via store.latest_observations_since and emits
+one candidate per itinerary priced at or below the watch's absolute cap,
+subject to the per-fingerprint alert cooldown. There is no new_low logic
+anywhere in this stage or its siblings: a price drop that stays above the cap
+is not an alertable event.
 """
 from __future__ import annotations
 
-import sqlite3
-
-from store import alerted_recently, latest_observations_since, min_price_before
+import store
 
 
-def score_new_observations(db: sqlite3.Connection, watch_id: str, cap_usd: float,
-                           since_iso: str, cooldown_hours: float = 24) -> list[dict]:
-    """Score observations recorded since `since_iso`.
+def score_new_observations(db, watch, run_start, cooldown_hours=24) -> list[dict]:
+    """Absolute-cap candidates only.
 
-    Returns candidate dicts: {"observation": row-dict, "reason": ..., "score": ...}.
-    Dedups against recent alerts (cooldown).
+    Candidate dict: {watch_id, fingerprint, origin, destination, depart_date,
+    return_date, airline, stops, price_usd, booking_url, observed_at,
+    reason="absolute"}.
+
+    Rules: from store.latest_observations_since (this run's rows); keep
+    price_usd <= watch["absolute_cap_usd"]; skip if
+    store.alerted_recently(fingerprint, cooldown_hours). NO new_low logic
+    anywhere. Sorted by price_usd ascending.
     """
-    candidates: list[dict] = []
-    for row in latest_observations_since(db, watch_id, since_iso):
-        price = row["price_usd"]
-        if price is None:
+    watch_id = watch.get("watch_id", watch.get("id"))
+    cap = watch["absolute_cap_usd"]
+    candidates = []
+    for r in store.latest_observations_since(db, watch_id, run_start):
+        price = r.get("price_usd")
+        if price is None or price > cap:
             continue
-        fp = row["fingerprint"]
-        reasons: list[tuple[str, float]] = []
-        if price <= cap_usd:
-            reasons.append(("absolute", (cap_usd - price) / cap_usd if cap_usd else 0.0))
-        hist_min = min_price_before(db, watch_id, fp, since_iso)
-        if hist_min is not None and price < hist_min:
-            reasons.append(("new_low", (hist_min - price) / hist_min if hist_min else 0.0))
-        if not reasons:
+        fingerprint = r["fingerprint"]
+        if store.alerted_recently(db, fingerprint, cooldown_hours):
             continue
-        reason, score = max(reasons, key=lambda r: r[1])
-        if alerted_recently(db, fp, cooldown_hours):
-            continue
-        candidates.append({"observation": dict(row), "reason": reason, "score": round(score, 4)})
-    candidates.sort(key=lambda c: c["score"], reverse=True)
+        candidates.append({
+            "watch_id": watch_id,
+            "fingerprint": fingerprint,
+            "origin": r.get("origin"),
+            "destination": r.get("destination"),
+            "depart_date": r.get("depart_date"),
+            "return_date": r.get("return_date"),
+            "airline": r.get("airline"),
+            "stops": r.get("stops"),
+            "price_usd": price,
+            "booking_url": r.get("booking_url"),
+            "observed_at": r.get("observed_at"),
+            "reason": "absolute",
+        })
+    candidates.sort(key=lambda c: c["price_usd"])
     return candidates

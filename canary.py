@@ -21,7 +21,8 @@ def run_canary(db: sqlite3.Connection, cfg: dict) -> tuple[bool, str]:
     depart = (date.today() + timedelta(days=REFERENCE["depart_offset"])).isoformat()
     ret = (date.today() + timedelta(days=REFERENCE["return_offset"])).isoformat()
     try:
-        results = narrow_query(REFERENCE["origin"], REFERENCE["dest"], depart, ret, cfg)
+        results = narrow_query(REFERENCE["origin"], REFERENCE["dest"], depart, ret, cfg,
+                               attempt_category="manual")
     except Exception:  # noqa: BLE001 - canary must never crash the caller
         detail = f"exception: {traceback.format_exc(limit=3).strip().splitlines()[-1]}"
         add_health(db, "canary", False, detail)

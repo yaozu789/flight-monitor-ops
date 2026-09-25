@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""Cheap Flight Monitor — CLI entrypoint (Phase 1).
+"""Cheap Flight Monitor — CLI entrypoint (v2 stage 4: sentinel + bursts).
 
-Usage:
-  python run.py broad  --watch japan [--duration 7]
-  python run.py narrow --watch japan --depart 2026-12-04 --return 2026-12-11
-  python run.py canary
-  python run.py check [--watch japan]
+Stage-04 changes vs stage 03 (plan 04, spec item 12):
+- Rolling sentinel tripwires replace the fixed per-pair check loop: 27
+  weekly anchors per group across the 3-9 month window, re-checked in
+  least-recently-checked rotation. The canary's reference-query role is
+  folded into the sentinel schedule (the manual `canary` command remains
+  for diagnostics).
+- Collection is paced across the 48 daily slots (adaptive per-run attempt
+  cap), with priority: bursts > sentinels > background, and a reserved
+  verification budget. Ready handoffs are drained BEFORE any collection.
+- Verification traffic bills to "verify", never "sentinel".
+- Burst triggers: a newly under-cap deal, or a >=20% week-over-week drop on
+  a recently successful cell. Bursts are deduped to 1/(group, week)/24h and
+  revalidate the trigger before spending the burst budget.
 
-Exit codes: 0 = success (even with zero deals); 1 = infrastructure failure;
-2 = canary failed (data layer blind).
-Every command prints a JSON summary to stdout for the scheduler to consume.
+Budget reality (spec item 1): one round-trip narrow query costs 1 + top_n
+HTTP attempts, so a sentinel cell (top_n=1) costs 2 attempts; 54 sentinel
+attempts/day = 27 cells/day, i.e. each anchor re-checks roughly every 2 days.
+See sentinel.py for the full arithmetic.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -25,24 +35,154 @@ sys.path.insert(0, str(BASE))
 
 import yaml  # noqa: E402
 
+import heartbeat  # noqa: E402
+import sentinel  # noqa: E402
+import transport  # noqa: E402
+from budget import BudgetExhausted, BudgetGuard  # noqa: E402
 from canary import run_canary  # noqa: E402
+from outbox import (  # noqa: E402
+    drain_pending,
+    enqueue_from_confirmation,
+    recheck_retries,
+)
 from poller import broad_scan, narrow_query  # noqa: E402
 from scorer import score_new_observations  # noqa: E402
 from store import (  # noqa: E402
+    acquire_lock,
     add_alert,
     add_broad_scan,
-    add_observation,
+    add_health,
+    claim_slot,
+    finish_slot,
+    get_backoff,
     init_db,
+    outbox_get,
+    outbox_list,
+    prepare_handoff,
+    reprepare_retries,
+    record_lock_loss,
+    release_lock,
+    reset_lock_loss,
+    set_outbox_user_confirmed,
+    slot_id,
     sync_watches,
+    update_outbox_state,
     utcnow_iso,
 )
-from verifier import verify_candidate  # noqa: E402
+from transport import ThrottleDetected  # noqa: E402
+from verifier import verify  # noqa: E402
 
 DB_PATH = BASE / "data" / "monitor.db"
 
-# check: sample departure offsets (days out) and trip length for the 2-hourly poll
-CHECK_DEPART_OFFSETS = [45, 75, 105, 135]
-CHECK_TRIP_DAYS = 7
+LOCK_TTL_S = 1500
+
+# Only scheduled runs of these commands ping Healthchecks.
+PING_COMMANDS = {"check", "broad"}
+
+
+def _noop(reason: str, **extra) -> int:
+    """Emit a machine-readable no-op summary. Exit 0: a bounded no-op is a
+    successful run (the scheduler stays quiet)."""
+    print(json.dumps({"status": "noop", "reason": reason, **extra}, indent=2))
+    return 0
+
+
+def _ping_ok(args, cmd_name: str, db) -> None:
+    """Success ping: only for scheduled check/broad cycles."""
+    if getattr(args, "scheduled", False) and cmd_name in PING_COMMANDS:
+        heartbeat.ping_success(db)
+
+
+def _ping_fail(args, cmd_name: str, db) -> None:
+    """Failure ping: only for scheduled check/broad cycles."""
+    if getattr(args, "scheduled", False) and cmd_name in PING_COMMANDS:
+        heartbeat.ping_fail(db)
+
+
+def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int:
+    """Overlap lock + throttle backoff + slot idempotency + budget handling
+    + heartbeat semantics (spec item 11)."""
+    if getattr(args, "scheduled", False):
+        ok, reason = heartbeat.validate_schedule_env()
+        if not ok:
+            print(json.dumps({"status": "refused", "reason": reason}, indent=2))
+            return 2
+    owner = f"{cmd_name}-{os.getpid()}"
+    if not acquire_lock(db, owner, ttl_s=LOCK_TTL_S):
+        losses = record_lock_loss(db)
+        if losses >= 3:
+            add_health(db, "overlap_lock", False,
+                       f"{losses} consecutive lock losses; failing the check")
+            _ping_fail(args, cmd_name, db)
+            return 1
+        return _noop("overlap_lock", losses=losses,
+                     detail="another collection run holds the lock; exiting")
+    try:
+        reset_lock_loss(db)
+        bo = get_backoff(db)
+        if bo is not None:
+            add_health(db, "throttle_backoff", True,
+                       f"not collecting: {bo['kind']} backoff until "
+                       f"{bo['until_ts']:.0f}")
+            rc = _noop("throttle_backoff", kind=bo["kind"],
+                       retry_at=bo["until_ts"])
+            _ping_ok(args, cmd_name, db)
+            return rc
+        slot = slot_id()
+        if not claim_slot(db, slot, "collect"):
+            rc = _noop("slot_already_completed", slot_id=slot,
+                       detail="check and broad share one collection per slot")
+            _ping_ok(args, cmd_name, db)
+            return rc
+        try:
+            rc = fn(args, db, watches, guard)
+        except SystemExit:
+            raise
+        except ThrottleDetected as e:  # BaseException: caught explicitly
+            finish_slot(db, slot, "throttled")
+            add_health(db, "throttle", False,
+                       f"throttle mid-run ({e.kind}); backoff persisted")
+            rc = _noop("throttle_backoff", kind=e.kind,
+                       retry_after_s=e.retry_after_s, slot_id=slot)
+            _ping_ok(args, cmd_name, db)
+            return rc
+        except BudgetExhausted as e:  # BaseException: caught explicitly
+            finish_slot(db, slot, "budget_exhausted")
+            add_health(db, "budget", True,
+                       f"budget exhausted, collection stopped: {e}")
+            rc = _noop("budget_exhausted", slot_id=slot,
+                       spent_today=guard.spent_today(),
+                       spent_run=guard.spent_run(), detail=str(e))
+            _ping_ok(args, cmd_name, db)
+            return rc
+        except BaseException as e:  # noqa: BLE001 - crash: /fail, never green
+            finish_slot(db, slot, "crashed")
+            add_health(db, "crash", False, f"{type(e).__name__}: {e}")
+            traceback.print_exc()
+            _ping_fail(args, cmd_name, db)
+            return 1
+        finish_slot(db, slot, "completed")
+        _ping_ok(args, cmd_name, db)
+        return rc
+    finally:
+        release_lock(db, owner)
+
+
+def run_manual(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int:
+    """Manual collecting commands (narrow, canary): take the shared collection
+    lock (item 3) and count against the budget, but never claim a scheduler
+    slot and NEVER ping (spec item 11)."""
+    owner = f"{cmd_name}-{os.getpid()}"
+    if not acquire_lock(db, owner, ttl_s=LOCK_TTL_S):
+        return _noop("overlap_lock",
+                     detail="another collection run holds the lock; exiting")
+    try:
+        reset_lock_loss(db)
+        return fn(args, db, watches, guard)
+    except BudgetExhausted as e:
+        return _noop("budget_exhausted", detail=str(e))
+    finally:
+        release_lock(db, owner)
 
 
 def load_config() -> tuple[dict, list[dict]]:
@@ -63,7 +203,13 @@ def get_watch(watches: list[dict], watch_id: str) -> dict:
     raise SystemExit(f"unknown watch: {watch_id} (have: {[w['id'] for w in watches]})")
 
 
-def cmd_broad(args, db, watches):
+def _add_scheduled(p) -> None:
+    p.add_argument("--scheduled", action="store_true",
+                   help="mark this run as the scheduled (cron) invocation; "
+                        "enables the Healthchecks ping and the env gate")
+
+
+def cmd_broad(args, db, watches, guard):
     w = get_watch(watches, args.watch)
     combos = broad_scan(w, duration_days=args.duration)
     summary = {"watch": w["id"], "duration_days": args.duration,
@@ -74,114 +220,271 @@ def cmd_broad(args, db, watches):
         for c in combos:
             add_broad_scan(db, watch_id=w["id"], depart_date=c["depart_date"],
                            return_date=c["return_date"], trip_days=args.duration,
-                           price_usd=c["price"], observed_at=now)
+                           price_usd=c["price_usd"], observed_at=now)
         summary["combos"] = combos[:10]
         summary["total_combos"] = len(combos)
     print(json.dumps(summary, indent=2))
     return 0
 
 
-def cmd_narrow(args, db, watches):
+def cmd_narrow(args, db, watches, guard):
     w = get_watch(watches, args.watch)
     itineraries = []
     for o in w["origins"]:
         for d in w["destinations"]:
-            res = narrow_query(o, d, args.depart, args.return_, w)
+            res = narrow_query(o, d, args.depart, args.return_, w,
+                               attempt_category="manual")
             if res:
                 itineraries.extend(res)
-    itineraries.sort(key=lambda x: x["price"])
+    itineraries.sort(key=lambda x: x["price_usd"])
     print(json.dumps({"watch": w["id"], "depart": args.depart, "return": args.return_,
                       "unknown": not itineraries, "itineraries": itineraries[:10]}, indent=2))
     return 0
 
 
-def cmd_canary(args, db, watches):
+def cmd_canary(args, db, watches, guard):
     w = watches[0]  # canary uses its own fixed reference; cfg shape only
     ok, detail = run_canary(db, w)
     print(json.dumps({"ok": ok, "detail": detail}))
     return 0 if ok else 2
 
 
-def cmd_check(args, db, watches):
+def cmd_check(args, db, watches, guard):
+    """One scheduled collection cycle (spec item 12 ordering):
+
+    1. Mint sentinel anchors + background grid (idempotent).
+    2. Drain durable pending handoffs -- before any collection.
+    3. Recheck prepared-but-unconfirmed handoffs (verify budget).
+    4. Collect: bursts > sentinels > background, paced across the 48 slots.
+    5. Score this run's observations; verify each candidate (verify budget);
+       enqueue durable pending alerts.
+    6. Queue burst triggers (new under-cap deals).
+    7. Prepare the new handoffs for the agent to relay.
+    """
     run_start = utcnow_iso()
+    slot = slot_id()
+    summary: dict = {"slot_id": slot, "watches": {}}
     targets = [get_watch(watches, args.watch)] if args.watch else watches
-    summary = {"watches": {}}
+    groups_cfg = {w["id"]: {"origins": w["origins"],
+                            "destinations": w["destinations"]} for w in targets}
+
+    # 1. Rolling sentinel anchors + background grid (idempotent).
+    n_sentinels = sentinel.mint_sentinels(db, groups_cfg)
+    n_bg = sentinel.ensure_background_grid(db, groups_cfg)
+
+    # 2. Hand off ready alerts BEFORE collecting.
+    drained = drain_pending(db, slot)
+    drained_ids = [r["alert_id"] for r in drained]
+
+    # 3. Retry pass (verify budget): recheck, re-render, retire.
+    retries = recheck_retries(db, watches, guard, slot)
+    retry_ids = retries["retry_ids"]
+    if retry_ids:
+        reprepare_retries(db, slot, retry_ids)
+
+    # 4. Collect, paced: bursts > sentinels > background.
+    collected = sentinel.collect(db, guard, groups_cfg, slot, run_start)
+    summary["collect"] = {
+        "attempts": collected["attempts"],
+        "bursts": collected["bursts"],
+        "sentinels": collected["sentinels"],
+        "background": collected["background"],
+        "drop_triggers": collected["drop_triggers"],
+        "new_sentinel_cells": n_sentinels,
+        "new_background_cells": n_bg,
+    }
+
+    # 5. Score + verify + enqueue.
+    new_ids: list[str] = []
+    verified_deals: list[dict] = []
     for w in targets:
-        obs_count = 0
-        for offset in CHECK_DEPART_OFFSETS:
-            depart = (date.today() + timedelta(days=offset)).isoformat()
-            ret = (date.today() + timedelta(days=offset + CHECK_TRIP_DAYS)).isoformat()
-            for o in w["origins"]:
-                for d in w["destinations"]:
-                    results = narrow_query(o, d, depart, ret, w)
-                    if not results:
-                        continue  # unknown, not "no deals"
-                    for r in results:
-                        add_observation(
-                            db, watch_id=w["id"], origin=r["origin"] or o,
-                            destination=r["destination"] or d, depart_date=depart,
-                            return_date=ret, airline=r["airline"], stops=r["stops"],
-                            cabin=r.get("cabin", w.get("cabin", "economy")),
-                            price_usd=r["price"], booking_url=r["booking_url"],
-                            observed_at=run_start)
-                        obs_count += 1
         candidates = score_new_observations(
-            db, w["id"], w["absolute_cap_usd"], run_start,
-            cooldown_hours=w.get("cooldown_hours", 24))
-        alerts = []
+            db, w, run_start, cooldown_hours=w.get("cooldown_hours", 24))
+        watch_new: list[str] = []
         for c in candidates:
-            conf = verify_candidate(c, w)
-            if not conf:
-                continue
-            obs = c["observation"]
-            alert_id = add_alert(db, observation_id=obs["id"], reason=c["reason"],
-                                 score=c["score"], verified_at=utcnow_iso())
-            alerts.append({"id": alert_id, "reason": c["reason"], "score": c["score"],
-                           "origin": obs["origin"], "destination": obs["destination"],
-                           "depart": obs["depart_date"], "return": obs["return_date"],
-                           "airline": obs["airline"], "stops": obs["stops"],
-                           "price": obs["price_usd"],
-                           "confirmed_price": conf["confirmed_price"],
-                           "booking_url": conf["booking_url"]})
-        summary["watches"][w["id"]] = {"observations": obs_count, "alerts": alerts}
+            ok, conf = verify(db, w, c, guard)
+            if not ok:
+                continue  # unknown: never alert on an unverified fare
+            # The alerts table stays the scoring-history record (the scorer's
+            # cooldown reads it); delivery state lives in the outbox.
+            add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
+                      verified_at=utcnow_iso())
+            aid, _action = enqueue_from_confirmation(db, w, c, conf)
+            watch_new.append(aid)
+            duration = (date.fromisoformat(conf["return_date"])
+                        - date.fromisoformat(conf["depart_date"])).days
+            verified_deals.append({
+                "watch_id": w["id"], "fingerprint": c["fingerprint"],
+                "price_usd": conf["price_usd"],
+                "depart_date": conf["depart_date"], "duration": duration,
+                "cap": w["absolute_cap_usd"]})
+        new_ids.extend(watch_new)
+        summary["watches"][w["id"]] = {"new_alerts": watch_new}
+
+    # 6. Burst triggers for newly under-cap deals.
+    n_triggers = sentinel.detect_under_cap_triggers(
+        db, verified_deals, run_start, slot)
+    summary["triggers_queued"] = n_triggers
+
+    # 7. Prepare the new handoffs (eligibility enforced inside the UPDATE).
+    if new_ids:
+        prepare_handoff(db, slot, new_ids)
+
+    batch = [r for r in
+             (outbox_get(db, aid) for aid in drained_ids + retry_ids + new_ids)
+             if r is not None]
+    summary["handoff"] = {
+        "slot_id": slot,
+        "alerts": [{"alert_id": r["alert_id"], "state": r["state"],
+                    "price_usd": r["price_usd"], "message": r["message_text"]}
+                   for r in batch],
+        "retried": retry_ids,
+        "retired": retries["retired"],
+        "unknown": retries["unknown"],
+        "agent_instruction": (
+            "Relay each message below VERBATIM to the user via the normal push. "
+            "Do not paraphrase, do not add claims, never use the word 'bookable'. "
+            "After relaying each, record it with: "
+            "python run.py outbox-mark --alert-id <id> "
+            "--state relay_attempted_unconfirmed. "
+            "After the USER confirms a deal, finalize it (human-driven only) with: "
+            "python run.py outbox-confirm --alert-id <id> --by <your name>."
+        ),
+    }
     print(json.dumps(summary, indent=2))
     return 0
 
 
+def cmd_outbox_mark(args, db, watches, guard):
+    """Agent-facing: record that a prepared handoff was relayed.
+
+    Only the handoff_prepared -> relay_attempted_unconfirmed transition is
+    allowed here. user_confirmed is NEVER settable through this path --
+    use outbox-confirm (human-driven) for that.
+    """
+    ok = update_outbox_state(db, args.alert_id, args.state, actor="agent")
+    if not ok:
+        row = outbox_get(db, args.alert_id)
+        have = row["state"] if row else "<unknown alert_id>"
+        raise SystemExit(
+            f"outbox-mark failed: cannot move {args.alert_id} from "
+            f"{have} to {args.state}")
+    print(json.dumps({"alert_id": args.alert_id, "state": args.state}))
+    return 0
+
+
+def cmd_outbox_list(args, db, watches, guard):
+    """List outbox alerts: the digest input."""
+    rows = outbox_list(db, args.state)
+    print(json.dumps({"alerts": [
+        {"alert_id": r["alert_id"], "state": r["state"],
+         "handoff_count": r["handoff_count"],
+         "prepared_slot": r["prepared_slot"],
+         "price_usd": r["price_usd"],
+         "confirmed_by": r["confirmed_by"],
+         "created_at": r["created_at"], "updated_at": r["updated_at"],
+         "message": r["message_text"]}
+        for r in rows]}, indent=2))
+    return 0
+
+
+def cmd_outbox_confirm(args, db, watches, guard):
+    """Human-only: finalize an alert after the USER confirms the deal.
+
+    This is the ONLY path to the user_confirmed state (spec item 10), and
+    scheduled code must never call it. The actor name is recorded for audit.
+    """
+    if not args.by:
+        raise SystemExit("outbox-confirm requires --by <actor> for audit")
+    ok = set_outbox_user_confirmed(db, args.alert_id, args.by)
+    if not ok:
+        raise SystemExit(
+            f"outbox-confirm failed for {args.alert_id}: unknown id or "
+            f"already terminal")
+    print(json.dumps({"alert_id": args.alert_id, "state": "user_confirmed",
+                      "confirmed_by": args.by}))
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Cheap Flight Monitor (Phase 1)")
+    ap = argparse.ArgumentParser(description="Cheap Flight Monitor (v2)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("broad", help="flex-date sweep for a watch")
     p.add_argument("--watch", required=True)
     p.add_argument("--duration", type=int, default=7)
+    _add_scheduled(p)
 
     p = sub.add_parser("narrow", help="specific-date round trip for a watch")
     p.add_argument("--watch", required=True)
     p.add_argument("--depart", required=True)
     p.add_argument("--return", dest="return_", required=True)
+    _add_scheduled(p)
 
-    sub.add_parser("canary", help="self-health reference query")
+    p = sub.add_parser("canary", help="self-health reference query")
+    _add_scheduled(p)
 
-    p = sub.add_parser("check", help="narrow poll + score + verify + record alerts")
+    p = sub.add_parser("check", help="drain handoffs, collect, score, verify, handoff")
     p.add_argument("--watch", default=None)
+    _add_scheduled(p)
+
+    p = sub.add_parser("outbox-mark", help="record a relayed handoff (agent use)")
+    p.add_argument("--alert-id", required=True)
+    p.add_argument("--state", required=True,
+                   choices=["relay_attempted_unconfirmed"])
+
+    p = sub.add_parser("outbox-list", help="list outbox alerts (digest input)")
+    p.add_argument("--state", default=None,
+                   choices=["pending", "handoff_prepared",
+                            "relay_attempted_unconfirmed", "user_confirmed",
+                            "retired"])
+
+    p = sub.add_parser("outbox-confirm",
+                       help="finalize an alert after USER confirmation (human only)")
+    p.add_argument("--alert-id", required=True)
+    p.add_argument("--by", required=True, help="actor name, recorded for audit")
 
     args = ap.parse_args()
+    db = None
     try:
         defaults, watches = load_config()
         db = init_db(DB_PATH)
         sync_watches(db, watches, defaults)
+        # The transport guard counts ACTUAL HTTP attempts and refuses to send
+        # when no guard is installed (fail closed). Installed for every
+        # collecting command, so even manual runs count against the ceilings.
+        guard = BudgetGuard(db)
+        guard.reset_run()
+        if args.cmd in ("broad", "narrow", "canary", "check"):
+            transport.install_transport_guard(guard)
         if args.cmd == "broad":
-            return cmd_broad(args, db, watches)
+            return run_guarded("broad", args, db, watches, guard, cmd_broad)
         if args.cmd == "narrow":
-            return cmd_narrow(args, db, watches)
+            return run_manual("narrow", args, db, watches, guard, cmd_narrow)
         if args.cmd == "canary":
-            return cmd_canary(args, db, watches)
+            return run_manual("canary", args, db, watches, guard, cmd_canary)
+        if args.cmd == "outbox-mark":
+            return cmd_outbox_mark(args, db, watches, guard)
+        if args.cmd == "outbox-list":
+            return cmd_outbox_list(args, db, watches, guard)
+        if args.cmd == "outbox-confirm":
+            return cmd_outbox_confirm(args, db, watches, guard)
         if args.cmd == "check":
-            return cmd_check(args, db, watches)
+            return run_guarded("check", args, db, watches, guard, cmd_check)
     except SystemExit:
         raise
+    except BudgetExhausted as e:  # manual commands hitting the ceiling: clean no-op
+        print(json.dumps({"status": "noop", "reason": "budget_exhausted",
+                          "detail": str(e)}, indent=2))
+        return 0
     except Exception:  # noqa: BLE001 - infrastructure failure -> non-zero exit
+        # A crash OUTSIDE run_guarded (config/DB failure): still /fail the
+        # scheduled check so a dead scheduler is never green.
+        if getattr(args, "scheduled", False) and args.cmd in PING_COMMANDS:
+            try:
+                heartbeat.ping_fail(db)
+            except Exception:
+                pass
         traceback.print_exc()
         return 1
     return 1

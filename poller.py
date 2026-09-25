@@ -1,12 +1,19 @@
-"""Flight searches via the `flights` PyPI package (punitarani/fli).
+#!/usr/bin/env python3
+"""Round-trip flight poller (v2: real HTTP-attempt accounting).
 
-Two primitives:
-  broad_scan(watch_cfg)  -- flex-date sweep over the watch window; finds cheap date combos.
-  narrow_query(...)      -- specific-date round trip with full itinerary detail.
+Every real HTTP send goes through the transport guard installed on
+fli's session layer (see transport.py). The budget therefore counts
+actual network attempts -- retries, pagination, and blank-page refetches
+included -- not ``.search()`` calls (spec item 1).
 
-Contract: empty / failed searches return None ("unknown"), NEVER zero or an
-empty deal list. The caller must treat None as "could not determine", not
-"no deals". Requests are sequential with jitter; one retry with backoff.
+Two entry points:
+- broad_scan(watch, duration_days) -> list of combos | None
+- narrow_query(origin, dest, depart, ret, watch, ...) -> list of itinerary rows
+
+Rows are dicts with keys: origin, destination, depart_date, return_date,
+airline, stops, price_usd, currency, booking_url, cabin. ``price_usd`` is
+the total round-trip price in USD: fli's SearchFlights returns the full
+round-trip total per itinerary (see audit Q12).
 """
 from __future__ import annotations
 
@@ -29,9 +36,12 @@ from fli.models import (
 )
 from fli.search import SearchClientError, SearchDates, SearchFlights
 
+import transport
+from transport import ThrottleDetected
+
 CURRENCY = "USD"
 MAX_DATES_PER_SWEEP = 93  # library cap: one page fetch per date
-_JITTER = (1.0, 3.0)      # seconds between requests
+_JITTER = (1.0, 3.0)  # seconds between requests
 
 
 def _polite() -> None:
@@ -39,12 +49,102 @@ def _polite() -> None:
 
 
 def _base(cfg: dict):
+    # Comma-separated airport lists are supported by resolve_airports, so one
+    # query can cover several airports (grouped metro queries).
     origins = resolve_airports(",".join(cfg["origins"]))
     dests = resolve_airports(",".join(cfg["destinations"]))
     stops = parse_max_stops({0: "ANY", 1: "ONE_STOP"}.get(cfg.get("max_stops", 1), "ONE_STOP"))
     seat = parse_cabin_class(cfg.get("cabin", "economy"))
     pax = PassengerInfo(adults=1)
     return origins, dests, stops, seat, pax
+
+
+def _apt(a) -> str | None:
+    """Airport is an Enum; the IATA code is the member name."""
+    return a.name.lstrip("_") if a is not None else None
+
+
+def _flatten(result, client: SearchFlights, seat, pax, cabin: str,
+             depart: str, ret: str) -> dict | None:
+    """Flatten a FlightResult or RT tuple into a plain itinerary dict."""
+    try:
+        booking_url = client.build_flight_booking_url(
+            result, currency=CURRENCY, seat_type=seat, passenger_info=pax)
+    except Exception:
+        booking_url = None
+
+    if isinstance(result, tuple):
+        outbound, back = result[0], result[1]
+        price, currency = outbound.price, outbound.currency or CURRENCY
+        stops = (outbound.stops or 0) + (back.stops or 0)
+        airline = outbound.primary_airline_name or (
+            outbound.primary_airline.name.lstrip("_") if outbound.primary_airline else None)
+        legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
+                for l in (outbound.legs + back.legs)]
+    else:
+        price, currency = result.price, result.currency or CURRENCY
+        stops = result.stops or 0
+        airline = result.primary_airline_name or (
+            result.primary_airline.name.lstrip("_") if result.primary_airline else None)
+        legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
+                for l in result.legs]
+    if price is None:
+        return None
+    origin = legs[0]["from"] if legs else None
+    destination = legs[0]["to"] if legs else None
+    return {"origin": origin, "destination": destination, "airline": airline,
+            "stops": stops, "price_usd": float(price), "currency": currency,
+            "booking_url": booking_url or "",
+            "depart_date": depart, "return_date": ret, "cabin": cabin}
+
+
+def narrow_query(origin: str, dest: str, depart: str, ret: str, watch: dict, *,
+                 attempt_category: str = "sentinel", top_n: int = 3,
+                 require_guard: bool = True) -> list[dict]:
+    """One specific-date round trip. Returns itinerary rows (empty list =
+    unknown, never "no deals"). Raises ThrottleDetected on 429/CAPTCHA
+    (BaseException: callers must catch it explicitly).
+
+    attempt_category is one of: manual, sentinel, verify, burst, background,
+    retry_reserve.
+    """
+    if require_guard:
+        transport.require_guard()
+    _origins, _dests, stops, seat, pax = _base(watch)
+    cabin = watch.get("cabin", "economy")
+    o = resolve_airports(origin)
+    d = resolve_airports(dest)
+    segments, _ = build_flight_segments(
+        origin=o, destination=d, departure_date=depart, return_date=ret)
+    filters = FlightSearchFilters(
+        trip_type=TripType.ROUND_TRIP, passenger_info=pax,
+        flight_segments=segments, stops=stops, seat_type=seat)
+
+    last_err: Exception | None = None
+    results = None
+    with transport.category_scope(attempt_category):
+        for attempt in range(2):
+            try:
+                # Only the network call is retried; flatten bugs must crash
+                # loudly, never masquerade as "unknown". ThrottleDetected is
+                # a BaseException, so it is NOT swallowed here.
+                client = SearchFlights()
+                results = client.search(filters, top_n=top_n, currency=CURRENCY)
+            except (SearchClientError, Exception) as e:  # noqa: BLE001 - network lib
+                last_err = e
+                time.sleep(2 ** attempt * 2)
+                continue
+            break
+    _polite()
+    if not results:
+        return []  # unknown, not "no deals"
+    out = []
+    for r in results:
+        flat = _flatten(r, client, seat, pax, cabin, depart, ret)
+        if flat:
+            out.append(flat)
+    out.sort(key=lambda x: x["price_usd"])
+    return out
 
 
 def _window(cfg: dict) -> tuple[date, date]:
@@ -61,14 +161,15 @@ def _chunks(start: date, end: date, size: int = MAX_DATES_PER_SWEEP):
         cur = chunk_end + timedelta(days=1)
 
 
-def broad_scan(cfg: dict, duration_days: int = 7) -> list[dict] | None:
+def broad_scan(watch: dict, duration_days: int = 7) -> list[dict] | None:
     """Flex-date round-trip sweep: cheapest price per departure date.
 
-    Returns [{depart_date, return_date, price, currency}] sorted by price,
-    or None when the sweep failed / returned nothing usable (unknown).
+    Returns [{depart_date, return_date, price_usd}] sorted by price, or None
+    when the sweep failed / returned nothing usable (unknown, not "no deals").
     """
-    origins, dests, stops, seat, pax = _base(cfg)
-    start, end = _window(cfg)
+    transport.require_guard()
+    origins, dests, stops, seat, pax = _base(watch)
+    start, end = _window(watch)
     out: list[dict] = []
     seen_ok = False
 
@@ -82,10 +183,13 @@ def broad_scan(cfg: dict, duration_days: int = 7) -> list[dict] | None:
             flight_segments=segments, stops=stops, seat_type=seat,
             from_date=cs.isoformat(), to_date=ce.isoformat(), duration=duration_days,
         )
-        try:
-            results = SearchDates().search(filters, currency=CURRENCY)
-        except (SearchClientError, Exception):
-            results = None
+        with transport.category_scope("background"):
+            try:
+                results = SearchDates().search(filters, currency=CURRENCY)
+            except ThrottleDetected:
+                raise
+            except (SearchClientError, Exception):  # noqa: BLE001 - network lib
+                results = None
         _polite()
         if not results:
             continue
@@ -98,85 +202,9 @@ def broad_scan(cfg: dict, duration_days: int = 7) -> list[dict] | None:
             if not d0:
                 continue
             out.append({"depart_date": d0, "return_date": d1,
-                        "price": float(dp.price), "currency": dp.currency or CURRENCY})
+                        "price_usd": float(dp.price)})
 
     if not seen_ok or not out:
         return None  # unknown, not "no deals"
-    out.sort(key=lambda r: r["price"])
+    out.sort(key=lambda r: r["price_usd"])
     return out
-
-
-def _apt(a) -> str | None:
-    """Airport is an Enum; the IATA code is the member name."""
-    return a.name.lstrip("_") if a is not None else None
-
-
-def _flatten(result, client: SearchFlights, seat, pax) -> dict | None:
-    """Flatten a FlightResult or RT tuple into a plain itinerary dict."""
-    try:
-        booking_url = client.build_flight_booking_url(
-            result, currency=CURRENCY, seat_type=seat, passenger_info=pax)
-    except Exception:
-        booking_url = None
-
-    if isinstance(result, tuple):
-        outbound, ret = result[0], result[1]
-        price, currency = outbound.price, outbound.currency or CURRENCY
-        stops = (outbound.stops or 0) + (ret.stops or 0)
-        airline = outbound.primary_airline_name or (
-            outbound.primary_airline.name.lstrip("_") if outbound.primary_airline else None)
-        legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
-                for l in (outbound.legs + ret.legs)]
-    else:
-        price, currency = result.price, result.currency or CURRENCY
-        stops = result.stops or 0
-        airline = result.primary_airline_name or (
-            result.primary_airline.name.lstrip("_") if result.primary_airline else None)
-        legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
-                for l in result.legs]
-    if price is None:
-        return None
-    origin = legs[0]["from"] if legs else None
-    destination = legs[0]["to"] if legs else None
-    return {"origin": origin, "destination": destination, "airline": airline,
-            "stops": stops, "price": float(price), "currency": currency,
-            "booking_url": booking_url}
-
-
-def narrow_query(origin: str, dest: str, depart: str, return_: str,
-                 cfg: dict, top_n: int = 3) -> list[dict] | None:
-    """Specific-date round trip. Returns itineraries sorted by price, or None (unknown)."""
-    origins, dests, stops, seat, pax = _base(cfg)
-    o = resolve_airports(origin)
-    d = resolve_airports(dest)
-    segments, _ = build_flight_segments(
-        origin=o, destination=d, departure_date=depart, return_date=return_)
-    filters = FlightSearchFilters(
-        trip_type=TripType.ROUND_TRIP, passenger_info=pax,
-        flight_segments=segments, stops=stops, seat_type=seat)
-
-    last_err: Exception | None = None
-    results = None
-    for attempt in range(2):
-        try:
-            # Only the network call is retried; flatten bugs must crash loudly,
-            # never masquerade as "unknown".
-            client = SearchFlights()
-            results = client.search(filters, top_n=top_n, currency=CURRENCY)
-        except (SearchClientError, Exception) as e:  # noqa: BLE001 - network lib, be liberal
-            last_err = e
-            time.sleep(2 ** attempt * 2)
-            continue
-        break
-    _polite()
-    if not results:
-        return None  # unknown, not "no deals"
-    out = []
-    for r in results:
-        flat = _flatten(r, client, seat, pax)
-        if flat:
-            flat.update({"depart_date": depart, "return_date": return_,
-                         "cabin": cfg.get("cabin", "economy")})
-            out.append(flat)
-    out.sort(key=lambda x: x["price"])
-    return out or None
