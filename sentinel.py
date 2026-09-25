@@ -197,15 +197,21 @@ def mint_sentinels(db, groups_cfg, today=None) -> int:
         lo_d, hi_d = _window_days(group_cfg)
         win_start = today_d + timedelta(days=lo_d)
         win_end = today_d + timedelta(days=hi_d)
-        step = max(1, -(-(hi_d - lo_d) // SENTINEL_ANCHORS_PER_GROUP))  # ceil
+        # Nearest-integer spacing, capped at 27 anchors: ~27 for any window
+        # (ceil spacing gave only 16 for a 30-day window).
+        step = max(1, round((hi_d - lo_d) / SENTINEL_ANCHORS_PER_GROUP))
         duration = _sentinel_duration(group_cfg)
+        picked = 0
         for k, base in _lattice(win_start, win_end, step):
+            if picked >= SENTINEL_ANCHORS_PER_GROUP:
+                break
             delta = ((k % 7) - base.weekday()) % 7
             if delta > 3:
                 delta -= 7
             d = base + timedelta(days=delta)
             if not (win_start <= d <= win_end):
                 continue
+            picked += 1
             cells.append({
                 "group_id": group_id,
                 "depart_date": d.isoformat(),
@@ -215,29 +221,24 @@ def mint_sentinels(db, groups_cfg, today=None) -> int:
             })
     new_count = store.ensure_cells(db, cells)
 
-    # Roll the window forward: retire anchors that left the window or whose
-    # stay length is no longer the configured sentinel stay.
-    for group_id, group_cfg in groups_cfg.items():
-        lo_d, hi_d = _window_days(group_cfg)
-        _retire_outside(db, group_id, "sentinel",
-                        (today_d + timedelta(days=lo_d)).isoformat(),
-                        (today_d + timedelta(days=hi_d)).isoformat(),
-                        durations={_sentinel_duration(group_cfg)})
+    # Anything active that is not in today's computed grid is retired:
+    # anchors that left the window, a changed stay or window, and cells
+    # left over from the old today-relative grid.
+    _retire_not_in(db, groups_cfg, "sentinel", cells)
     return new_count
 
 
-def _retire_outside(db, group_id, role, lo_iso, hi_iso, durations=None):
-    """Retire active cells of *group_id*/*role* departing outside
-    [lo_iso, hi_iso], or (when given) with a stay not in *durations*."""
-    rows = db.execute(
-        """SELECT id, depart_date, duration FROM cells
-           WHERE group_id = ? AND role = ? AND active = 1""",
-        (group_id, role)).fetchall()
-    for row in rows:
-        if (row["depart_date"] < lo_iso or row["depart_date"] > hi_iso
-                or (durations is not None
-                    and row["duration"] not in durations)):
-            store.retire_cell(db, row["id"])
+def _retire_not_in(db, groups_cfg, role, cells):
+    """Retire active *role* cells of these groups that are not in *cells*
+    (the grid just computed), so the active grid is exactly the lattice."""
+    wanted = {(c["group_id"], c["depart_date"], c["duration"]) for c in cells}
+    for group_id in groups_cfg:
+        for row in db.execute(
+                """SELECT id, depart_date, duration FROM cells
+                   WHERE group_id = ? AND role = ? AND active = 1""",
+                (group_id, role)).fetchall():
+            if (group_id, row["depart_date"], row["duration"]) not in wanted:
+                store.retire_cell(db, row["id"])
 
 
 def ensure_background_grid(db, groups_cfg, today=None) -> int:
@@ -265,13 +266,7 @@ def ensure_background_grid(db, groups_cfg, today=None) -> int:
                     "weekday": d.weekday(),
                 })
     new_count = store.ensure_cells(db, cells)
-
-    for group_id, group_cfg in groups_cfg.items():
-        lo_d, hi_d = _window_days(group_cfg)
-        _retire_outside(db, group_id, "background",
-                        (today_d + timedelta(days=lo_d)).isoformat(),
-                        (today_d + timedelta(days=hi_d)).isoformat(),
-                        durations=set(_durations(group_cfg)))
+    _retire_not_in(db, groups_cfg, "background", cells)
     return new_count
 
 

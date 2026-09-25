@@ -203,7 +203,18 @@ class TestMint(SentinelTestBase):
             flags[d] = row["active"]
         self.assertEqual(flags[seeded[0][1]], 0)
         self.assertEqual(flags[seeded[1][1]], 0)
-        self.assertEqual(flags[seeded[2][1]], 1)
+        # In-window but off the lattice (e.g. left over from the old
+        # today-relative grid): also retired. The active set is exactly the
+        # minted anchors.
+        on_lattice = any(
+            r["depart_date"] == seeded[2][1] for r in self.db.execute(
+                "SELECT depart_date FROM cells WHERE role='sentinel' "
+                "AND active=1 AND depart_date=?", (seeded[2][1],)))
+        self.assertEqual(flags[seeded[2][1]], 1 if on_lattice else 0)
+        active = self.db.execute(
+            "SELECT COUNT(*) AS c FROM cells WHERE group_id='japan_fall_2026' "
+            "AND role='sentinel' AND active=1").fetchone()["c"]
+        self.assertLessEqual(active, 27)
 
     def test_background_grid_counts(self):
         n = sentinel.ensure_background_grid(self.db, GROUPS, today=TODAY)
@@ -284,6 +295,38 @@ class TestGridStability(SentinelTestBase):
         want = {r["depart_date"] for r in self.db.execute(
             "SELECT depart_date FROM cells WHERE role='sentinel' AND active=1")}
         self.assertTrue(24 <= len(want) <= 27)
+
+    def test_old_grid_cells_are_retired(self):
+        """Cells from the old today-relative grid (any date, any stay) are
+        retired on the first mint, leaving exactly the lattice."""
+        cfg = {"g1": {"origins": ["SFO"], "destinations": ["NRT"]}}
+        start = date.fromisoformat(TODAY)
+        store.ensure_cells(self.db, [
+            {"group_id": "g1",
+             "depart_date": (start + timedelta(days=d)).isoformat(),
+             "duration": dur, "role": "background", "weekday": 0}
+            for d in range(14, 181, 3) for dur in (5, 9, 14)])
+        sentinel.mint_sentinels(self.db, cfg, today=TODAY)
+        sentinel.ensure_background_grid(self.db, cfg, today=TODAY)
+        rows = self.db.execute(
+            "SELECT depart_date FROM cells WHERE role='background' "
+            "AND active=1").fetchall()
+        for r in rows:
+            self.assertEqual(date.fromisoformat(r["depart_date"]).weekday(), 0)
+        self.assertLessEqual(len(rows), 27 * 10)
+
+    def test_short_window_keeps_about_27_sentinels(self):
+        for lo, hi in ((30, 60), (30, 120), (90, 270)):
+            with self.subTest(window=(lo, hi)):
+                cfg = {f"w{lo}{hi}": {"origins": ["SFO"],
+                                      "destinations": ["NRT"],
+                                      "window_days": (lo, hi)}}
+                sentinel.mint_sentinels(self.db, cfg, today=TODAY)
+                n = self.db.execute(
+                    "SELECT COUNT(*) AS c FROM cells WHERE group_id=? AND "
+                    "role='sentinel' AND active=1",
+                    (f"w{lo}{hi}",)).fetchone()["c"]
+                self.assertTrue(24 <= n <= 27, (lo, hi, n))
 
     def test_retired_cell_reactivates_when_wanted_again(self):
         cfg_wide = {"g1": {"origins": ["SFO"], "destinations": ["NRT"],
