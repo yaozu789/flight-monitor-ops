@@ -48,7 +48,28 @@ def _watch_leg(watch: dict, plural_key: str, singular_key: str) -> str:
     return str(single) if single is not None else "?"
 
 
-def render_alert_message(watch, confirmation, fingerprint, first_seen_at) -> str:
+def _history_lines(history, price) -> list[str]:
+    """Dated price context from stored observations (never computed by the
+    relaying agent), so the alert can be checked rather than trusted."""
+    if not history:
+        return []
+    if not history.get("checks"):
+        return ["History: no earlier checks for these dates yet."]
+    head = (f"History ({history['depart_from']} to {history['depart_to']} "
+            f"departures, {history['duration']}-night trips, "
+            f"{history['checks']} checks since {history['since']}):")
+    verdict = " = lowest seen" if price <= history["low"] else ""
+    stats = (f"  {history['lookback_days']}-day low ${history['low']:,.0f} "
+             f"({history['low_day']}) | median daily low "
+             f"${history['median_daily_low']:,.0f} | this fare "
+             f"${price:,.0f}{verdict}")
+    recent = "  Recent daily lows: " + " | ".join(
+        f"{day[5:]} ${p:,.0f}" for day, p in history["recent"])
+    return [head, stats, recent]
+
+
+def render_alert_message(watch, confirmation, fingerprint, first_seen_at,
+                         history=None) -> str:
     """Plain-text handoff.
 
     Includes: route, dates, airline/stops, price USD, booking URL,
@@ -74,6 +95,7 @@ def render_alert_message(watch, confirmation, fingerprint, first_seen_at) -> str
         f"{_stops_text(confirmation.get('stops'))}",
         f"First seen {first_seen_at}; rechecked at {confirmation['observed_at']}.",
     ]
+    lines.extend(_history_lines(history, confirmation["price_usd"]))
     if confirmation.get("booking_url"):
         lines.append(f"Book: {confirmation['booking_url']}")
     lines.append(f"Reference: {fingerprint}")
@@ -95,7 +117,9 @@ def enqueue_from_confirmation(db, watch, candidate, confirmation) -> tuple[str, 
     alert_id = make_alert_id(watch_id, store.depart_week(candidate["depart_date"]))
     message = render_alert_message(
         watch, confirmation, candidate["fingerprint"],
-        store.first_seen(db, candidate["fingerprint"]))
+        store.first_seen(db, candidate["fingerprint"]),
+        history=store.price_history(db, watch_id, confirmation["depart_date"],
+                                    confirmation["return_date"]))
     return store.enqueue_alert(
         db,
         alert_id=alert_id,
@@ -151,7 +175,10 @@ def recheck_retries(db, watches, guard, slot, deadline_fn=None) -> dict:
         if status == "confirmed":
             message = render_alert_message(
                 watch, confirmation, row["fingerprint"],
-                store.first_seen(db, row["fingerprint"]))
+                store.first_seen(db, row["fingerprint"]),
+                history=store.price_history(
+                    db, row["watch_id"], confirmation["depart_date"],
+                    confirmation["return_date"]))
             store.update_outbox_message(db, row["alert_id"], message,
                                         confirmation["price_usd"])
             retry_ids.append(row["alert_id"])

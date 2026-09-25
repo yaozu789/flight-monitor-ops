@@ -404,7 +404,9 @@ class OutboxRetryTests(unittest.TestCase):
         self.assertEqual(result["retry_ids"], [aid])
         row = store.outbox_get(db, aid)
         self.assertIn("490", row["message_text"])       # fresh recheck price
-        self.assertNotIn("460", row["message_text"])   # stale price replaced
+        # Stale price replaced in the headline (the history section may
+        # legitimately list the earlier $460 observation, dated).
+        self.assertNotIn("460", row["message_text"].splitlines()[0])
         self.assertEqual(row["price_usd"], 490.0)
 
 
