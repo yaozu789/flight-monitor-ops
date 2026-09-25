@@ -73,6 +73,7 @@ def _flatten(result, client: SearchFlights, seat, pax, cabin: str,
     except Exception:
         booking_url = None
 
+    back = None
     if isinstance(result, tuple):
         outbound, back = result[0], result[1]
         price, currency = outbound.price, outbound.currency or CURRENCY
@@ -86,12 +87,26 @@ def _flatten(result, client: SearchFlights, seat, pax, cabin: str,
         airline = result.primary_airline_name or (
             result.primary_airline.name.lstrip("_") if result.primary_airline else None)
         raw_legs = result.legs
-    legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
-            for l in raw_legs]
+        outbound = result
     if price is None:
         return None
-    origin = legs[0]["from"] if legs else None
-    destination = legs[0]["to"] if legs else None
+    # Only USD fares can be compared with USD caps.
+    if (currency or CURRENCY).upper() != CURRENCY:
+        return None
+    # Spec: self-transfer itineraries are excluded from normal alerts.
+    if getattr(outbound, "self_transfer", None) or (
+            back is not None and getattr(back, "self_transfer", None)):
+        return None
+    # Endpoints of each direction: first departure and FINAL arrival (the
+    # first leg's arrival is only the layover on a connecting flight).
+    out_legs = list(outbound.legs)
+    back_legs = list(back.legs) if back is not None else []
+    origin = _apt(out_legs[0].departure_airport) if out_legs else None
+    destination = _apt(out_legs[-1].arrival_airport) if out_legs else None
+    return_origin = (_apt(back_legs[0].departure_airport)
+                     if back_legs else None)
+    return_destination = (_apt(back_legs[-1].arrival_airport)
+                          if back_legs else None)
 
     # v3: per-leg flight numbers and departure datetimes feed the richer
     # fingerprint (store.make_fingerprint) and are persisted on the
@@ -108,7 +123,9 @@ def _flatten(result, client: SearchFlights, seat, pax, cabin: str,
             depart_times.append(dt.isoformat() if hasattr(dt, "isoformat")
                                 else str(dt))
 
-    return {"origin": origin, "destination": destination, "airline": airline,
+    return {"origin": origin, "destination": destination,
+            "return_origin": return_origin,
+            "return_destination": return_destination, "airline": airline,
             "stops": stops, "price_usd": float(price), "currency": currency,
             "booking_url": booking_url or "",
             "depart_date": depart, "return_date": ret, "cabin": cabin,

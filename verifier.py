@@ -48,6 +48,10 @@ def _match(row: dict, depart_date: str, return_date: str) -> str:
 
 def _confirmation(match: dict, depart_date: str, return_date: str) -> dict:
     return {
+        "origin": match.get("origin"),
+        "destination": match.get("destination"),
+        "return_origin": match.get("return_origin"),
+        "return_destination": match.get("return_destination"),
         "price_usd": _price(match),
         "depart_date": depart_date,
         "return_date": return_date,

@@ -31,7 +31,7 @@ def run_canary(db: sqlite3.Connection, cfg: dict) -> tuple[bool, str]:
         detail = f"empty/failed query {REFERENCE['origin']}->{REFERENCE['dest']} {depart}/{ret}"
         add_health(db, "canary", False, detail)
         return False, detail
-    cheapest = min(r["price"] for r in results)
+    cheapest = min(r["price_usd"] for r in results)
     detail = (f"{len(results)} itineraries {REFERENCE['origin']}->{REFERENCE['dest']} "
               f"{depart}/{ret}, cheapest ${cheapest:.0f}")
     add_health(db, "canary", True, detail)
