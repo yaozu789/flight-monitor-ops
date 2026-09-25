@@ -42,7 +42,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 
-class DeadlineExceeded(Exception):
+class DeadlineExceeded(BaseException):
     """A collection run exceeded its run deadline (run.RUN_DEADLINE_S).
 
     Control-flow only: run.run_guarded catches it for a CONTROLLED stop --
@@ -354,6 +354,14 @@ def init_db(path_or_db: str | Path | sqlite3.Connection) -> sqlite3.Connection:
     db.executescript(SCHEMA_BASE)
     db.executescript(SCHEMA_V2)
     migrate_db(db)  # add v2 columns to tables the base script just created
+    # daily_counters (which enforce the limits) arrived after budget_ledger:
+    # backfill them from the ledger so a migrated DB does not forget today's
+    # spend. MAX keeps this idempotent (ledger_insert bumps both together).
+    db.execute(
+        """INSERT INTO daily_counters (day, category, n)
+           SELECT day, category, SUM(attempts) FROM budget_ledger
+           WHERE true GROUP BY day, category
+           ON CONFLICT (day, category) DO UPDATE SET n = MAX(n, excluded.n)""")
     db.commit()
     return db
 
@@ -955,12 +963,16 @@ def count_today(db: sqlite3.Connection, day: str,
 
 # ---------------------------------------------------------------- throttle
 
-def get_backoff(db: sqlite3.Connection) -> dict | None:
+def get_throttle_state(db: sqlite3.Connection) -> dict | None:
+    """The persisted throttle row, active or expired (for backoff history)."""
     row = db.execute("SELECT * FROM throttle_state WHERE id = 1").fetchone()
-    if row is None:
-        return None
-    d = dict(row)
-    if d["until_ts"] <= time.time():
+    return dict(row) if row else None
+
+
+def get_backoff(db: sqlite3.Connection) -> dict | None:
+    """The throttle row only while its backoff is still active."""
+    d = get_throttle_state(db)
+    if d is None or d["until_ts"] <= time.time():
         return None
     return d
 
@@ -978,6 +990,17 @@ def set_backoff(db: sqlite3.Connection, kind: str, until_ts: float,
         (kind, until_ts, retry_after_s, detail, utcnow_iso()))
     db.commit()
     add_health(db, "throttle", False, f"{kind}: {detail}")
+
+
+def clear_backoff_if_unchanged(db: sqlite3.Connection, seen: dict) -> bool:
+    """Delete the throttle row only if it is still exactly the row *seen*
+    (same until_ts and updated_at), so a stale success cannot erase a newer
+    throttle written concurrently. Returns True when a row was deleted."""
+    cur = db.execute(
+        "DELETE FROM throttle_state WHERE id = 1 AND until_ts = ? "
+        "AND updated_at = ?", (seen["until_ts"], seen["updated_at"]))
+    db.commit()
+    return cur.rowcount > 0
 
 
 def clear_backoff(db: sqlite3.Connection) -> None:

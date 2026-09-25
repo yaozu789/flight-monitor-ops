@@ -247,6 +247,10 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         def _deadline_exceeded() -> bool:
             return time.monotonic() >= deadline_at
 
+        # The deadline is also enforced before every HTTP send, so one long
+        # search cannot run past it (a stale lock could then be broken while
+        # this run is still sending).
+        transport.set_deadline_fn(_deadline_exceeded)
         try:
             rc = fn(args, db, watches, guard,
                     drained=drained, deadline_fn=_deadline_exceeded)
@@ -310,6 +314,7 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         _ping_ok(args, cmd_name, db)
         return rc
     finally:
+        transport.set_deadline_fn(None)
         release_lock(db, owner)
 
 

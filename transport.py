@@ -43,7 +43,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import threading
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 import time
 
 from curl_cffi.requests import Session
@@ -215,24 +215,93 @@ def set_send_handler(fn) -> None:
 # send wrapper (wraps original Session.get / Session.post)
 # ---------------------------------------------------------------------------
 
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+MAX_REDIRECTS = 5
+
+_deadline_fn = None  # set by run.run_guarded for the duration of a run
+
+
+def set_deadline_fn(fn) -> None:
+    """Install (or clear with None) the run deadline checked before every
+    send, so a run cannot keep sending past its deadline inside one search."""
+    global _deadline_fn
+    _deadline_fn = fn
+
+
+def _check_send_gates(guard) -> dict | None:
+    """Before any send: stop on the run deadline or an ACTIVE persisted
+    backoff (covers fli's own retries and manual commands, which never go
+    through run_guarded's backoff check). Returns the throttle row, active
+    or expired, for the success path."""
+    if _deadline_fn is not None and _deadline_fn():
+        raise store.DeadlineExceeded("run deadline exceeded before send")
+    state = guard.read_throttle_state()
+    if state is not None and state["until_ts"] > time.time():
+        raise ThrottleDetected(
+            state["kind"], None,
+            "persisted backoff active until %.0f" % state["until_ts"])
+    return state
+
+
 def _do_send(method, orig, self_obj, args, kwargs):
     # 1. Fail closed: no guard installed -> RuntimeError, nothing sent.
     guard = require_guard()
-    # 2. Reserve budget for this category. BudgetExhausted (BaseException)
-    #    propagates untouched: nothing is sent, nothing is recorded, and
-    #    fli's `except Exception` cannot wrap it (v3 item 2).
+    kwargs = dict(kwargs)
+    url = args[0] if args else kwargs.pop("url", "")
+    rest = args[1:]
+    # 2. Redirects are followed HERE, one budgeted send per hop; libcurl's
+    #    own redirect-following would hide hops from the ledger.
+    follow = kwargs.pop("allow_redirects", True)
+    kwargs["allow_redirects"] = False
+    state = None
+    hops = 0
+    while True:
+        gate = _check_send_gates(guard)
+        if hops == 0:
+            state = gate
+        resp = _send_once(guard, method, orig, self_obj, url, rest, kwargs)
+        status = getattr(resp, "status_code", None)
+        location = _header(getattr(resp, "headers", None), "location")
+        if not (follow and status in REDIRECT_STATUSES and location
+                and hops < MAX_REDIRECTS):
+            break
+        url = urljoin(url, location)
+        if status == 303 or (status in (301, 302) and method == "POST"):
+            method, orig = "GET", _orig_session_get
+            for k in ("data", "json", "files"):
+                kwargs.pop(k, None)
+        hops += 1
+    # 3. A clean response ends a streak of throttles (expired history row).
+    if state is not None:
+        guard.clear_throttle_state(state)
+    return resp
+
+
+def _header(headers, name):
+    """Case-insensitive header lookup on a dict or curl_cffi Headers."""
+    try:
+        items = headers.items()
+    except AttributeError:
+        return None
+    for key, value in items:
+        if str(key).lower() == name:
+            return value
+    return None
+
+
+def _send_once(guard, method, orig, self_obj, url, rest, kwargs):
+    """One budgeted HTTP attempt, classified for throttling."""
+    # Reserve budget for this category. BudgetExhausted (BaseException)
+    # propagates untouched: nothing is sent, nothing is recorded, and fli's
+    # `except Exception` cannot wrap it (v3 item 2).
     category = current_category()
     guard.reserve(category)
-
-    url = args[0] if args else kwargs.get("url", "")
     handler = _send_handler
 
     def do_real():
-        return orig(self_obj, *args, **kwargs)
+        return orig(self_obj, url, *rest, **kwargs)
 
     call = (lambda: handler(method, url, kwargs, do_real)) if handler else do_real
-
-    # 3. Call handler-or-original; classify failures.
     try:
         resp = call()
     except BaseException as exc:
@@ -240,11 +309,8 @@ def _do_send(method, orig, self_obj, args, kwargs):
             raise
         _raise_if_throttle(guard, method, url, exc)
         raise  # not a throttle -> re-raise unchanged
-
-    # 4. Success path (v3 item 4): inspect the RETURNED response for 429 /
-    #    suspect 403 / CAPTCHA before handing it back to fli. The old code
-    #    only checked the CAPTCHA marker here, so a returned 429 was treated
-    #    as a normal response.
+    # Inspect the RETURNED response for 429 / suspect 403 / CAPTCHA before
+    # handing it back to fli (v3 item 4).
     _raise_if_throttled_response(guard, method, url, resp)
     return resp
 
@@ -367,7 +433,9 @@ def _record_throttle(guard, kind, headers, detail="") -> float | None:
     applies ONLY when the header is absent.
     """
     retry_after_s = _parse_retry_after(headers or {})
-    prev = guard.read_backoff() or {}
+    # History, not just the active backoff: an expired row still counts
+    # toward the exponential curve until a clean response clears it.
+    prev = guard.read_throttle_state() or {}
     consecutive = int(prev.get("consecutive", 0) or 0) + 1
     if retry_after_s is not None:
         backoff_s = retry_after_s
