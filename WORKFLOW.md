@@ -16,8 +16,8 @@
 6. **Muse deploys only a merged `main` commit, and only after Yaozu approves.** No auto-pull. No schedule, destination, limit, or credential change without Yaozu's OK.
 
 Rules:
-- Never commit `data/`, `*.db`, `.env`, tokens, or the healthchecks ping URL. The URL lives only in the runtime env var `HEALTHCHECKS_PING_URL`.
+- Never commit `data/`, `*.db`, `.env`, tokens, or the healthchecks ping URL. At runtime it reaches the process only as the env var `HEALTHCHECKS_PING_URL`; on Muse it is stored in the gitignored `.env` (mode 600) and exported per run.
 - Test fixtures live inside this repo. No absolute paths to any machine.
 - Dependencies go in `requirements.txt` with exact pins.
 - A new test must fail on the code before its fix.
-- Design source of truth: `Flight_monitor_final_spec.md` in Yaozu's project folder (outside this repo).
+- Design source of truth: `docs/spec.md`, plus the post-spec decisions listed in `CLAUDE.md`.
