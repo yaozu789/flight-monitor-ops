@@ -102,6 +102,9 @@ class Stage4OrchestrationTests(unittest.TestCase):
 
         def collect_writes_deal(db_, guard_, groups, slot_, run_start, **kw):
             order.append("collect")
+            # Like the real collect(): narrow the per-run allowance to the
+            # paced share and spend all of it.
+            guard_.set_run_allowance(guard_.spent_run())
             store.add_observation(
                 db_, watch_id="w1", origin="SFO", destination="JFK",
                 depart_date="2026-11-01", return_date="2026-11-08",
@@ -112,6 +115,7 @@ class Stage4OrchestrationTests(unittest.TestCase):
 
         def fake_verify(db_, watch, cand, guard_, **kw):
             order.append("verify")
+            guard_.reserve("verify")  # real budget path, no network
             return True, {"price_usd": cand["price_usd"],
                           "depart_date": cand["depart_date"],
                           "return_date": cand["return_date"],
@@ -134,6 +138,65 @@ class Stage4OrchestrationTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "handoff_prepared")
         self.assertEqual(rows[0]["prepared_slot"], slot)
+
+    def test_verified_deal_hands_off_when_budget_stops_run(self):
+        """If the budget runs out mid-verify, deals already verified in this
+        run are still handed off in this slot (not left pending)."""
+        from budget import BudgetExhausted
+        db, guard = _ctx(self)
+        slot = store.slot_id()
+
+        def collect_writes_two(db_, guard_, groups, slot_, run_start, **kw):
+            for price, dep in ((400.0, "2026-11-01"), (450.0, "2026-12-01")):
+                store.add_observation(
+                    db_, watch_id="w1", origin="SFO", destination="JFK",
+                    depart_date=dep, return_date=dep[:8] + "08",
+                    airline="UA", stops=0, cabin="economy", price_usd=price,
+                    booking_url="https://example.invalid/b")
+            return {"attempts": 0, "bursts": 0, "sentinels": 0,
+                    "background": 0, "drop_triggers": 0}
+
+        calls = []
+
+        def verify_then_exhaust(db_, watch, cand, guard_, **kw):
+            calls.append(cand["price_usd"])
+            if len(calls) > 1:
+                raise BudgetExhausted("daily", "verify", 150, 150)
+            return True, {"price_usd": cand["price_usd"],
+                          "depart_date": cand["depart_date"],
+                          "return_date": cand["return_date"],
+                          "airline": cand["airline"], "stops": cand["stops"],
+                          "booking_url": cand["booking_url"],
+                          "observed_at": store.utcnow_iso()}
+
+        with mock.patch.object(fm_sentinel, "mint_sentinels", return_value=0), \
+                mock.patch.object(fm_sentinel, "ensure_background_grid",
+                                  return_value=0), \
+                mock.patch.object(fm_sentinel, "collect", collect_writes_two), \
+                mock.patch.object(fm_run, "verify", verify_then_exhaust):
+            args = SimpleNamespace(cmd="check", scheduled=False, watch="w1")
+            with self.assertRaises(BudgetExhausted):
+                fm_run.cmd_check(args, db, [WATCH], guard)
+        rows = db.execute("SELECT state, prepared_slot, price_usd "
+                          "FROM outbox").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["price_usd"], 400.0)
+        self.assertEqual(rows[0]["state"], "handoff_prepared")
+        self.assertEqual(rows[0]["prepared_slot"], slot)
+
+    def test_tied_observations_score_once(self):
+        """Rows of one fingerprint sharing an observed_at (collection stamps
+        a whole run with run_start) yield ONE candidate, not duplicates."""
+        db, _ = _ctx(self)
+        ts = store.utcnow_iso()
+        for _ in range(2):
+            store.add_observation(
+                db, watch_id="w1", origin="SFO", destination="JFK",
+                depart_date="2026-11-01", return_date="2026-11-08",
+                airline="UA", stops=0, cabin="economy", price_usd=400.0,
+                booking_url="https://example.invalid/b", observed_at=ts)
+        rows = store.latest_observations_since(db, "w1", ts)
+        self.assertEqual(len(rows), 1)
 
     def test_three_handoffs_one_slot(self):
         """Drained + retried + new handoffs can all prepare in one slot."""

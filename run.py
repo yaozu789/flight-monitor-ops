@@ -39,7 +39,7 @@ import yaml  # noqa: E402
 import heartbeat  # noqa: E402
 import sentinel  # noqa: E402
 import transport  # noqa: E402
-from budget import BudgetExhausted, BudgetGuard  # noqa: E402
+from budget import PER_RUN_MAX, BudgetExhausted, BudgetGuard  # noqa: E402
 from canary import run_canary  # noqa: E402
 from outbox import (  # noqa: E402
     RELAYABLE_ACTIONS,
@@ -327,7 +327,8 @@ def cmd_canary(args, db, watches, guard):
     return 0 if ok else 2
 
 
-def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals):
+def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
+                       deadline_fn=None):
     """Score observations written since *since_iso*, verify each under-cap
     candidate (verify budget), and enqueue confirmed deals.
 
@@ -340,6 +341,7 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals):
             db, w, since_iso, cooldown_hours=w.get("cooldown_hours", 24))
         watch_new: list[str] = []
         for c in candidates:
+            _check_deadline(deadline_fn)
             ok, conf = verify(db, w, c, guard)
             if not ok:
                 continue  # unknown: never alert on an unverified fare
@@ -352,8 +354,11 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals):
             # was already outboxed without a meaningful drop and must NOT
             # be emitted to relay again -- only inserted and rearmed
             # alerts join the relay batch.
-            if action in RELAYABLE_ACTIONS:
+            # Record immediately (not after the loop) so a budget/deadline
+            # stop later in this pass still hands this deal off.
+            if action in RELAYABLE_ACTIONS and aid not in new_ids:
                 watch_new.append(aid)
+                new_ids.append(aid)
             duration = (date.fromisoformat(conf["return_date"])
                         - date.fromisoformat(conf["depart_date"])).days
             verified_deals.append({
@@ -361,7 +366,6 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals):
                 "price_usd": conf["price_usd"],
                 "depart_date": conf["depart_date"], "duration": duration,
                 "cap": w["absolute_cap_usd"]})
-        new_ids.extend(watch_new)
         per_watch[w["id"]] = watch_new
     return per_watch
 
@@ -414,38 +418,46 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
         slot_start_ts(slot - 1), tz=timezone.utc).isoformat()
     new_ids: list[str] = []
     verified_deals: list[dict] = []
-    per_watch = _verify_candidates(db, targets, guard, prev_start_iso,
-                                   new_ids, verified_deals)
+    per_watch: dict[str, list[str]] = {}
+    try:
+        per_watch = _verify_candidates(db, targets, guard, prev_start_iso,
+                                       new_ids, verified_deals,
+                                       deadline_fn=deadline_fn)
 
-    # 5. Collect, paced: sentinels > bursts > background.
-    collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
-                                 deadline_fn=deadline_fn)
-    summary["collect"] = {
-        "attempts": collected["attempts"],
-        "bursts": collected["bursts"],
-        "sentinels": collected["sentinels"],
-        "background": collected["background"],
-        "drop_triggers": collected["drop_triggers"],
-        "new_sentinel_cells": n_sentinels,
-        "new_background_cells": n_bg,
-    }
+        # 5. Collect, paced: sentinels > bursts > background.
+        collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
+                                     deadline_fn=deadline_fn)
+        summary["collect"] = {
+            "attempts": collected["attempts"],
+            "bursts": collected["bursts"],
+            "sentinels": collected["sentinels"],
+            "background": collected["background"],
+            "drop_triggers": collected["drop_triggers"],
+            "new_sentinel_cells": n_sentinels,
+            "new_background_cells": n_bg,
+        }
 
-    # 6. Same-slot verify: this run's own collection output.
-    same_slot = _verify_candidates(db, targets, guard, run_start,
-                                   new_ids, verified_deals)
-    for wid, ids in same_slot.items():
-        per_watch.setdefault(wid, []).extend(ids)
+        # 6. Same-slot verify: this run's own collection output. collect()
+        # narrowed the per-run allowance to its paced share; verification is
+        # not paced (the daily ceiling and verify reserve still bound it), so
+        # restore the default before verifying.
+        guard.set_run_allowance(PER_RUN_MAX)
+        same_slot = _verify_candidates(db, targets, guard, run_start,
+                                       new_ids, verified_deals,
+                                       deadline_fn=deadline_fn)
+        for wid, ids in same_slot.items():
+            per_watch.setdefault(wid, []).extend(ids)
+    finally:
+        # 7-8 run even when budget/deadline/throttle stops the run above, so
+        # deals already verified still queue their burst trigger and hand
+        # off in this slot instead of waiting for the next drain.
+        n_triggers = sentinel.detect_under_cap_triggers(
+            db, verified_deals, run_start, slot)
+        if new_ids:
+            prepare_handoff(db, slot, new_ids)
     for wid, ids in per_watch.items():
         summary["watches"][wid] = {"new_alerts": ids}
-
-    # 7. Burst triggers for newly under-cap deals.
-    n_triggers = sentinel.detect_under_cap_triggers(
-        db, verified_deals, run_start, slot)
     summary["triggers_queued"] = n_triggers
-
-    # 8. Prepare the new handoffs (eligibility enforced inside the UPDATE).
-    if new_ids:
-        prepare_handoff(db, slot, new_ids)
 
     batch = [r for r in
              (outbox_get(db, aid) for aid in drained_ids + retry_ids + new_ids)

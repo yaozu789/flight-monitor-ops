@@ -197,6 +197,18 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([k for k, _ in self.captured], ["success"])
 
+    def test_deadline_streak_needs_back_to_back_slots(self):
+        """Deadline stops separated by a gap (a slot with no run) are not a
+        streak."""
+        db, guard = self._ctx()
+        slot = store.slot_id()
+        for prev in (slot - 3, slot - 1):  # slot - 2 never ran
+            store.claim_slot(db, prev, "check")
+            store.finish_slot(db, prev, "deadline")
+        store.claim_slot(db, slot, "check")
+        store.finish_slot(db, slot, "deadline")
+        self.assertEqual(store.deadline_streak(db), 2)
+
     def test_deadline_shorter_than_lock_ttl(self):
         """The deadline must stay below the lock TTL so a stopped run
         never wedges the lock for the next slot."""
