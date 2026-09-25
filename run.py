@@ -356,7 +356,10 @@ def cadence_slots(watches: list[dict]) -> int:
         if w.get("run_every_minutes"):
             minutes = int(w["run_every_minutes"])
             break
-    return max(1, minutes // 30)
+    if minutes < 30 or minutes % 30:
+        raise ValueError(
+            f"run_every_minutes must be a multiple of 30, got {minutes}")
+    return minutes // 30
 
 
 def get_watch(watches: list[dict], watch_id: str) -> dict:

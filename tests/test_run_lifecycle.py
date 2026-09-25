@@ -355,8 +355,11 @@ class PipelineOrderTests(unittest.TestCase):
         self._patch(_sentinel, "per_run_allowance",
                     lambda guard, slot, *a: 200)
 
+        # An even slot: sentinel-first order (odd slots lead with
+        # exploration; see test_odd_slot_leads_with_exploration).
+        even_slot = store.slot_id() - (store.slot_id() % 2)
         rc = fm_run.cmd_check(args_for("check", False), self.db, [WATCH],
-                              self.guard)
+                              self.guard, slot=even_slot)
         self.assertEqual(rc, 0)
 
         # v3 order: verify first, then sentinels, then bursts (whose
@@ -372,9 +375,11 @@ class PipelineOrderTests(unittest.TestCase):
         self.assertLess(first_sentinel, revalidate_at)
         self.assertLess(revalidate_at, first_burst)
         self.assertLess(first_burst, first_background)
+        last_background = len(events) - 1 - events[::-1].index("background")
         for i, e in enumerate(events):
             if e == "sentinel":
-                self.assertLess(i, first_burst)
+                # Before the bursts, or leftover allowance after background.
+                self.assertTrue(i < first_burst or i > last_background)
             elif e == "background":
                 self.assertGreater(i, first_burst)
         # The seeded candidate was actually verified and enqueued.

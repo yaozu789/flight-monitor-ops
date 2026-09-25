@@ -400,7 +400,9 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
         if deadline_fn is not None and deadline_fn():
             raise store.DeadlineExceeded(
                 f"{role} phase deadline exceeded")
-        if result["attempts"] >= allowance:
+        # Only start a check this phase can afford in full (outbound page +
+        # top_n return pages); a half-finished check wastes its sends.
+        if allowance - result["attempts"] < 1 + top_n:
             break
         group_cfg = groups_cfg.get(cell["group_id"])
         if group_cfg is None:
@@ -444,17 +446,27 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
     # The guard's allowance is a cap on the RUN total, so set it relative to
     # what this run already spent (retry/verify passes run before
     # collection); an absolute value could leave collection 0 attempts.
-    guard.set_run_allowance(guard.spent_run() + allowance)
+    run_start_spent = guard.spent_run()
+    guard.set_run_allowance(
+        min(PER_RUN_HARD_CAP, run_start_spent + allowance))
+    # Never let the relative allowance lift the run past the 80 hard cap.
+    allowance = min(allowance, max(0, PER_RUN_HARD_CAP - run_start_spent))
 
     def phase(fn):
         """Run one phase. A CATEGORY cap (e.g. sentinels' daily 54) only
         ends that phase; daily/per-run/verify-reserve exhaustion ends
-        collection."""
+        collection. Spend is reconciled with the guard afterwards, so sends
+        made just before an exception are still counted."""
         try:
             fn()
             return True
         except BudgetExhausted as e:
             return getattr(e, "scope", None) == "category"
+        finally:
+            # Sends made just before an exception are in the guard's total
+            # but not yet in result["attempts"].
+            result["attempts"] = max(result["attempts"],
+                                     guard.spent_run() - run_start_spent)
 
     # Sentinels get at most half of this run's allowance up front, so
     # bursts and background progress all day instead of only after the
@@ -472,8 +484,8 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
             if deadline_fn is not None and deadline_fn():
                 raise store.DeadlineExceeded("burst phase deadline exceeded")
             left = allowance - result["attempts"]
-            if left <= 0:
-                break
+            if left < BURST_STEP_MAX_ATTEMPTS:
+                break  # only start a burst that can finish a whole step
             group_cfg = groups_cfg.get(trig["group_id"])
             if group_cfg is None:
                 continue
@@ -488,8 +500,14 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
                        "background", DETAIL_TOP_N, "background",
                        result, allowance, "background", deadline_fn, checked)
 
-    for step in (lambda: sentinels(sentinel_share), bursts, background,
-                 lambda: sentinels(allowance)):
+    order = [lambda: sentinels(sentinel_share), bursts, background,
+             lambda: sentinels(allowance)]
+    if slot % 2 == 1:
+        # Alternate runs lead with exploration, so a small allowance (about
+        # 3 at a 30-minute cadence) still reaches bursts and background.
+        order = [bursts, background, lambda: sentinels(sentinel_share),
+                 lambda: sentinels(allowance)]
+    for step in order:
         if not phase(step):
             break  # global budget stop: partial progress is kept
     return result
@@ -615,7 +633,9 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                           slot=slot, run_start=run_start)
 
     def _allowance_exhausted() -> bool:
-        return (guard.spent_run() - run_spent_entry) >= allowance
+        # A step is only started if the allowance covers the whole step.
+        return (allowance - (guard.spent_run() - run_spent_entry)
+                < BURST_STEP_MAX_ATTEMPTS)
 
     def _record(status: str) -> None:
         store.record_burst(db, trigger_id=trigger["id"], group_id=group_id,

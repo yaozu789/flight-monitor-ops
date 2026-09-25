@@ -289,6 +289,40 @@ class TestCollectPriority(SentinelTestBase):
         self.assertGreater(per_2h, per_30)
         self.assertLessEqual(per_2h, sentinel.PER_RUN_HARD_CAP)
 
+    def test_odd_slot_leads_with_exploration(self):
+        """With a small allowance (3, about the 30-minute share) an odd
+        slot reaches background before sentinels; whole checks only."""
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        store.ensure_cells(self.db, [
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 7, "role": "sentinel", "weekday": 0},
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 8, "role": "background", "weekday": 0}])
+        calls = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append((category, top_n))
+            return (400.0, 1 + top_n)
+
+        self.patch(sentinel, "check_cell", fake_check)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 4)
+        sentinel.collect(self.db, self.guard(), GROUPS, slot=5,
+                         run_start=store.utcnow_iso())
+        self.assertEqual(calls[0][0], "background")
+        # 4 attempts: one background check (1 + 3) uses it all; no partial
+        # sentinel check is started after it.
+        self.assertEqual(calls, [("background", 3)])
+
+    def test_run_total_never_exceeds_80(self):
+        g = self.guard()
+        g.set_run_allowance(80)
+        for _ in range(36):
+            g.reserve("verify") if _ < 24 else g.reserve("retry_reserve")
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 48)
+        sentinel.collect(self.db, g, {}, slot=4, run_start=store.utcnow_iso())
+        self.assertLessEqual(g.run_allowance(), sentinel.PER_RUN_HARD_CAP)
+
     def test_sentinel_cap_does_not_end_collection(self):
         """Hitting the sentinel CATEGORY cap ends only the sentinel phase;
         background still runs in the same collection pass."""
@@ -376,7 +410,7 @@ class TestCollectPriority(SentinelTestBase):
         self.patch(sentinel, "check_cell", fake_check)
         self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 6)
 
-        result = sentinel.collect(self.db, self.guard(), GROUPS, slot=5,
+        result = sentinel.collect(self.db, self.guard(), GROUPS, slot=4,
                                   run_start=store.utcnow_iso())
         kinds = [c[0] for c in calls]
         self.assertEqual(kinds[0], "sentinel")
