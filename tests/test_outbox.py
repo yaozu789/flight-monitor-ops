@@ -722,14 +722,60 @@ class PrepareHandoffV3Tests(unittest.TestCase):
         second = outbox.drain_pending(db, 100)
         self.assertEqual([r["alert_id"] for r in second], [a2])
 
+    def test_late_confirmation_cannot_hit_newer_event(self):
+        """A rearm bumps the event number; confirming or marking the OLD
+        event is refused instead of landing on the new deal."""
+        db, _ = fresh_db(self)
+        aid = outbox.make_alert_id("w1", "2026-W40")
+        seed_outbox_row(db, aid, 495.0)
+        store.prepare_handoff(db, 100, [aid])
+        old_event = store.outbox_get(db, aid)["event_no"]
+        self._rearm(db, aid, 440.0)
+        store.prepare_handoff(db, 101, [aid])
+        self.assertFalse(store.set_outbox_user_confirmed(
+            db, aid, "yaozu", event_no=old_event))
+        self.assertFalse(store.update_outbox_state(
+            db, aid, "relay_attempted_unconfirmed", actor="agent",
+            event_no=old_event))
+        new_event = store.outbox_get(db, aid)["event_no"]
+        self.assertEqual(new_event, old_event + 1)
+        self.assertTrue(store.set_outbox_user_confirmed(
+            db, aid, "yaozu", event_no=new_event))
+
+    def test_reprepare_respects_cap_and_gap(self):
+        db, _ = fresh_db(self)
+        aid = outbox.make_alert_id("w1", "2026-W40")
+        seed_outbox_row(db, aid, 495.0)
+        store.prepare_handoff(db, 100, [aid])          # count 1
+        store.reprepare_retries(db, 101, [aid])        # inside gap: no-op
+        self.assertEqual(store.outbox_get(db, aid)["handoff_count"], 1)
+        store.reprepare_retries(db, 103, [aid])        # count 2
+        store.reprepare_retries(db, 106, [aid, aid])   # capped
+        self.assertEqual(store.outbox_get(db, aid)["handoff_count"], 2)
+
     def test_retired_week_rearms_on_new_deal(self):
         db, _ = fresh_db(self)
         aid = outbox.make_alert_id("w1", "2026-W40")
         seed_outbox_row(db, aid, 495.0)
         store.prepare_handoff(db, 100, [aid])
         self.assertTrue(store.retire_outbox(db, aid, "gone"))
-        row = self._rearm(db, aid, 490.0)  # not a big drop, but week retired
+        # Same fare back within 72 h of retirement: no re-alert...
+        _, action = store.enqueue_alert(
+            db, alert_id=aid, watch_id="w1", fingerprint=FP, price_usd=490.0,
+            depart_date=DEP, return_date=RET, airline="UA", stops=0,
+            booking_url="", message_text="m", origin="SFO", destination="JFK")
+        self.assertEqual(action, "deduped")
+        # ...after 72 h it is a new event.
+        db.execute("UPDATE outbox SET updated_at=? WHERE alert_id=?",
+                   ("2000-01-01T00:00:00+00:00", aid))
+        db.commit()
+        row = self._rearm(db, aid, 490.0)
         self.assertEqual((row["state"], row["handoff_count"]), ("pending", 0))
+        # A meaningful drop re-alerts a retired week at once.
+        store.prepare_handoff(db, 200, [aid])
+        self.assertTrue(store.retire_outbox(db, aid, "gone again"))
+        row = self._rearm(db, aid, 440.0)
+        self.assertEqual(row["state"], "pending")
 
     def test_confirmed_week_rearms_only_on_meaningful_drop(self):
         db, _ = fresh_db(self)

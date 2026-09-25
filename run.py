@@ -97,10 +97,11 @@ RELAY_INSTRUCTION = (
     "Relay each message below VERBATIM to the user via the normal push. "
     "Do not paraphrase, do not add claims, never use the word 'bookable'. "
     "After relaying each, record it with: "
-    "python run.py outbox-mark --alert-id <id> "
+    "python run.py outbox-mark --alert-id <alert_id> --event <event> "
     "--state relay_attempted_unconfirmed. "
     "After the USER confirms a deal, finalize it (human-driven only) with: "
-    "python run.py outbox-confirm --alert-id <id> --by <your name>."
+    "python run.py outbox-confirm --alert-id <alert_id> --event <event> "
+    "--by <your name>."
 )
 
 
@@ -120,8 +121,9 @@ def _handoff_payload(db, slot, alert_ids, **extra) -> dict:
              if r is not None and r["state"] in RELAYABLE_STATES]
     return {
         "slot_id": slot,
-        "alerts": [{"alert_id": r["alert_id"], "state": r["state"],
-                    "price_usd": r["price_usd"], "message": r["message_text"]}
+        "alerts": [{"alert_id": r["alert_id"], "event": r["event_no"],
+                    "state": r["state"], "price_usd": r["price_usd"],
+                    "message": r["message_text"]}
                    for r in batch],
         **extra,
         "agent_instruction": RELAY_INSTRUCTION,
@@ -387,20 +389,17 @@ def _add_scheduled(p) -> None:
 
 def cmd_broad(args, db, watches, guard, *, drained=None, deadline_fn=None,
               slot=None):
-    slot = slot if slot is not None else slot_id()
-    # Alerts drained at the start of the run are relayed on every path.
-    handoff = _handoff_payload(db, slot, _ids(drained))
-    # A flex-date sweep sends one request per date (up to 93 per chunk, 180+
-    # for the 3-9 month window), which exceeds the whole background budget
-    # (48/day) and would stop mid-sweep having persisted nothing. Collection
-    # uses the sentinel/background grid instead; broad stays off until it is
-    # rebuilt as resumable, budget-sized chunks.
+    """Disabled. A flex-date sweep sends one request per date (up to 93 per
+    chunk, 180+ for the 3-9 month window), which exceeds the whole daily
+    background budget (48) and would stop mid-sweep with nothing saved.
+    The sentinel/background grid covers the window instead. main() answers
+    before the lock and slot claim, so this can never make a same-slot
+    check skip collection."""
     print(json.dumps({"status": "noop", "reason": "broad_scan_disabled",
                       "detail": "a sweep exceeds the daily background "
                                 "budget; the sentinel/background grid "
                                 "covers the window instead",
-                      "watch": getattr(args, "watch", None),
-                      "handoff": handoff}, indent=2))
+                      "watch": getattr(args, "watch", None)}, indent=2))
     return 0
 
 
@@ -625,7 +624,8 @@ def cmd_outbox_mark(args, db, watches, guard):
     allowed here. user_confirmed is NEVER settable through this path --
     use outbox-confirm (human-driven) for that.
     """
-    ok = update_outbox_state(db, args.alert_id, args.state, actor="agent")
+    ok = update_outbox_state(db, args.alert_id, args.state, actor="agent",
+                             event_no=args.event)
     if not ok:
         row = outbox_get(db, args.alert_id)
         have = row["state"] if row else "<unknown alert_id>"
@@ -659,11 +659,12 @@ def cmd_outbox_confirm(args, db, watches, guard):
     """
     if not args.by:
         raise SystemExit("outbox-confirm requires --by <actor> for audit")
-    ok = set_outbox_user_confirmed(db, args.alert_id, args.by)
+    ok = set_outbox_user_confirmed(db, args.alert_id, args.by,
+                                   event_no=args.event)
     if not ok:
         raise SystemExit(
-            f"outbox-confirm failed for {args.alert_id}: unknown id or "
-            f"already terminal")
+            f"outbox-confirm failed for {args.alert_id} event {args.event}: "
+            f"unknown id, already terminal, or replaced by a newer deal")
     print(json.dumps({"alert_id": args.alert_id, "state": "user_confirmed",
                       "confirmed_by": args.by}))
     return 0
@@ -693,6 +694,8 @@ def main() -> int:
 
     p = sub.add_parser("outbox-mark", help="record a relayed handoff (agent use)")
     p.add_argument("--alert-id", required=True)
+    p.add_argument("--event", type=int, required=True,
+                   help="the handoff's event number, from the relay batch")
     p.add_argument("--state", required=True,
                    choices=["relay_attempted_unconfirmed"])
 
@@ -705,6 +708,8 @@ def main() -> int:
     p = sub.add_parser("outbox-confirm",
                        help="finalize an alert after USER confirmation (human only)")
     p.add_argument("--alert-id", required=True)
+    p.add_argument("--event", type=int, required=True,
+                   help="the alert's event number, from the relay batch")
     p.add_argument("--by", required=True, help="actor name, recorded for audit")
 
     args = ap.parse_args()
@@ -722,7 +727,9 @@ def main() -> int:
         if args.cmd in ("broad", "narrow", "canary", "check"):
             transport.install_transport_guard(guard)
         if args.cmd == "broad":
-            return run_guarded("broad", args, db, watches, guard, cmd_broad)
+            # Disabled: answer before the lock and slot claim, so it can
+            # never make a same-slot check skip collection.
+            return cmd_broad(args, db, watches, guard)
         if args.cmd == "narrow":
             return run_manual("narrow", args, db, watches, guard, cmd_narrow)
         if args.cmd == "canary":
