@@ -24,10 +24,13 @@ from types import SimpleNamespace
 # keeps fake_transport importable standalone too.)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Captured Google Flights page from fli's test suite (pinned commit 881aee5,
+# MIT license, see tests/fixtures/LICENSE-fli.txt). Kept inside the repo so
+# the suite runs on any clean checkout.
 FIXTURE_HTML = (
-    Path("/home/hatch/workspace/flitest_repo/tests/search/fixtures/"
-         "search_page_jfk_lhr_nonstop_ds1.html").read_text()
-)
+    Path(__file__).resolve().parent / "fixtures"
+    / "search_page_jfk_lhr_nonstop_ds1.html"
+).read_text()
 
 CAPTCHA_BODY = (
     "<html><body><h1>About this page</h1>"
