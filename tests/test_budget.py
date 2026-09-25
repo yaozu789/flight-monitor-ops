@@ -228,6 +228,16 @@ class BudgetTransportTest(unittest.TestCase):
         self.assertEqual(backoff["kind"], "captcha")
         self.assertTrue(backoff["until_ts"] > time.time())
 
+    def test_live_results_page_is_not_captcha(self):
+        """A normal results page (ds:1 payload + Google's route list with
+        "/recaptcha/challenge") passes through: no throttle, no backoff."""
+        g = self.make_guard()
+        fake = install_fake_transport(g, mode="ok")
+        resp = Session().get("http://example.invalid")
+        self.assertIn("/recaptcha/challenge", resp.text)
+        self.assertIsNone(store.get_backoff(self.db))
+        self.assertEqual(fake.sends, 1)
+
     # -- blank pages tripwire -----------------------------------------
 
     def test_blank_pages_tripwire(self):

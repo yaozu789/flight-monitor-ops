@@ -294,7 +294,16 @@ def _raise_if_throttle(guard, method, url, exc) -> None:
 
 
 def _has_captcha_marker(body) -> bool:
+    """A CAPTCHA / unusual-traffic block page, not a results page.
+
+    Every normal Google Flights results page (~2 MB) embeds a site route
+    list containing "/recaptcha/challenge", so a bare substring match flags
+    every successful search as a CAPTCHA. A page that carries the ds:1
+    results payload is never a block page.
+    """
     lowered = (body or "").lower()
+    if "ds:1" in lowered:
+        return False
     return any(marker in lowered for marker in CAPTCHA_MARKERS)
 
 
