@@ -141,69 +141,123 @@ def _coerce_today(today) -> date:
     return date.fromisoformat(today)
 
 
-def mint_sentinels(db, groups_cfg, today=None) -> int:
-    """Idempotently mint 27 weekly anchors per group across the 3-9 month
-    window (today+90d .. today+270d).
+def _window_days(group_cfg) -> tuple[int, int]:
+    """(earliest, latest) departure offset in days for a group. Defaults to
+    the spec's 3-9 month window."""
+    lo, hi = (group_cfg or {}).get("window_days", (90, 270))
+    return int(lo), int(hi)
 
-    Anchor ``i``: ``window_start + i * (window_days // 27)`` days, snapped to
-    ``weekday == i % 7`` (+-3 days, clamped to the window). ``duration=7``,
-    ``role="sentinel"``. Sentinel cells of these groups with
-    ``depart_date < today+75d`` or ``> today+285d`` are retired (active=0).
-    Returns the new-cell count.
+
+def _durations(group_cfg) -> list[int]:
+    """Trip lengths (days) explored for a group. Defaults to 5..14."""
+    lo, hi = (group_cfg or {}).get("durations", (5, 14))
+    return list(range(int(lo), int(hi) + 1))
+
+
+def _sentinel_duration(group_cfg) -> int:
+    """Sentinel stay length: 7 days, clamped into the group's range."""
+    durs = _durations(group_cfg)
+    return min(max(7, durs[0]), durs[-1])
+
+
+# Fixed calendar lattice (a Monday). Grid dates are computed from it, not
+# from "today", so the same dates are re-minted every day: cells enter at
+# the far end of the window and retire at the near end instead of a new set
+# being added daily (the old grid grew to 40 sentinels / 1,700+ background
+# cells per group).
+GRID_EPOCH = date(2026, 1, 5)
+
+
+def _lattice(start: date, end: date, step: int):
+    """Lattice points GRID_EPOCH + k*step within [start, end], as (k, date)."""
+    k = -(-(start - GRID_EPOCH).days // step)  # ceil
+    while True:
+        d = GRID_EPOCH + timedelta(days=k * step)
+        if d > end:
+            return
+        yield k, d
+        k += 1
+
+
+def mint_sentinels(db, groups_cfg, today=None) -> int:
+    """Idempotently mint ~27 fixed anchors per group across the group's
+    departure window (``window_days``, default today+90d .. today+270d).
+
+    Anchors sit on a fixed lattice (step = window // 27 days from
+    GRID_EPOCH), each snapped +-3 days to weekday ``k % 7`` so they spread
+    across weekdays. They stay fixed until they leave the window. The stay
+    is 7 days clamped into the group's ``durations``; ``role="sentinel"``.
+    Sentinels outside the window, or with a stay no longer configured, are
+    retired. Returns the new/reactivated cell count.
     """
     today_d = _coerce_today(today)
-    win_start = today_d + timedelta(days=90)
-    win_end = today_d + timedelta(days=270)
-    window_days = (win_end - win_start).days
-    step = window_days // SENTINEL_ANCHORS_PER_GROUP
 
     cells = []
-    for group_id in groups_cfg:
-        for i in range(SENTINEL_ANCHORS_PER_GROUP):
-            base = win_start + timedelta(days=i * step)
-            target_wd = i % 7
-            delta = (target_wd - base.weekday()) % 7
+    for group_id, group_cfg in groups_cfg.items():
+        lo_d, hi_d = _window_days(group_cfg)
+        win_start = today_d + timedelta(days=lo_d)
+        win_end = today_d + timedelta(days=hi_d)
+        # Nearest-integer spacing, capped at 27 anchors: ~27 for any window
+        # (ceil spacing gave only 16 for a 30-day window).
+        step = max(1, round((hi_d - lo_d) / SENTINEL_ANCHORS_PER_GROUP))
+        duration = _sentinel_duration(group_cfg)
+        picked = 0
+        for k, base in _lattice(win_start, win_end, step):
+            if picked >= SENTINEL_ANCHORS_PER_GROUP:
+                break
+            delta = ((k % 7) - base.weekday()) % 7
             if delta > 3:
                 delta -= 7
             d = base + timedelta(days=delta)
-            d = min(max(d, win_start), win_end)  # clamp to window
+            if not (win_start <= d <= win_end):
+                continue
+            picked += 1
             cells.append({
                 "group_id": group_id,
                 "depart_date": d.isoformat(),
-                "duration": 7,
+                "duration": duration,
                 "role": "sentinel",
                 "weekday": d.weekday(),
             })
     new_count = store.ensure_cells(db, cells)
 
-    # Roll the window forward: retire anchors that drifted out of range.
-    lo = (today_d + timedelta(days=75)).isoformat()
-    hi = (today_d + timedelta(days=285)).isoformat()
-    for group_id in groups_cfg:
-        stale = db.execute(
-            """SELECT id FROM cells
-               WHERE group_id = ? AND role = 'sentinel' AND active = 1
-                 AND (depart_date < ? OR depart_date > ?)""",
-            (group_id, lo, hi)).fetchall()
-        for row in stale:
-            store.retire_cell(db, row["id"])
+    # Anything active that is not in today's computed grid is retired:
+    # anchors that left the window, a changed stay or window, and cells
+    # left over from the old today-relative grid.
+    _retire_not_in(db, groups_cfg, "sentinel", cells)
     return new_count
+
+
+def _retire_not_in(db, groups_cfg, role, cells):
+    """Retire active *role* cells of these groups that are not in *cells*
+    (the grid just computed), so the active grid is exactly the lattice."""
+    wanted = {(c["group_id"], c["depart_date"], c["duration"]) for c in cells}
+    for group_id in groups_cfg:
+        for row in db.execute(
+                """SELECT id, depart_date, duration FROM cells
+                   WHERE group_id = ? AND role = ? AND active = 1""",
+                (group_id, role)).fetchall():
+            if (group_id, row["depart_date"], row["duration"]) not in wanted:
+                store.retire_cell(db, row["id"])
 
 
 def ensure_background_grid(db, groups_cfg, today=None) -> int:
     """Idempotently mint the background grid: per group, weekly departures
-    today+14d..today+180d x durations 5..14, role="background".
-    Returns the new-cell count.
+    across the group's window x its trip lengths, role="background".
+    Cells that have left the window (e.g. departures now in the past) or
+    whose stay is no longer configured are retired, so the rotation never
+    spends budget on them. Returns the new-cell count.
     """
     today_d = _coerce_today(today)
-    start = today_d + timedelta(days=14)
-    end = today_d + timedelta(days=180)
 
     cells = []
-    d = start
-    while d <= end:
-        for group_id in groups_cfg:
-            for duration in range(5, 15):
+    for group_id, group_cfg in groups_cfg.items():
+        lo_d, hi_d = _window_days(group_cfg)
+        durations = _durations(group_cfg)
+        # Weekly departures on the fixed lattice (Mondays from GRID_EPOCH).
+        for _, d in _lattice(today_d + timedelta(days=lo_d),
+                             today_d + timedelta(days=hi_d), 7):
+            for duration in durations:
                 cells.append({
                     "group_id": group_id,
                     "depart_date": d.isoformat(),
@@ -211,8 +265,9 @@ def ensure_background_grid(db, groups_cfg, today=None) -> int:
                     "role": "background",
                     "weekday": d.weekday(),
                 })
-        d += timedelta(days=7)
-    return store.ensure_cells(db, cells)
+    new_count = store.ensure_cells(db, cells)
+    _retire_not_in(db, groups_cfg, "background", cells)
+    return new_count
 
 
 def due_sentinels(db, limit) -> list[dict]:
@@ -566,13 +621,14 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
 
 # ---------------------------------------------------------------- bursts
 
-def _burst_steps(trigger):
+def _burst_steps(trigger, durations=None):
     """Ordered burst steps as (step_index, kind, depart_date, duration).
 
     Step 0 revalidates the trigger (billed "verify"); steps 1..20 are the
     neighbour departures +-1..10 days at the trigger duration; steps 21..29
-    are the duration exploration (5..14 days, excluding the trigger's own
-    duration). 30 steps x 2 attempts = 60 attempts max.
+    are the duration exploration (the group's trip lengths, default 5..14,
+    excluding the trigger's own duration). 30 steps x 2 attempts = 60
+    attempts max with the default range.
     """
     yield 0, "revalidate", trigger["depart_date"], trigger["duration"]
     base = date.fromisoformat(trigger["depart_date"])
@@ -583,7 +639,7 @@ def _burst_steps(trigger):
                    (base + timedelta(days=s * delta)).isoformat(),
                    trigger["duration"])
             idx += 1
-    for dur in range(5, 15):
+    for dur in (durations or range(5, 15)):
         if dur == trigger["duration"]:
             continue
         yield idx, "duration", trigger["depart_date"], dur
@@ -657,7 +713,7 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                            depart_week=trigger["depart_week"],
                            attempts=total, status=status)
 
-    steps = list(_burst_steps(trigger))
+    steps = list(_burst_steps(trigger, _durations(group_cfg)))
     try:
         for step_idx, kind, d_date, dur in steps:
             if step_idx < next_step:

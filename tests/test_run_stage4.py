@@ -401,6 +401,17 @@ class Stage4OrchestrationTests(unittest.TestCase):
                                                  watch="w1"),
                                  db, [WATCH], guard, slot=42)
         self.assertEqual(_json.loads(out.getvalue())["slot_id"], 42)
+    def test_group_cfg_reads_watch_window(self):
+        cfg = fm_run.group_cfg_for({"id": "w", "origins": ["SFO"],
+                                    "destinations": ["NRT"],
+                                    "window_months": [1, 4],
+                                    "trip_length_days": [3, 8]})
+        self.assertEqual(cfg["window_days"], (30, 120))
+        self.assertEqual(cfg["durations"], (3, 8))
+        default = fm_run.group_cfg_for({"id": "w", "origins": ["SFO"],
+                                        "destinations": ["NRT"]})
+        self.assertEqual(default["window_days"], (90, 270))
+        self.assertEqual(default["durations"], (5, 14))
 
     def test_tied_observations_score_once(self):
         """Rows of one fingerprint sharing an observed_at (collection stamps
