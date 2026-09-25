@@ -4,7 +4,9 @@ Interposes at the transport layer's send-handler seam: every HTTP attempt the
 budget guard reserves is routed here instead of the real session. Modes:
 
 - "ok": returns the captured ds:1 search page (JFK->LHR fixture).
-- "http429": raises a duck-typed 429 error (with Retry-After when given).
+- "http429": returns HTTP 429 (with Retry-After when given). v3: the
+  transport wrapper must detect the throttle in the SUCCESS path by
+  inspecting the returned response -- the fake no longer raises.
 - "captcha": returns HTTP 200 with a CAPTCHA / unusual-traffic body.
 - "blank": returns HTTP 200 with an empty body (fli decodes no payload).
 
@@ -81,8 +83,12 @@ class FakeTransport:
         if self.mode == "ok":
             return FakeResponse()
         if self.mode == "http429":
+            # v3: return the 429 response (with Retry-After when given) so
+            # the transport wrapper must detect it in the success path by
+            # inspecting the returned response. Never raises.
             headers = {"Retry-After": self.retry_after} if self.retry_after else {}
-            raise FakeHTTPError(429, headers, "Too Many Requests")
+            return FakeResponse(text="Too Many Requests", status_code=429,
+                                headers=headers)
         if self.mode == "captcha":
             return FakeResponse(text=CAPTCHA_BODY)
         if self.mode == "blank":

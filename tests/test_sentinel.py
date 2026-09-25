@@ -24,7 +24,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _TESTS_DIR = HERE
@@ -242,38 +242,47 @@ class TestRotation(SentinelTestBase):
 
 class TestAllowance(SentinelTestBase):
     def test_fresh_day_slot_0(self):
-        # ceil(150/48) = 4 (verify reserve makes it ceil(126/48)=3 -> floor 4)
-        self.assertEqual(sentinel.per_run_allowance(self.guard(), 0), 4)
+        # ceil(126/48) = ceil(2.625) = 3 (verify reserve held back; v3: no
+        # minimum floor, the paced value stands on its own)
+        self.assertEqual(sentinel.per_run_allowance(self.guard(), 0), 3)
 
-    def test_floor_when_nearly_exhausted(self):
+    def test_zero_when_exhausted(self):
         self.spend("sentinel", 140)
-        # remaining = 150-140-max(0, 24-0) < 0 -> floor 4; reserve stops it
-        self.assertEqual(sentinel.per_run_allowance(self.guard(), 0), 4)
+        # remaining = 150-140-max(0, 24-0) = -14 <= 0 -> allowance 0 (v3
+        # item 7: no floor of 4 when the budget is exhausted)
+        self.assertEqual(sentinel.per_run_allowance(self.guard(), 0), 0)
 
     def test_midday(self):
         self.spend("sentinel", 75)
-        # ceil((150-75-0)/24) = ceil(3.125) = 4
-        self.assertEqual(sentinel.per_run_allowance(self.guard(), 24), 4)
+        # remaining = 150-75-24 = 51; ceil(51/24) = 3
+        self.assertEqual(sentinel.per_run_allowance(self.guard(), 24), 3)
 
     def test_verify_reserve_held_back(self):
         self.spend("verify", 10)
         g = self.guard()
-        # remaining = 150-10-max(0, 24-10) = 126 -> ceil(126/48)=3 -> floor 4
-        self.assertEqual(sentinel.per_run_allowance(g, 0), 4)
-        # without the reserve it would be ceil(140/48)=3 -> still 4 here;
+        # remaining = 150-10-max(0, 24-10) = 126 -> ceil(126/48)=3
+        self.assertEqual(sentinel.per_run_allowance(g, 0), 3)
+        # without the reserve it would be ceil(140/48)=3 too here;
         # the reserve bites harder late-day:
         self.spend("verify", 14)  # verify total 24 -> reserve 0
-        self.assertEqual(sentinel.per_run_allowance(self.guard(), 40), 4 + 8)
+        self.assertEqual(sentinel.per_run_allowance(self.guard(), 40), 12)
 
     def test_late_day_ramps_up(self):
         # remaining = 150-0-24 = 126 over 8 slots -> ceil(15.75)=16 -> cap 12
         self.assertEqual(sentinel.per_run_allowance(self.guard(), 40), 12)
 
+    def test_allowance_never_negative(self):
+        self.spend("sentinel", 150)
+        self.assertEqual(sentinel.per_run_allowance(self.guard(), 0), 0)
+        self.assertEqual(sentinel.per_run_allowance(self.guard(), 47), 0)
+
 
 # ---------------------------------------------------------------- collect priority
 
 class TestCollectPriority(SentinelTestBase):
-    def test_bursts_before_sentinels_before_background(self):
+    def test_sentinels_before_bursts_before_background(self):
+        # v3 group 4: collection priority is sentinels -> bursts ->
+        # background (bursts no longer jump the queue).
         depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
         tid = store.queue_trigger(
             self.db, kind="under_cap", group_id="japan_fall_2026",
@@ -287,7 +296,8 @@ class TestCollectPriority(SentinelTestBase):
         ])
         calls = []
 
-        def fake_burst(db, trigger, guard, group_cfg, slot, run_start=None):
+        def fake_burst(db, trigger, guard, group_cfg, slot, run_start=None,
+                       **kwargs):
             calls.append(("burst", trigger["id"]))
             return 0
 
@@ -303,15 +313,18 @@ class TestCollectPriority(SentinelTestBase):
         result = sentinel.collect(self.db, self.guard(), GROUPS, slot=5,
                                   run_start=store.utcnow_iso())
         kinds = [c[0] for c in calls]
-        self.assertEqual(kinds[0], "burst")
+        self.assertEqual(kinds[0], "sentinel")
+        burst_at = kinds.index("burst")
         first_bg = kinds.index("background")
-        self.assertGreater(first_bg, 1)
-        self.assertTrue(all(k == "sentinel" for k in kinds[1:first_bg]))
+        self.assertGreater(burst_at, 0)
+        self.assertGreater(first_bg, burst_at)
+        self.assertTrue(all(k == "sentinel" for k in kinds[:burst_at]))
+        self.assertTrue(all(k == "background" for k in kinds[first_bg:]))
         self.assertEqual(result["bursts"], [tid])
         self.assertEqual(result["sentinels"], 1)
         self.assertEqual(result["background"], 1)
         # sentinel phase used top_n=1, background top_n=3
-        self.assertEqual(calls[1], ("sentinel", 1))
+        self.assertEqual(calls[0], ("sentinel", 1))
         self.assertEqual(calls[-1], ("background", 3))
 
     def test_collect_stops_cleanly_on_budget_exhausted(self):
@@ -331,6 +344,10 @@ class TestCollectPriority(SentinelTestBase):
             return (400.0, 2)
 
         self.patch(sentinel, "check_cell", fake_check)
+        # v3: collect() drives the per-send allowance from the pacer, so pin
+        # the paced value for this test; the guard's per_run_max=4 is what
+        # the fake checks exhaust (2 checks x 2 reserves, then raise).
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 4)
         g = self.guard(per_run_max=4)  # 2 checks, then BudgetExhausted
         result = sentinel.collect(self.db, g, GROUPS, slot=5,
                                   run_start=store.utcnow_iso())
@@ -571,6 +588,9 @@ class TestBurst(SentinelTestBase):
         self.assertEqual(trow["status"], "dropped")
 
     def test_burst_partial_on_allowance(self):
+        # v3 group 4: a partial burst is RESUMABLE, never terminal. The
+        # trigger goes to "burst_active" (not "burst") and progress
+        # persists so the next slot resumes at the right step.
         trig = self._trigger()
 
         def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
@@ -593,7 +613,173 @@ class TestBurst(SentinelTestBase):
         self.assertEqual(brow["attempts"], 4)
         trow = self.db.execute(
             "SELECT status FROM triggers WHERE id=?", (trig["id"],)).fetchone()
+        self.assertEqual(trow["status"], "burst_active")
+        prog = store.get_burst_progress(self.db, trig["id"])
+        self.assertEqual(prog["status"], "active")
+        self.assertEqual(prog["attempts_used"], 4)
+        self.assertEqual(prog["next_step"], 2)  # revalidate + 1 neighbour done
+        # Still due: the next slot must resume it.
+        due = [t["id"] for t in store.due_triggers(self.db, 8)]
+        self.assertIn(trig["id"], due)
+
+
+# ---------------------------------------------------------------- resumable bursts (v3 group 4)
+
+class TestResumableBursts(SentinelTestBase):
+    def _trigger(self, price=400.0, fp="fp-resume"):
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        tid = store.queue_trigger(
+            self.db, kind="under_cap", group_id="japan_fall_2026",
+            depart_week=store.depart_week(depart), depart_date=depart,
+            duration=7, price_usd=price, fingerprint=fp, slot=7)
+        trig = [t for t in store.due_triggers(self.db, 7)
+                if t["id"] == tid][0]
+        return trig
+
+    def _fake_check(self, price=400.0):
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            guard.reserve(category)
+            guard.reserve(category)
+            return (price, 2)
+        return fake_check
+
+    def _run_burst(self, trig, allowance):
+        self.patch(sentinel, "check_cell", self._fake_check())
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot: allowance)
+        return sentinel.execute_burst(
+            self.db, trig, self.guard(), GROUPS["japan_fall_2026"], slot=7,
+            run_start=store.utcnow_iso())
+
+    def test_partial_persists_progress(self):
+        """A partial run persists attempts_used / next_step / active."""
+        trig = self._trigger()
+        used = self._run_burst(trig, allowance=4)
+        self.assertEqual(used, 4)
+        prog = store.get_burst_progress(self.db, trig["id"])
+        self.assertEqual((prog["attempts_used"], prog["next_step"],
+                          prog["status"]), (4, 2, "active"))
+
+    def test_next_slot_resumes_same_burst(self):
+        """The next slot resumes at the persisted step; completed steps
+        are not repeated (no duplicate work)."""
+        trig = self._trigger()
+        self._run_burst(trig, allowance=4)  # steps 0..1 done
+        seen = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            seen.append((cell["depart_date"], cell["duration"]))
+            return (400.0, 2)
+
+        self.patch(sentinel, "check_cell", fake_check)
+        # generous allowance: finish everything remaining (28 steps x 2)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 60)
+        trig2 = [t for t in store.due_triggers(self.db, 8)
+                 if t["id"] == trig["id"]][0]
+        used = sentinel.execute_burst(
+            self.db, trig2, self.guard(), GROUPS["japan_fall_2026"], slot=8,
+            run_start=store.utcnow_iso())
+        self.assertEqual(used, 56)  # 28 remaining steps x 2 attempts
+        # No step repeated: 28 distinct (date, duration) pairs.
+        self.assertEqual(len(seen), 28)
+        self.assertEqual(len(set(seen)), 28)
+        prog = store.get_burst_progress(self.db, trig["id"])
+        self.assertEqual(prog["status"], "done")
+        self.assertEqual(prog["attempts_used"], 60)
+        trow = self.db.execute(
+            "SELECT status FROM triggers WHERE id=?", (trig["id"],)).fetchone()
         self.assertEqual(trow["status"], "burst")
+        # Consumed: no longer due.
+        self.assertNotIn(trig["id"],
+                         [t["id"] for t in store.due_triggers(self.db, 9)])
+
+    def test_cumulative_attempts_cap_at_60(self):
+        """Cumulative attempts stop at 60 even across many partial slots."""
+        trig = self._trigger()
+        total = 0
+        for slot in (7, 8, 9, 10, 11):
+            trig_n = [t for t in store.due_triggers(self.db, slot)
+                      if t["id"] == trig["id"]]
+            if not trig_n:
+                break
+            total += self._run_burst(trig_n[0], allowance=14)
+        prog = store.get_burst_progress(self.db, trig["id"])
+        # 14+14+14+14+4 = 60: the last slot stops mid-allowance at the cap.
+        self.assertEqual(prog["attempts_used"], 60)
+        self.assertEqual(prog["status"], "done")
+        self.assertEqual(total, 60)
+        trow = self.db.execute(
+            "SELECT status FROM triggers WHERE id=?", (trig["id"],)).fetchone()
+        self.assertEqual(trow["status"], "burst")
+
+    def test_expired_burst_not_resumed(self):
+        """Progress past its 24h expiry is marked expired and never runs."""
+        trig = self._trigger()
+        self._run_burst(trig, allowance=4)
+        past = (datetime.now(timezone.utc)
+                - timedelta(hours=25)).isoformat()
+        self.db.execute(
+            "UPDATE burst_progress SET expires_at=? WHERE trigger_id=?",
+            (past, trig["id"]))
+        self.db.commit()
+        calls = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append(1)
+            return (400.0, 2)
+
+        self.patch(sentinel, "check_cell", fake_check)
+        trig2 = [t for t in store.due_triggers(self.db, 8)
+                 if t["id"] == trig["id"]]
+        # due_triggers already excludes it once expired...
+        self.assertEqual(trig2, [])
+        # ...and a direct execute_burst call is a no-op that marks expiry.
+        stale = dict(trig)
+        used = sentinel.execute_burst(
+            self.db, stale, self.guard(), GROUPS["japan_fall_2026"], slot=8,
+            run_start=store.utcnow_iso())
+        self.assertEqual(used, 0)
+        self.assertEqual(calls, [])
+        prog = store.get_burst_progress(self.db, trig["id"])
+        self.assertEqual(prog["status"], "expired")
+        trow = self.db.execute(
+            "SELECT status FROM triggers WHERE id=?", (trig["id"],)).fetchone()
+        self.assertEqual(trow["status"], "expired")
+
+    def test_mid_query_budget_exhausted_keeps_partial_spend(self):
+        """A transport allowance ending mid-query: the partial spend is
+        folded into the cumulative total, the trigger stays resumable,
+        and BudgetExhausted propagates so collect() stops cleanly."""
+        from budget import BudgetExhausted
+        trig = self._trigger()
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            # Spend 1 attempt, then blow the budget mid-query.
+            guard.reserve(category)
+            raise BudgetExhausted("boom")
+
+        self.patch(sentinel, "check_cell", fake_check)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 200)
+        with self.assertRaises(BudgetExhausted):
+            sentinel.execute_burst(
+                self.db, trig, self.guard(), GROUPS["japan_fall_2026"],
+                slot=7, run_start=store.utcnow_iso())
+        prog = store.get_burst_progress(self.db, trig["id"])
+        # The 1 partially-spent attempt is accounted for; the step itself
+        # (next_step still 0) will be retried on resume.
+        self.assertEqual(prog["attempts_used"], 1)
+        self.assertEqual(prog["next_step"], 0)
+        self.assertEqual(prog["status"], "active")
+        trow = self.db.execute(
+            "SELECT status FROM triggers WHERE id=?", (trig["id"],)).fetchone()
+        self.assertEqual(trow["status"], "burst_active")
+        brow = self.db.execute(
+            "SELECT status FROM bursts WHERE trigger_id=?",
+            (trig["id"],)).fetchone()
+        self.assertEqual(brow["status"], "partial")
 
 
 # ---------------------------------------------------------------- triggers

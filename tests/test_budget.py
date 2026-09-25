@@ -8,7 +8,9 @@ Run from the project root, e.g.:
 The project root is put first on sys.path so ``import store`` resolves to
 the project's store.py.
 """
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -59,17 +61,25 @@ class BudgetTransportTest(unittest.TestCase):
 
     def test_atomic_daily_ceiling_151_threads(self):
         """151 threads x separate connections x separate guards hammering
-        reserve("manual"): exactly 150 succeed, 1 raises BudgetExhausted,
-        and the ledger holds exactly 150 rows (atomic ceiling proof)."""
+        reserve("verify"): exactly 150 succeed, 1 raises BudgetExhausted,
+        and the ledger holds exactly 150 rows (atomic ceiling proof).
+
+        Category "verify" is used because v3 holds a verify reserve: a
+        non-"verify" category would stop at 126 (the last 24 attempts are
+        held for the verifier -- see test_verify_reserve_blocks_non_verify).
+        The daily ceiling itself is what this test proves atomic."""
         results = []
         lock = threading.Lock()
 
         def worker():
             conn = store.get_db(self.db_path)
             try:
-                g = budget.BudgetGuard(conn, day=self.day)
+                # No category caps: the DAILY ceiling is what must bind.
+                # Category "verify" is exempt from the v3 verify reserve,
+                # so the ceiling is proved atomic without interference.
+                g = budget.BudgetGuard(conn, day=self.day, category_caps={})
                 try:
-                    g.reserve("manual")
+                    g.reserve("verify")
                     outcome = "ok"
                 except budget.BudgetExhausted:
                     outcome = "exhausted"
@@ -194,8 +204,11 @@ class BudgetTransportTest(unittest.TestCase):
         self.assertIsNotNone(backoff)
         self.assertTrue(backoff["until_ts"] > time.time())
         self.assertEqual(backoff["kind"], "http_429")
-        # until ~= now + max(120, 900 * 2**0) = now + 900
-        self.assertAlmostEqual(backoff["until_ts"], t0 + 900, delta=60)
+        # v3 item 8: Retry-After header honored when present --
+        # until ~= now + 120, NOT max(120, exponential).
+        self.assertAlmostEqual(backoff["until_ts"], t0 + 120, delta=60)
+        self.assertEqual(backoff["retry_after_s"], 120)
+        self.assertEqual(exc.retry_after_s, 120)
         # The attempt was still made (and budgeted) before the 429 arrived.
         self.assertEqual(fake.sends, 1)
         self.assertEqual(g.spent_today(), 1)
@@ -258,6 +271,241 @@ class BudgetTransportTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             transport.install_transport_guard(other)
         self.assertIs(transport.require_guard(), g)
+
+
+# ---------------------------------------------------------------------------
+# v3 reviewer items
+# ---------------------------------------------------------------------------
+
+class BudgetV3Test(BudgetTransportTest):
+    """Group 1 (v3): BudgetExhausted as BaseException, own-connection
+    reserve, verify reserve, per-send allowance, import-time Session patch,
+    returned-429/suspect-403 inspection in the success path."""
+
+    def test_budget_exhausted_is_base_exception(self):
+        # v3 item 2: deliberately NOT an Exception subclass, so fli's
+        # `except Exception` -> _wrap_request_error cannot convert it.
+        self.assertTrue(issubclass(budget.BudgetExhausted, BaseException))
+        self.assertFalse(issubclass(budget.BudgetExhausted, Exception))
+
+    # -- verify reserve (item 6) --------------------------------------
+
+    def test_verify_reserve_blocks_non_verify(self):
+        # No category caps and a high per-run cap: only the daily ceiling
+        # and the verify reserve are in play.
+        g = self.make_guard(category_caps={}, per_run_max=1000)
+        for _ in range(126):
+            g.reserve("sentinel")
+        # daily_remaining = 24; 24 - 1 < max(0, 24 - 0) -> refused, even
+        # though daily budget remains.
+        with self.assertRaises(budget.BudgetExhausted) as cm:
+            g.reserve("sentinel")
+        self.assertEqual(cm.exception.scope, "verify_reserve")
+        # Nothing was recorded for the refused attempt.
+        self.assertEqual(g.spent_today(), 126)
+        # The held-back attempts are still available to the verifier.
+        g.reserve("verify")
+        self.assertEqual(g.spent_today("verify"), 1)
+        self.assertEqual(g.spent_today(), 127)
+
+    def test_verify_spend_releases_headroom(self):
+        g = self.make_guard(category_caps={}, per_run_max=1000)
+        for _ in range(24):
+            g.reserve("verify")
+        # headroom is now 0: non-verify categories may use the full ceiling.
+        for _ in range(126):
+            g.reserve("sentinel")
+        self.assertEqual(g.spent_today(), 150)
+        with self.assertRaises(budget.BudgetExhausted) as cm:
+            g.reserve("sentinel")
+        self.assertEqual(cm.exception.scope, "daily")
+
+    # -- own-connection reserve (item 3) -------------------------------
+
+    def test_reserve_leaves_caller_transaction_open(self):
+        g = self.make_guard()
+        # Caller holds an open DEFERRED (read) transaction. (An open *write*
+        # transaction would inherently block any other BEGIN IMMEDIATE; the
+        # contract is that the guard never commits or rolls back the
+        # caller's transaction, whatever it holds.)
+        self.db.execute("BEGIN")
+        before = self.db.execute(
+            "SELECT COUNT(*) AS n FROM budget_ledger").fetchone()["n"]
+        self.assertTrue(self.db.in_transaction)
+        g.reserve("manual")
+        # Still open and intact: the guard used its OWN connection and never
+        # touched the caller's (the v2 bug committed it here).
+        self.assertTrue(self.db.in_transaction)
+        after = self.db.execute(
+            "SELECT COUNT(*) AS n FROM budget_ledger").fetchone()["n"]
+        self.assertEqual(after, before)  # our snapshot is untouched
+        self.db.rollback()
+        self.assertFalse(self.db.in_transaction)
+        # ...and the reserve really landed (via the guard's own connection).
+        self.assertEqual(
+            store.count_today(self.db, self.day, "manual"), 1)
+
+    # -- import-time patch / fail closed (item 1) -----------------------
+
+    def test_fresh_import_patches_session_immediately(self):
+        """A fresh subprocess importing transport (no install call) has
+        Session.get/post patched and fails closed on the first send."""
+        code = (
+            "import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import transport\n"
+            "from curl_cffi.requests import Session\n"
+            "assert Session.get.__name__ == '_guarded_get', Session.get\n"
+            "assert Session.post.__name__ == '_guarded_post', Session.post\n"
+            "try:\n"
+            "    Session().get('http://example.invalid/')\n"
+            "except RuntimeError as e:\n"
+            "    assert 'transport guard not installed' in str(e), e\n"
+            "    print('FAIL_CLOSED_OK')\n"
+            "else:\n"
+            "    raise SystemExit('unarmed send did not fail closed')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(_PROJECT_ROOT)],
+            capture_output=True, text=True, timeout=120)
+        self.assertIn("FAIL_CLOSED_OK", proc.stdout, proc.stderr)
+
+    # -- success-path inspection (item 4) --------------------------------
+
+    def test_suspect_403_detected_in_success_path(self):
+        g = self.make_guard()
+        install_fake_transport(g, mode="ok")
+
+        def handler(method, url, kwargs, proceed):
+            return FakeResponse(
+                text="<html><body>rate-limit exceeded, slow down</body></html>",
+                status_code=403)
+
+        transport.set_send_handler(handler)
+        with self.assertRaises(transport.ThrottleDetected) as cm:
+            Session().get("http://example.invalid")
+        exc = cm.exception
+        self.assertFalse(isinstance(exc, Exception))
+        self.assertEqual(exc.kind, "suspect_403")
+        backoff = store.get_backoff(self.db)
+        self.assertIsNotNone(backoff)
+        self.assertEqual(backoff["kind"], "suspect_403")
+        self.assertTrue(backoff["until_ts"] > time.time())
+        # The attempt was made (and budgeted) before the 403 arrived.
+        self.assertEqual(g.spent_today(), 1)
+
+    def test_retry_after_absent_uses_exponential(self):
+        # v3 item 8: no Retry-After header -> exponential 900 * 2**(n-1).
+        g = self.make_guard()
+        install_fake_transport(g, mode="http429")  # no retry_after
+        t0 = time.time()
+        with self.assertRaises(transport.ThrottleDetected) as cm:
+            Session().get("http://example.invalid")
+        self.assertIsNone(cm.exception.retry_after_s)
+        backoff = store.get_backoff(self.db)
+        self.assertIsNone(backoff["retry_after_s"])
+        self.assertAlmostEqual(backoff["until_ts"], t0 + 900, delta=60)
+        # Consecutive: a second 429 without a header doubles the backoff.
+        with self.assertRaises(transport.ThrottleDetected):
+            Session().get("http://example.invalid")
+        backoff2 = store.get_backoff(self.db)
+        self.assertAlmostEqual(backoff2["until_ts"], t0 + 1800, delta=120)
+
+    # -- BudgetExhausted through real fli Client.get (item 2) -----------
+
+    def test_budget_exhausted_through_real_fli_client_get(self):
+        """The real fli Client.get must propagate the ORIGINAL
+        BudgetExhausted: not wrapped by `except Exception` into
+        _wrap_request_error, never converted to an "unknown". Tenacity may
+        still spin its attempts, but every attempt fails fast inside
+        reserve(): zero sends, zero ledger rows."""
+        from fli.search.client import Client
+        g = self.make_guard(daily_ceiling=0)
+        fake = install_fake_transport(g, mode="ok")
+        client = Client()
+        with self.assertRaises(budget.BudgetExhausted) as cm:
+            client.get("http://example.invalid/")
+        exc = cm.exception
+        self.assertIs(type(exc), budget.BudgetExhausted)  # not wrapped
+        self.assertFalse(isinstance(exc, Exception))
+        self.assertTrue(isinstance(exc, BaseException))
+        self.assertEqual(exc.scope, "daily")
+        self.assertEqual(fake.sends, 0)      # nothing left the machine
+        self.assertEqual(g.spent_today(), 0)  # nothing recorded
+
+    # -- per-send allowance (item 5) ------------------------------------
+
+    def test_top_n_3_against_allowance_2_stops_at_two_sends(self):
+        """set_run_allowance(2), then a top_n=3 query: exactly 2 sends go
+        out; the 3rd raises BudgetExhausted mid-query (per-send, not
+        per-query enforcement)."""
+        import poller
+        orig_polite = poller._polite
+        poller._polite = lambda: None
+        self.addCleanup(setattr, poller, "_polite", orig_polite)
+        g = self.make_guard()
+        g.set_run_allowance(2)
+        fake = install_fake_transport(g, mode="ok")
+        watch = {"origins": ["JFK"], "destinations": ["LHR"],
+                 "max_stops": 0, "cabin": "economy"}
+        with self.assertRaises(budget.BudgetExhausted) as cm:
+            poller.narrow_query("JFK", "LHR", "2026-12-01", "2026-12-08",
+                                watch, top_n=3, attempt_category="sentinel")
+        self.assertEqual(cm.exception.scope, "per_run")
+        self.assertFalse(isinstance(cm.exception, Exception))
+        self.assertEqual(fake.sends, 2)
+        self.assertEqual(g.spent_today("sentinel"), 2)
+
+    # -- persisted backoff skips the follow-up run ------------------------
+
+    def test_followup_scheduled_run_skips_collection_on_backoff(self):
+        """First run: a returned 429 persists a backoff. Follow-up scheduled
+        run: collection fn never runs, nothing is sent, and the legitimate
+        no-op still pings success (never /fail)."""
+        import importlib.util as ilu
+        import heartbeat
+        spec = ilu.spec_from_file_location(
+            "fm_run_v3t", str(_PROJECT_ROOT / "run.py"))
+        fm_run = ilu.module_from_spec(spec)
+        sys.modules["fm_run_v3t"] = fm_run
+        spec.loader.exec_module(fm_run)
+
+        g = self.make_guard()
+        fake = install_fake_transport(g, mode="http429", retry_after="120")
+        with self.assertRaises(transport.ThrottleDetected):
+            Session().get("http://example.invalid")
+        self.assertIsNotNone(store.get_backoff(self.db))
+
+        old_url = os.environ.get("HEALTHCHECKS_PING_URL")
+        os.environ["HEALTHCHECKS_PING_URL"] = \
+            "https://example.invalid/hc/fake-v3-backoff"
+        self.addCleanup(self._restore_hc_env, old_url)
+        captured = heartbeat.start_capture()
+        self.addCleanup(heartbeat.stop_capture)
+
+        calls = []
+
+        def spy(args, db, watches, guard):
+            calls.append(1)
+            return 0
+
+        args = SimpleNamespace(cmd="check", scheduled=True, watch=None,
+                               duration=7, depart="2026-10-01",
+                               return_="2026-10-08")
+        rc = fm_run.run_guarded("check", args, self.db, [], g, spy)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])       # collection never ran
+        self.assertEqual(fake.sends, 1)   # only the throttled first-run send
+        kinds = [k for k, _ in captured]
+        self.assertEqual(kinds, ["success"])
+        self.assertFalse(any("/fail" in u for _, u in captured))
+
+    @staticmethod
+    def _restore_hc_env(old_url):
+        if old_url is None:
+            os.environ.pop("HEALTHCHECKS_PING_URL", None)
+        else:
+            os.environ["HEALTHCHECKS_PING_URL"] = old_url
 
 
 if __name__ == "__main__":

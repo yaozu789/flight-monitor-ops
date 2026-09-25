@@ -81,15 +81,15 @@ from poller import narrow_query
 try:
     from budget import BudgetExhausted as _ImportedBudgetExhausted
     if not (isinstance(_ImportedBudgetExhausted, type)
-            and issubclass(_ImportedBudgetExhausted, Exception)):
+            and issubclass(_ImportedBudgetExhausted, BaseException)):
         # The base-tree s4/budget.py still on sys.path defines BudgetExhausted
-        # as a BaseException for the old poller; the v2 contract needs the
-        # Exception subclass carrying .scope/.category.
-        raise ImportError("budget.BudgetExhausted is not the v2 Exception subclass")
+        # with an older API; the v3 contract needs the BaseException
+        # subclass carrying .scope/.category.
+        raise ImportError("budget.BudgetExhausted is not the v3 BaseException subclass")
     BudgetExhausted = _ImportedBudgetExhausted
 except ImportError:
-    class BudgetExhausted(Exception):
-        """Fallback until the v2 budget module is assembled on sys.path."""
+    class BudgetExhausted(BaseException):
+        """Fallback until the v3 budget module is assembled on sys.path."""
 
         def __init__(self, scope=None, category=None,
                      message="budget exhausted"):
@@ -102,7 +102,9 @@ SENTINEL_ANCHORS_PER_GROUP = 27
 SENTINEL_TOP_N = 1
 DETAIL_TOP_N = 3
 PER_RUN_ATTEMPT_CAP = 12
-PER_RUN_ATTEMPT_FLOOR = 4
+# v3 item 7: the old PER_RUN_ATTEMPT_FLOOR = 4 minimum is removed. When the
+# budget is exhausted the allowance is 0 -- no floor of attempts the run
+# cannot afford.
 
 # Suggested per-category caps for BudgetGuard(category_caps=...). Caps are
 # maxima, not an allocation: they intentionally sum above the 150/day ceiling.
@@ -116,6 +118,12 @@ DAILY_PARTITION = {
 
 DAILY_CEILING = 150
 VERIFY_RESERVE = 24
+
+# v3 group 4: resumable bursts. A burst runs at most 60 attempts total
+# (2 per step); a partial burst resumes in later slots until 60 attempts,
+# all steps complete, or BURST_EXPIRY_HOURS after the trigger was queued.
+BURST_MAX_ATTEMPTS = 60
+BURST_EXPIRY_HOURS = 24
 
 
 # ---------------------------------------------------------------- minting
@@ -305,14 +313,17 @@ def per_run_allowance(guard, slot) -> int:
 
     ``remaining = 150 - spent_today() - max(0, 24 - spent_today("verify"))``
     (the verify reserve is held back for the verifier); spread over the
-    slots left today, clamped to [4, 12].
+    slots left today, clamped to at most 12. v3 item 7: no minimum floor --
+    when the budget is exhausted (remaining <= 0) the allowance is 0, so
+    the run stops instead of burning a floor of 4 attempts it cannot afford.
     """
     remaining = (DAILY_CEILING - guard.spent_today()
                  - max(0, VERIFY_RESERVE - guard.spent_today("verify")))
+    if remaining <= 0:
+        return 0
     slots_left = store.slots_left_today(slot)
     paced = math.ceil(remaining / max(1, slots_left))
-    return min(PER_RUN_ATTEMPT_CAP,
-               max(PER_RUN_ATTEMPT_FLOOR, paced))
+    return min(PER_RUN_ATTEMPT_CAP, paced)
 
 
 # ---------------------------------------------------------------- collect
@@ -366,11 +377,14 @@ def _queue_drop_trigger(db, cell: dict, price: float, slot: int) -> bool:
 
 def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
                    top_n: int, category: str, result: dict, allowance: int,
-                   count_key: str) -> None:
+                   count_key: str, deadline_fn=None) -> None:
     remaining = allowance - result["attempts"]
     if remaining <= 0:
         return
     for cell in store.due_cells(db, role, remaining):
+        if deadline_fn is not None and deadline_fn():
+            raise store.DeadlineExceeded(
+                f"{role} phase deadline exceeded")
         if result["attempts"] >= allowance:
             break
         group_cfg = groups_cfg.get(cell["group_id"])
@@ -388,13 +402,18 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
                 result["drop_triggers"] += 1
 
 
-def collect(db, guard, groups_cfg, slot, run_start) -> dict:
-    """One collection pass.
+def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None) -> dict:
+    """One collection pass (v3 order).
 
-    Priority: bursts (due_triggers -> execute_burst) -> sentinels
-    (due_sentinels, top_n=1, "sentinel") -> background (due_background,
-    top_n=3, "background"). Budget: per_run_allowance total; stops cleanly on
-    BudgetExhausted (partial progress is kept).
+    Priority: sentinels (due_sentinels, top_n=1, "sentinel") -> bursts
+    (due_triggers -> execute_burst, resumable across slots) -> background
+    (due_background, top_n=3, "background"). Verification of new candidates
+    runs BEFORE this (run.py cmd_check), so the verifier's budget is spent
+    before collection burns it. Budget: per_run_allowance total; stops
+    cleanly on BudgetExhausted (partial progress is kept).
+
+    The run deadline is checked at loop tops; DeadlineExceeded propagates
+    to run.run_guarded for a controlled stop (never swallowed here).
 
     Drop triggers: when a sentinel/background cell check succeeds and its
     previous last_price_usd exists and new <= 0.8*previous and the previous
@@ -406,23 +425,30 @@ def collect(db, guard, groups_cfg, slot, run_start) -> dict:
     result = {"attempts": 0, "bursts": [], "sentinels": 0,
               "background": 0, "drop_triggers": 0}
     allowance = per_run_allowance(guard, slot)
+    # v3 item 5: enforce the allowance on EVERY send, not just before a
+    # multi-attempt query. reserve() refuses once the run-local total hits
+    # this, so a top_n=3 query against a 2-attempt allowance stops at 2
+    # sends instead of overshooting to 4.
+    guard.set_run_allowance(allowance)
     try:
+        _collect_phase(db, guard, groups_cfg, slot, run_start,
+                       "sentinel", SENTINEL_TOP_N, "sentinel",
+                       result, allowance, "sentinels", deadline_fn)
         for trig in store.due_triggers(db, slot):
+            if deadline_fn is not None and deadline_fn():
+                raise store.DeadlineExceeded("burst phase deadline exceeded")
             if result["attempts"] >= allowance:
                 break
             group_cfg = groups_cfg.get(trig["group_id"])
             if group_cfg is None:
                 continue
             used = execute_burst(db, trig, guard, group_cfg, slot,
-                                 run_start=run_start)
+                                 run_start=run_start, deadline_fn=deadline_fn)
             result["attempts"] += used
             result["bursts"].append(trig["id"])
         _collect_phase(db, guard, groups_cfg, slot, run_start,
-                       "sentinel", SENTINEL_TOP_N, "sentinel",
-                       result, allowance, "sentinels")
-        _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "background", DETAIL_TOP_N, "background",
-                       result, allowance, "background")
+                       result, allowance, "background", deadline_fn)
     except BudgetExhausted:
         pass  # stop cleanly; partial progress is kept
     return result
@@ -466,32 +492,79 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
 
 # ---------------------------------------------------------------- bursts
 
-def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None) -> int:
+def _burst_steps(trigger):
+    """Ordered burst steps as (step_index, kind, depart_date, duration).
+
+    Step 0 revalidates the trigger (billed "verify"); steps 1..20 are the
+    neighbour departures +-1..10 days at the trigger duration; steps 21..29
+    are the duration exploration (5..14 days, excluding the trigger's own
+    duration). 30 steps x 2 attempts = 60 attempts max.
+    """
+    yield 0, "revalidate", trigger["depart_date"], trigger["duration"]
+    base = date.fromisoformat(trigger["depart_date"])
+    idx = 1
+    for delta in range(1, 11):
+        for s in (-1, 1):
+            yield (idx, "neighbour",
+                   (base + timedelta(days=s * delta)).isoformat(),
+                   trigger["duration"])
+            idx += 1
+    for dur in range(5, 15):
+        if dur == trigger["duration"]:
+            continue
+        yield idx, "duration", trigger["depart_date"], dur
+        idx += 1
+
+
+def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
+                  deadline_fn=None) -> int:
     """Expand one due trigger (dict from ``store.due_triggers``).
 
+    v3 group 4: the burst is RESUMABLE across slots. Progress (cumulative
+    attempts used, next step, expiry) persists in ``store.burst_progress``
+    after every step. A burst that hits the per-run allowance, the run
+    deadline, or the budget stops as "partial" and later slots resume it
+    via ``due_triggers`` until it reaches 60 attempts, completes all 30
+    steps, or expires (24h after the trigger was queued). It is NEVER
+    marked permanently done after a single partial allowance.
+
     1. Revalidate the trigger's depart/duration with top_n=1 billed to
-       "verify" (verify traffic bills to "verify", never "sentinel"). If the
-       cheapest is unknown or above the trigger price -> mark_trigger
-       "dropped", record_burst(status="dropped"), return attempts used.
+       "verify" (first execution only). If the cheapest is unknown or above
+       the trigger price -> mark_trigger "dropped", progress "dropped",
+       record_burst(status="dropped"), return attempts used.
     2. Neighbour departures +-1..10 days (20 dates) at the trigger duration,
-       top_n=1, billed "burst"; stop when burst-phase attempts reach 40 or the
-       per-run allowance is exhausted.
+       top_n=1, billed "burst".
     3. Duration exploration: durations 5..14 excluding the trigger duration,
-       same depart_date, top_n=1, "burst", until 60 burst-phase attempts total
-       or the allowance is exhausted.
-    4. record_burst(status="done"/"partial"), mark_trigger "burst".
+       same depart_date, top_n=1, "burst".
+    4. record_burst(status="done"/"partial"); the trigger goes to "burst"
+       when finished, "burst_active" (resumable) on partial.
 
     One-off checks are never recorded as cell checks (synthetic cell dicts
-    with ``id=None``). ``BudgetExhausted`` mid-burst records a partial burst
-    and marks the trigger so it does not refire, then re-raises. Returns
-    total attempts used.
+    with ``id=None``). ``BudgetExhausted`` / deadline mid-burst keeps the
+    persisted progress, marks the trigger "burst_active", records a
+    partial burst, and re-raises. Returns attempts used by THIS call.
     """
+    # Load or initialize resumable progress.
+    prog = store.get_burst_progress(db, trigger["id"])
+    if prog is None:
+        created = _parse_ts(trigger["created_at"])
+        expires_at = (created + timedelta(hours=BURST_EXPIRY_HOURS)).isoformat()
+        prog = store.init_burst_progress(db, trigger["id"],
+                                         trigger["group_id"],
+                                         trigger["depart_week"], expires_at)
+    # Defensive: expired or terminal progress never executes.
+    if prog["status"] != "active" or prog["expires_at"] <= store.utcnow_iso():
+        if prog["status"] == "active":
+            store.save_burst_progress(db, trigger["id"], status="expired")
+            store.mark_trigger(db, trigger["id"], "expired")
+        return 0
+
     total = 0
+    cumulative = prog["attempts_used"]
+    next_step = prog["next_step"]
     allowance = per_run_allowance(guard, slot)
     run_spent_entry = guard.spent_run()
     group_id = trigger["group_id"]
-    depart_date = trigger["depart_date"]
-    duration = trigger["duration"]
 
     def _one_off(d_date: str, dur: int, category: str):
         cell = {"id": None, "depart_date": d_date, "duration": dur}
@@ -507,46 +580,59 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None) -> int:
                            depart_week=trigger["depart_week"],
                            attempts=total, status=status)
 
+    steps = list(_burst_steps(trigger))
     try:
-        # 1) revalidate (verify billing)
-        price, used = _one_off(depart_date, duration, "verify")
-        total += used
-        if price is None or price > trigger["price_usd"]:
-            store.mark_trigger(db, trigger["id"], "dropped")
-            _record("dropped")
-            return total
-
-        # 2) neighbour departures +-1..10 days
-        burst_attempts = 0
-        base = date.fromisoformat(depart_date)
-        neighbours = [(base + timedelta(days=s * delta)).isoformat()
-                      for delta in range(1, 11) for s in (-1, 1)]
-        done = True
-        for d_iso in neighbours:
-            if burst_attempts >= 40 or _allowance_exhausted():
-                done = False
+        for step_idx, kind, d_date, dur in steps:
+            if step_idx < next_step:
+                continue  # already done in an earlier slot: resume point
+            if cumulative >= BURST_MAX_ATTEMPTS:
                 break
-            _, used = _one_off(d_iso, duration, "burst")
-            total += used
-            burst_attempts += used
-
-        # 3) duration exploration
-        for dur in range(5, 15):
-            if dur == duration:
-                continue
-            if burst_attempts >= 60 or _allowance_exhausted():
-                done = False
+            if _allowance_exhausted():
                 break
-            _, used = _one_off(depart_date, dur, "burst")
+            if deadline_fn is not None and deadline_fn():
+                raise store.DeadlineExceeded("burst phase deadline exceeded")
+            category = "verify" if kind == "revalidate" else "burst"
+            price, used = _one_off(d_date, dur, category)
             total += used
-            burst_attempts += used
-
-        _record("done" if done else "partial")
-        store.mark_trigger(db, trigger["id"], "burst")
+            cumulative += used
+            next_step = step_idx + 1
+            if kind == "revalidate" and (price is None
+                                        or price > trigger["price_usd"]):
+                store.mark_trigger(db, trigger["id"], "dropped")
+                store.save_burst_progress(db, trigger["id"], status="dropped",
+                                          next_step=next_step,
+                                          attempts_used=cumulative)
+                _record("dropped")
+                return total
+            # Persist every step so a later slot resumes exactly here.
+            store.save_burst_progress(db, trigger["id"], status="active",
+                                      next_step=next_step,
+                                      attempts_used=cumulative)
+        finished = (next_step >= len(steps)
+                    or cumulative >= BURST_MAX_ATTEMPTS)
+        if finished:
+            store.mark_trigger(db, trigger["id"], "burst")
+            store.save_burst_progress(db, trigger["id"], status="done")
+            _record("done")
+        else:
+            # Partial: resumable, NEVER terminal after one allowance.
+            store.mark_trigger(db, trigger["id"], "burst_active")
+            _record("partial")
         return total
-    except BudgetExhausted:
-        # Don't lose the work: record the partial burst and mark the trigger
-        # so it doesn't refire, then let collect() stop cleanly.
+    except (BudgetExhausted, store.DeadlineExceeded):
+        # Account carefully for a transport allowance ending mid-query: the
+        # interrupted step may have partially spent before raising. Fold
+        # that spend into the cumulative total so the 60-attempt cap stays
+        # accurate across resumes. (Progress was persisted per completed
+        # step above; the interrupted step itself is retried on resume.)
+        partial_spend = (guard.spent_run() - run_spent_entry) - total
+        if partial_spend > 0:
+            cumulative += partial_spend
+            store.save_burst_progress(db, trigger["id"], status="active",
+                                      next_step=next_step,
+                                      attempts_used=cumulative)
+        # Mark resumable and let the caller stop cleanly (collect) /
+        # controlled (run_guarded).
+        store.mark_trigger(db, trigger["id"], "burst_active")
         _record("partial")
-        store.mark_trigger(db, trigger["id"], "burst")
         raise

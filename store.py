@@ -15,6 +15,22 @@ preserved verbatim). v2 only ADDS tables/columns/functions:
   added idempotently; guarded transitions; slot-gap retry eligibility.
 - throttle_state: persisted 429 / CAPTCHA backoff.
 - cells / triggers / bursts: sentinel rotation + burst scheduling (plan 04).
+
+v3 is a strict superset of v2. Review-driven changes:
+- Fingerprints may now include per-leg flight numbers and departure
+  datetimes. The Phase-1 scheme is UNCHANGED when those fields are absent
+  (old rows keep their hashes); when present they join the hash input so
+  different flights hash differently.
+- observations gains flight_numbers / depart_times columns (JSON lists,
+  NULL for old rows); outbox gains unknown_count.
+- Alert identity is (watch_id, departure ISO week): one alert slot per
+  watch per week; re-alert only on a meaningful drop.
+- The scheduler transition map is exactly pending -> handoff_prepared ->
+  relay_attempted_unconfirmed. Retirement is a separate guarded operation
+  (never from user_confirmed); human confirmation only from the two
+  handed-off states, with the actor recorded.
+- prepare_handoff enforces the handoff-count cap and slot gap inside the
+  UPDATE. Retry cap is 2; a third consecutive unknown recheck retires.
 """
 from __future__ import annotations
 
@@ -24,6 +40,17 @@ import sqlite3
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+
+class DeadlineExceeded(Exception):
+    """A collection run exceeded its run deadline (run.RUN_DEADLINE_S).
+
+    Control-flow only: run.run_guarded catches it for a CONTROLLED stop --
+    finish_slot("deadline"), a health note, lock release, and a success
+    ping -- never /fail. Collection loops raise it at loop tops via the
+    deadline_fn passed down from run_guarded. It must never be swallowed by
+    generic crash handlers.
+    """
 
 # ---------------------------------------------------------------------------
 # Phase-1 / 01-03 tables: preserved VERBATIM (live DB compatibility).
@@ -163,7 +190,7 @@ CREATE TABLE IF NOT EXISTS triggers (
     day TEXT NOT NULL,             -- UTC day queued (dedup scope)
     created_slot INTEGER NOT NULL,
     created_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',  -- queued|burst|dropped
+    status TEXT NOT NULL DEFAULT 'queued',  -- queued|burst_active|burst|dropped|expired
     UNIQUE (kind, group_id, depart_week, day)
 );
 CREATE TABLE IF NOT EXISTS bursts (
@@ -176,24 +203,41 @@ CREATE TABLE IF NOT EXISTS bursts (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_bursts_group_week ON bursts (group_id, depart_week, created_at);
+-- v3 group 4: resumable burst progress. A burst that exhausts the per-run
+-- allowance (or the run deadline / budget) stops as "partial" and is
+-- resumed by later slots until 60 attempts, all steps, or expiry -- it is
+-- NEVER marked permanently done after one partial allowance.
+CREATE TABLE IF NOT EXISTS burst_progress (
+    trigger_id INTEGER PRIMARY KEY REFERENCES triggers (id),
+    group_id TEXT NOT NULL,
+    depart_week TEXT NOT NULL,
+    attempts_used INTEGER NOT NULL DEFAULT 0,  -- cumulative across slots
+    next_step INTEGER NOT NULL DEFAULT 0,      -- 0=revalidate, 1..20=neighbours, 21..29=durations
+    status TEXT NOT NULL DEFAULT 'active',     -- active|done|dropped|expired
+    expires_at TEXT NOT NULL,                  -- trigger created_at + 24h
+    updated_at TEXT NOT NULL
+);
 """
 
-# Outbox lifecycle (spec item 2): pending -> handoff_prepared ->
-# relay_attempted_unconfirmed -> user_confirmed | retired. user_confirmed is
-# terminal and may ONLY be set by the outbox-confirm command (actor="user").
+# Outbox lifecycle (v3): the SCHEDULER transition map is exactly
+#   pending -> handoff_prepared -> relay_attempted_unconfirmed
+# Retirement is a separate guarded operation (retire_outbox), never from
+# user_confirmed; user_confirmed is terminal and may ONLY be set by the
+# human-driven outbox-confirm command via set_outbox_user_confirmed.
 OUTBOX_TRANSITIONS = {
-    "pending": {"handoff_prepared", "retired"},
-    "handoff_prepared": {"relay_attempted_unconfirmed", "handoff_prepared", "retired"},
-    "relay_attempted_unconfirmed": {"handoff_prepared", "user_confirmed", "retired"},
+    "pending": {"handoff_prepared"},
+    "handoff_prepared": {"relay_attempted_unconfirmed"},
+    "relay_attempted_unconfirmed": set(),
     "user_confirmed": set(),
     "retired": set(),
 }
 
-# Retry policy (spec item 7): a prepared handoff becomes eligible for a
-# rechecked retry after RETRY_MIN_SLOT_GAP slots, at most RETRY_MAX_ATTEMPTS
-# handoffs per alert.
+# Retry policy (v3): a prepared handoff becomes eligible for a rechecked
+# retry after RETRY_MIN_SLOT_GAP slots, at most RETRY_MAX_ATTEMPTS handoffs
+# per alert. A third consecutive unknown recheck retires the alert.
 RETRY_MIN_SLOT_GAP = 3
-RETRY_MAX_ATTEMPTS = 3
+RETRY_MAX_ATTEMPTS = 2
+UNKNOWN_MAX = 3
 
 # Departure-week meaningful-drop dedup (smaller item): an already-outboxed
 # deal re-arms to pending only if the fresh price dropped by at least
@@ -218,6 +262,15 @@ _OUTBOX_V2_COLUMNS = [
     ("prepared_at", "TEXT"),
     ("last_price_usd", "REAL"),
     ("confirmed_by", "TEXT"),
+    ("unknown_count", "INTEGER NOT NULL DEFAULT 0"),  # v3: unknown rechecks
+]
+
+# v3 columns on the observations table: per-leg flight numbers and departure
+# datetimes (JSON lists). NULL for old rows -- old fingerprints (computed
+# without these fields) keep matching the Phase-1 scheme verbatim.
+_OBS_V3_COLUMNS = [
+    ("flight_numbers", "TEXT"),
+    ("depart_times", "TEXT"),
 ]
 
 
@@ -247,7 +300,11 @@ def slots_left_today(slot: int) -> int:
 
 
 def depart_week(depart_date: str) -> str:
-    """ISO week label (YYYY-Www) of a departure date, for burst dedup."""
+    """ISO week label (YYYY-Www) of a departure date.
+
+    v3 alert identity is (watch_id, depart_week): one alert slot per watch
+    per week. Also used for burst dedup.
+    """
     d = date.fromisoformat(depart_date)
     iso_year, iso_week, _ = d.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
@@ -274,6 +331,11 @@ def migrate_db(db: sqlite3.Connection) -> None:
         for name, ddl in _OUTBOX_V2_COLUMNS:
             if name not in cols:
                 db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {ddl}")
+    obs_cols = {r["name"] for r in db.execute("PRAGMA table_info(observations)")}
+    if obs_cols:
+        for name, ddl in _OBS_V3_COLUMNS:
+            if name not in obs_cols:
+                db.execute(f"ALTER TABLE observations ADD COLUMN {name} {ddl}")
     info = {r["name"] for r in db.execute("PRAGMA table_info(run_slots)")}
     if info and "claimed_at" not in info:
         # Patch-01 key was (slot_id, command); v2 keys slot_id alone.
@@ -298,9 +360,20 @@ def init_db(path_or_db: str | Path | sqlite3.Connection) -> sqlite3.Connection:
 # ---------------------------------------------------------------- Phase-1 API (preserved verbatim)
 
 def make_fingerprint(origin: str, destination: str, depart_date: str,
-                     return_date: str, airline: str | None, stops: int | None) -> str:
-    # Phase-1 SHA1 scheme -- must not change: 1743 existing observations use it.
+                     return_date: str, airline: str | None, stops: int | None,
+                     flight_numbers: list[str] | None = None,
+                     depart_times: list[str] | None = None) -> str:
+    # Phase-1 SHA1 scheme -- must not change: 1743 existing observations use
+    # it. When the optional v3 leg fields are absent, the input is byte-
+    # identical to Phase-1, so old rows keep their hashes verbatim. When
+    # present (every new fli result carries them), they join the hash so two
+    # itineraries that differ only in flight number / departure time hash
+    # differently.
     raw = f"{origin}|{destination}|{depart_date}|{return_date}|{airline or ''}|{stops if stops is not None else ''}"
+    fns = "|".join(str(f) for f in flight_numbers) if flight_numbers else ""
+    dts = "|".join(str(t) for t in depart_times) if depart_times else ""
+    if fns or dts:
+        raw = f"{raw}|{fns}|{dts}"
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
@@ -325,15 +398,23 @@ def add_observation(db: sqlite3.Connection, *, watch_id: str, origin: str,
                     destination: str, depart_date: str, return_date: str,
                     airline: str | None, stops: int | None, cabin: str,
                     price_usd: float | None, booking_url: str | None,
-                    observed_at: str | None = None) -> int:
-    fp = make_fingerprint(origin, destination, depart_date, return_date, airline, stops)
+                    observed_at: str | None = None,
+                    flight_numbers: list[str] | None = None,
+                    depart_times: list[str] | None = None) -> int:
+    # v3: every new fli result populates the leg fields; old callers omit
+    # them and get the Phase-1 fingerprint verbatim (compat).
+    fp = make_fingerprint(origin, destination, depart_date, return_date,
+                          airline, stops, flight_numbers, depart_times)
     cur = db.execute(
         """INSERT INTO observations
            (watch_id, fingerprint, origin, destination, depart_date, return_date,
-            airline, stops, cabin, price_usd, booking_url, observed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            airline, stops, cabin, price_usd, booking_url, observed_at,
+            flight_numbers, depart_times)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (watch_id, fp, origin, destination, depart_date, return_date, airline,
-         stops, cabin, price_usd, booking_url, observed_at or utcnow_iso()),
+         stops, cabin, price_usd, booking_url, observed_at or utcnow_iso(),
+         json.dumps(flight_numbers) if flight_numbers else None,
+         json.dumps(depart_times) if depart_times else None),
     )
     db.commit()
     return cur.lastrowid
@@ -343,7 +424,7 @@ def save_observations(db: sqlite3.Connection, watch_id: str,
                       observations: list[dict], run_start: str) -> int:
     """Batch variant of add_observation for poller rows (keys: origin,
     destination, depart_date, return_date, airline, stops, cabin, price_usd,
-    currency, booking_url)."""
+    currency, booking_url, flight_numbers, depart_times)."""
     n = 0
     for o in observations:
         add_observation(
@@ -352,7 +433,9 @@ def save_observations(db: sqlite3.Connection, watch_id: str,
             return_date=o["return_date"], airline=o.get("airline"),
             stops=o.get("stops"), cabin=o.get("cabin", "economy"),
             price_usd=o.get("price_usd"), booking_url=o.get("booking_url"),
-            observed_at=run_start)
+            observed_at=run_start,
+            flight_numbers=o.get("flight_numbers"),
+            depart_times=o.get("depart_times"))
         n += 1
     return n
 
@@ -527,26 +610,35 @@ def prepare_handoff(db: sqlite3.Connection, slot: int,
                     new_ids: list[str] | None = None) -> list[dict]:
     """Flip eligible pending rows to handoff_prepared in one UPDATE.
 
-    Eligibility (state='pending', plus the optional alert_id filter) is
-    enforced inside the UPDATE itself, so concurrent callers cannot prepare
-    the same row twice and non-pending rows are never touched (spec item 6).
+    Eligibility is enforced inside the UPDATE itself, so concurrent callers
+    cannot prepare the same row twice and non-pending rows are never touched
+    (v2 spec item 6). v3 adds two predicates, also inside the UPDATE (they
+    apply to the filtered-ID form as well):
+      - handoff_count < RETRY_MAX_ATTEMPTS (the retry cap),
+      - the last handoff was at least RETRY_MIN_SLOT_GAP slots ago
+        (prepared_slot NULL = never handed off = eligible).
     Returns the prepared rows.
     """
     now = utcnow_iso()
+    where_extra = ("AND handoff_count < ? "
+                   "AND (prepared_slot IS NULL OR prepared_slot <= ?)")
+    params_extra = (RETRY_MAX_ATTEMPTS, slot - RETRY_MIN_SLOT_GAP)
     if new_ids is None:
         db.execute(
-            """UPDATE outbox
+            f"""UPDATE outbox
                SET state='handoff_prepared', handoff_count=handoff_count + 1,
                    prepared_slot=?, prepared_at=?, updated_at=?
-               WHERE state='pending'""", (slot, now, now))
+               WHERE state='pending' {where_extra}""",
+            (slot, now, now, *params_extra))
     elif new_ids:
         marks = ",".join("?" for _ in new_ids)
         db.execute(
             f"""UPDATE outbox
                 SET state='handoff_prepared', handoff_count=handoff_count + 1,
                     prepared_slot=?, prepared_at=?, updated_at=?
-                WHERE state='pending' AND alert_id IN ({marks})""",
-            (slot, now, now, *new_ids))
+                WHERE state='pending' {where_extra}
+                  AND alert_id IN ({marks})""",
+            (slot, now, now, *params_extra, *new_ids))
     else:
         return []
     db.commit()
@@ -562,8 +654,9 @@ def reprepare_retries(db: sqlite3.Connection, slot: int,
 
     Retry rows are already in a handoff state (handoff_prepared or
     relay_attempted_unconfirmed); a re-handoff bumps handoff_count (so the
-    3-handoff cap in eligible_retry_candidates is honored) and stamps the
-    current prepared_slot. Rows not in a handoff state are never touched.
+    2-handoff cap in eligible_retry_candidates is honored) and stamps the
+    current prepared_slot. A confirmed recheck also clears the unknown streak.
+    Rows not in a handoff state are never touched.
     """
     if not retry_ids:
         return
@@ -572,7 +665,7 @@ def reprepare_retries(db: sqlite3.Connection, slot: int,
     db.execute(
         f"""UPDATE outbox
             SET handoff_count=handoff_count + 1, prepared_slot=?,
-                prepared_at=?, updated_at=?
+                prepared_at=?, updated_at=?, unknown_count=0
             WHERE alert_id IN ({marks})
               AND state IN ('handoff_prepared', 'relay_attempted_unconfirmed')""",
         (slot, now, now, *retry_ids))
@@ -594,8 +687,11 @@ def update_outbox_state(db: sqlite3.Connection, alert_id: str, new_state: str,
                         actor: str = "scheduler") -> bool:
     """Guarded state transition. Returns False when the transition is illegal.
 
-    The scheduler/agent may never set user_confirmed through this path; only
-    the outbox-confirm command (actor="user") may, via set_outbox_user_confirmed.
+    v3: the scheduler map is exactly pending -> handoff_prepared ->
+    relay_attempted_unconfirmed. In particular "retired" is not reachable
+    here (use retire_outbox) and user_confirmed is never settable through
+    this path -- only set_outbox_user_confirmed (the human-driven
+    outbox-confirm command) may set it.
     """
     row = outbox_get(db, alert_id)
     if row is None:
@@ -611,15 +707,35 @@ def update_outbox_state(db: sqlite3.Connection, alert_id: str, new_state: str,
     return True
 
 
+def note_unknown_recheck(db: sqlite3.Connection, alert_id: str) -> int:
+    """Bump the persisted unknown-recheck counter; returns the new count.
+
+    The counter is cleared by reprepare_retries (a confirmed recheck breaks
+    the streak); the caller retires the row at store.UNKNOWN_MAX.
+    """
+    db.execute(
+        "UPDATE outbox SET unknown_count = unknown_count + 1, updated_at=? "
+        "WHERE alert_id=?",
+        (utcnow_iso(), alert_id),
+    )
+    db.commit()
+    row = outbox_get(db, alert_id)
+    return row["unknown_count"] if row else 0
+
+
 def set_outbox_user_confirmed(db: sqlite3.Connection, alert_id: str,
                               actor: str) -> bool:
     """Final user confirmation. Only a human-driven outbox-confirm call may
-    invoke this (spec item 10); the actor name is recorded for audit."""
+    invoke this (spec item 10); the actor name is recorded for audit.
+
+    v3: a pending alert has never been handed off, so there is nothing for
+    the user to confirm -- only handoff_prepared and
+    relay_attempted_unconfirmed may be confirmed.
+    """
     row = outbox_get(db, alert_id)
     if row is None:
         return False
-    if row["state"] not in ("pending", "handoff_prepared",
-                            "relay_attempted_unconfirmed"):
+    if row["state"] not in ("handoff_prepared", "relay_attempted_unconfirmed"):
         return False
     db.execute(
         """UPDATE outbox SET state='user_confirmed', confirmed_by=?,
@@ -642,10 +758,23 @@ def update_outbox_message(db: sqlite3.Connection, alert_id: str,
 
 
 def retire_outbox(db: sqlite3.Connection, alert_id: str, reason: str) -> bool:
-    ok = update_outbox_state(db, alert_id, "retired")
-    if ok:
-        add_health(db, "outbox_retire", True, f"{alert_id}: {reason}")
-    return ok
+    """Guarded retirement, separate from update_outbox_state.
+
+    The v3 scheduler transition map has no edge into retired: retirement is
+    an explicit operation, never a transition. user_confirmed is terminal
+    and can never be retired; retired rows stay retired.
+    """
+    row = outbox_get(db, alert_id)
+    if row is None:
+        return False
+    if row["state"] not in ("pending", "handoff_prepared",
+                            "relay_attempted_unconfirmed"):
+        return False
+    db.execute("UPDATE outbox SET state='retired', updated_at=? WHERE alert_id=?",
+               (utcnow_iso(), alert_id))
+    db.commit()
+    add_health(db, "outbox_retire", True, f"{alert_id}: {reason}")
+    return True
 
 
 # ---------------------------------------------------------------- slots & lock
@@ -844,18 +973,31 @@ def queue_trigger(db: sqlite3.Connection, *, kind: str, group_id: str,
 
 
 def due_triggers(db: sqlite3.Connection, slot: int) -> list[dict]:
-    """Queued triggers younger than 24h with no burst for (group, week) in
-    the last 24h (spec item 4 dedup)."""
+    """Triggers ready for (re)execution.
+
+    - status='queued', younger than 24h, with no burst for (group, week) in
+      the last 24h (spec item 4 dedup);
+    - OR status='burst_active' with unexpired, still-active burst progress
+      (v3 group 4: a partial burst resumes in later slots until it reaches
+      60 attempts, finishes all steps, or expires -- never terminal after
+      one partial allowance).
+    """
     day_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+    now_iso = utcnow_iso()
     return [dict(r) for r in db.execute(
         """SELECT t.* FROM triggers t
-           WHERE t.status = 'queued' AND t.created_at >= ?
-             AND NOT EXISTS (
-                   SELECT 1 FROM bursts b
-                   WHERE b.group_id = t.group_id
-                     AND b.depart_week = t.depart_week
-                     AND b.created_at >= ?)
-           ORDER BY t.created_at ASC""", (day_ago, day_ago))]
+           LEFT JOIN burst_progress p ON p.trigger_id = t.id
+           WHERE t.created_at >= ?
+             AND ((t.status = 'queued'
+                   AND NOT EXISTS (
+                         SELECT 1 FROM bursts b
+                         WHERE b.group_id = t.group_id
+                           AND b.depart_week = t.depart_week
+                           AND b.created_at >= ?))
+                  OR (t.status = 'burst_active'
+                      AND p.status = 'active'
+                      AND p.expires_at > ?))
+           ORDER BY t.created_at ASC""", (day_ago, day_ago, now_iso))]
 
 
 def mark_trigger(db: sqlite3.Connection, trigger_id: int, status: str) -> None:
@@ -870,3 +1012,52 @@ def record_burst(db: sqlite3.Connection, *, trigger_id: int, group_id: str,
            status, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
         (trigger_id, group_id, depart_week, attempts, status, utcnow_iso()))
     db.commit()
+
+
+# ---------------------------------------------------------------- burst progress (v3 group 4: resumable bursts)
+
+def init_burst_progress(db: sqlite3.Connection, trigger_id: int,
+                        group_id: str, depart_week: str,
+                        expires_at: str) -> dict:
+    """Create the resumable progress row for a trigger's first burst
+    execution. attempts_used=0, next_step=0 (revalidate), status='active'."""
+    db.execute(
+        """INSERT OR IGNORE INTO burst_progress
+           (trigger_id, group_id, depart_week, attempts_used, next_step,
+            status, expires_at, updated_at)
+           VALUES (?, ?, ?, 0, 0, 'active', ?, ?)""",
+        (trigger_id, group_id, depart_week, expires_at, utcnow_iso()))
+    db.commit()
+    return get_burst_progress(db, trigger_id)
+
+
+def get_burst_progress(db: sqlite3.Connection,
+                       trigger_id: int) -> dict | None:
+    row = db.execute("SELECT * FROM burst_progress WHERE trigger_id=?",
+                     (trigger_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def save_burst_progress(db: sqlite3.Connection, trigger_id: int, *,
+                        next_step: int | None = None,
+                        attempts_used: int | None = None,
+                        status: str | None = None) -> dict:
+    """Persist burst progress (called after every burst step so a later
+    slot -- or a BudgetExhausted/deadline -- resumes exactly where this
+    execution stopped). Returns the updated row."""
+    sets = ["updated_at=?"]
+    vals: list = [utcnow_iso()]
+    if next_step is not None:
+        sets.append("next_step=?")
+        vals.append(next_step)
+    if attempts_used is not None:
+        sets.append("attempts_used=?")
+        vals.append(attempts_used)
+    if status is not None:
+        sets.append("status=?")
+        vals.append(status)
+    vals.append(trigger_id)
+    db.execute(f"UPDATE burst_progress SET {', '.join(sets)} "
+               f"WHERE trigger_id=?", vals)
+    db.commit()
+    return get_burst_progress(db, trigger_id)

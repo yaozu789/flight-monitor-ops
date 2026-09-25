@@ -79,23 +79,40 @@ def _flatten(result, client: SearchFlights, seat, pax, cabin: str,
         stops = (outbound.stops or 0) + (back.stops or 0)
         airline = outbound.primary_airline_name or (
             outbound.primary_airline.name.lstrip("_") if outbound.primary_airline else None)
-        legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
-                for l in (outbound.legs + back.legs)]
+        raw_legs = outbound.legs + back.legs
     else:
         price, currency = result.price, result.currency or CURRENCY
         stops = result.stops or 0
         airline = result.primary_airline_name or (
             result.primary_airline.name.lstrip("_") if result.primary_airline else None)
-        legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
-                for l in result.legs]
+        raw_legs = result.legs
+    legs = [{"from": _apt(l.departure_airport), "to": _apt(l.arrival_airport)}
+            for l in raw_legs]
     if price is None:
         return None
     origin = legs[0]["from"] if legs else None
     destination = legs[0]["to"] if legs else None
+
+    # v3: per-leg flight numbers and departure datetimes feed the richer
+    # fingerprint (store.make_fingerprint) and are persisted on the
+    # observation row. Legs that lack them are skipped; absent fields keep
+    # the Phase-1 fingerprint for old callers.
+    flight_numbers: list[str] = []
+    depart_times: list[str] = []
+    for leg in raw_legs:
+        fn = getattr(leg, "flight_number", None)
+        if fn:
+            flight_numbers.append(str(fn))
+        dt = getattr(leg, "departure_datetime", None)
+        if dt is not None:
+            depart_times.append(dt.isoformat() if hasattr(dt, "isoformat")
+                                else str(dt))
+
     return {"origin": origin, "destination": destination, "airline": airline,
             "stops": stops, "price_usd": float(price), "currency": currency,
             "booking_url": booking_url or "",
-            "depart_date": depart, "return_date": ret, "cabin": cabin}
+            "depart_date": depart, "return_date": ret, "cabin": cabin,
+            "flight_numbers": flight_numbers, "depart_times": depart_times}
 
 
 def narrow_query(origin: str, dest: str, depart: str, ret: str, watch: dict, *,

@@ -71,7 +71,7 @@ class Stage4OrchestrationTests(unittest.TestCase):
             message_text="deal", origin="SFO", destination="JFK")
 
         orig_collect = fm_sentinel.collect
-        def spy_collect(db_, guard_, groups, slot, run_start):
+        def spy_collect(db_, guard_, groups, slot, run_start, **kwargs):
             order.append("collect")
             row = store.outbox_get(db_, aid)
             order.append(f"drain_state={row['state']}")
@@ -147,7 +147,7 @@ class Stage4OrchestrationTests(unittest.TestCase):
         db, guard = _ctx(self)
         seen = {}
 
-        def probe(args, db_, watches, guard_):
+        def probe(args, db_, watches, guard_, **kwargs):
             seen["slot_done"] = store.slot_done(db_, store.slot_id())
             return 0
 
@@ -161,14 +161,14 @@ class Stage4OrchestrationTests(unittest.TestCase):
         db, guard = _ctx(self)
         args = SimpleNamespace(cmd="check", scheduled=False, watch=None)
         rc1 = fm_run.run_guarded("check", args, db, [WATCH], guard,
-                                 lambda a, d, w, g: 0)
+                                 lambda *a, **k: 0)
         self.assertEqual(rc1, 0)
         # broad in the same slot: slot already claimed -> noop, fn not run
         ran = []
         rc2 = fm_run.run_guarded(
             "broad", SimpleNamespace(cmd="broad", scheduled=False, watch="w1",
                                      duration=7),
-            db, [WATCH], guard, lambda a, d, w, g: ran.append(1) or 0)
+            db, [WATCH], guard, lambda *a, **k: ran.append(1) or 0)
         self.assertEqual(rc2, 0)
         self.assertEqual(ran, [])
 

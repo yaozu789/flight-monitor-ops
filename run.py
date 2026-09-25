@@ -26,8 +26,9 @@ import argparse
 import json
 import os
 import sys
+import time
 import traceback
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -41,6 +42,7 @@ import transport  # noqa: E402
 from budget import BudgetExhausted, BudgetGuard  # noqa: E402
 from canary import run_canary  # noqa: E402
 from outbox import (  # noqa: E402
+    RELAYABLE_ACTIONS,
     drain_pending,
     enqueue_from_confirmation,
     recheck_retries,
@@ -48,6 +50,7 @@ from outbox import (  # noqa: E402
 from poller import broad_scan, narrow_query  # noqa: E402
 from scorer import score_new_observations  # noqa: E402
 from store import (  # noqa: E402
+    DeadlineExceeded,
     acquire_lock,
     add_alert,
     add_broad_scan,
@@ -65,6 +68,7 @@ from store import (  # noqa: E402
     reset_lock_loss,
     set_outbox_user_confirmed,
     slot_id,
+    slot_start_ts,
     sync_watches,
     update_outbox_state,
     utcnow_iso,
@@ -75,6 +79,12 @@ from verifier import verify  # noqa: E402
 DB_PATH = BASE / "data" / "monitor.db"
 
 LOCK_TTL_S = 1500
+
+# Run deadline, deliberately shorter than the lock TTL: a run that exceeds
+# it stops in a controlled way (finish_slot("deadline"), lock released)
+# instead of wedging the lock until TTL expiry. Checked at loop tops in
+# collection code via the deadline_fn passed to fn.
+RUN_DEADLINE_S = 1200
 
 # Only scheduled runs of these commands ping Healthchecks.
 PING_COMMANDS = {"check", "broad"}
@@ -99,9 +109,35 @@ def _ping_fail(args, cmd_name: str, db) -> None:
         heartbeat.ping_fail(db)
 
 
+def _check_deadline(deadline_fn) -> None:
+    """Raise DeadlineExceeded when the run deadline has passed.
+
+    deadline_fn is None outside run_guarded (direct calls, manual
+    commands) -- then there is no deadline to enforce.
+    """
+    if deadline_fn is not None and deadline_fn():
+        raise DeadlineExceeded(
+            f"run deadline ({RUN_DEADLINE_S}s) exceeded")
+
+
 def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int:
-    """Overlap lock + throttle backoff + slot idempotency + budget handling
-    + heartbeat semantics (spec item 11)."""
+    """Overlap lock + drain-first + throttle backoff + slot idempotency +
+    budget handling + run deadline + heartbeat semantics (spec item 11).
+
+    Order after lock acquisition is deliberate:
+
+    1. drain pending alerts (no network) FIRST -- stranded handoffs are
+       prepared even when a persisted backoff or an already-claimed slot
+       short-circuits the run below;
+    2. persisted throttle backoff -> legitimate no-op;
+    3. slot claim -> legitimate no-op when check/broad already ran;
+    4. the collection fn, bounded by the run deadline.
+
+    Heartbeat: success ONLY after a scheduled check/broad cycle finishes
+    (including legitimate no-ops and controlled deadline stops); /fail on
+    crash, SystemExit, repeated lock contention, or a non-zero fn return.
+    Manual/unscheduled runs never ping.
+    """
     if getattr(args, "scheduled", False):
         ok, reason = heartbeat.validate_schedule_env()
         if not ok:
@@ -119,6 +155,11 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
                      detail="another collection run holds the lock; exiting")
     try:
         reset_lock_loss(db)
+        slot = slot_id()
+        # Drain FIRST (no network): must run before the backoff / slot
+        # early-returns below so stranded handoffs are never stuck behind a
+        # skipped collection.
+        drained = drain_pending(db, slot)
         bo = get_backoff(db)
         if bo is not None:
             add_health(db, "throttle_backoff", True,
@@ -128,15 +169,25 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
                        retry_at=bo["until_ts"])
             _ping_ok(args, cmd_name, db)
             return rc
-        slot = slot_id()
         if not claim_slot(db, slot, "collect"):
             rc = _noop("slot_already_completed", slot_id=slot,
                        detail="check and broad share one collection per slot")
             _ping_ok(args, cmd_name, db)
             return rc
+        # Run deadline, shorter than the lock TTL: on exceed the run stops
+        # in a controlled way instead of wedging until TTL expiry.
+        deadline_at = time.monotonic() + RUN_DEADLINE_S
+
+        def _deadline_exceeded() -> bool:
+            return time.monotonic() >= deadline_at
+
         try:
-            rc = fn(args, db, watches, guard)
+            rc = fn(args, db, watches, guard,
+                    drained=drained, deadline_fn=_deadline_exceeded)
         except SystemExit:
+            # An explicit exit from fn is a failure signal, not a success:
+            # /fail, then let it propagate.
+            _ping_fail(args, cmd_name, db)
             raise
         except ThrottleDetected as e:  # BaseException: caught explicitly
             finish_slot(db, slot, "throttled")
@@ -155,12 +206,28 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
                        spent_run=guard.spent_run(), detail=str(e))
             _ping_ok(args, cmd_name, db)
             return rc
+        except DeadlineExceeded as e:
+            # Controlled stop, NOT a failure: the slot is finished, the
+            # lock is released by the finally below, and the cycle pings
+            # success -- never /fail.
+            finish_slot(db, slot, "deadline")
+            add_health(db, "run_deadline", True,
+                       f"controlled stop after {RUN_DEADLINE_S}s: {e}")
+            rc = _noop("deadline", slot_id=slot, detail=str(e))
+            _ping_ok(args, cmd_name, db)
+            return rc
         except BaseException as e:  # noqa: BLE001 - crash: /fail, never green
             finish_slot(db, slot, "crashed")
             add_health(db, "crash", False, f"{type(e).__name__}: {e}")
             traceback.print_exc()
             _ping_fail(args, cmd_name, db)
             return 1
+        if rc != 0:
+            # fn reported failure without raising: not a success, never
+            # green.
+            finish_slot(db, slot, "completed")
+            _ping_fail(args, cmd_name, db)
+            return rc
         finish_slot(db, slot, "completed")
         _ping_ok(args, cmd_name, db)
         return rc
@@ -209,8 +276,9 @@ def _add_scheduled(p) -> None:
                         "enables the Healthchecks ping and the env gate")
 
 
-def cmd_broad(args, db, watches, guard):
+def cmd_broad(args, db, watches, guard, *, drained=None, deadline_fn=None):
     w = get_watch(watches, args.watch)
+    _check_deadline(deadline_fn)
     combos = broad_scan(w, duration_days=args.duration)
     summary = {"watch": w["id"], "duration_days": args.duration,
                "combos": combos if combos else None,
@@ -249,15 +317,16 @@ def cmd_canary(args, db, watches, guard):
     return 0 if ok else 2
 
 
-def cmd_check(args, db, watches, guard):
-    """One scheduled collection cycle (spec item 12 ordering):
+def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
+    """One scheduled collection cycle (v3 group 4 ordering):
 
     1. Mint sentinel anchors + background grid (idempotent).
     2. Drain durable pending handoffs -- before any collection.
     3. Recheck prepared-but-unconfirmed handoffs (verify budget).
-    4. Collect: bursts > sentinels > background, paced across the 48 slots.
-    5. Score this run's observations; verify each candidate (verify budget);
-       enqueue durable pending alerts.
+    4. Verify new candidates FIRST (verify budget): score the previous
+       slot's collection output -- this run has not collected yet -- so
+       verification spend is prioritized ahead of fresh collection.
+    5. Collect: sentinels > bursts > background, paced across the 48 slots.
     6. Queue burst triggers (new under-cap deals).
     7. Prepare the new handoffs for the agent to relay.
     """
@@ -272,34 +341,34 @@ def cmd_check(args, db, watches, guard):
     n_sentinels = sentinel.mint_sentinels(db, groups_cfg)
     n_bg = sentinel.ensure_background_grid(db, groups_cfg)
 
-    # 2. Hand off ready alerts BEFORE collecting.
-    drained = drain_pending(db, slot)
+    # 2. Hand off ready alerts BEFORE collecting. run_guarded already
+    # drained (drain-first); direct callers drain here.
+    if drained is None:
+        drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 
     # 3. Retry pass (verify budget): recheck, re-render, retire.
-    retries = recheck_retries(db, watches, guard, slot)
+    retries = recheck_retries(db, watches, guard, slot,
+                              deadline_fn=deadline_fn)
     retry_ids = retries["retry_ids"]
     if retry_ids:
         reprepare_retries(db, slot, retry_ids)
 
-    # 4. Collect, paced: bursts > sentinels > background.
-    collected = sentinel.collect(db, guard, groups_cfg, slot, run_start)
-    summary["collect"] = {
-        "attempts": collected["attempts"],
-        "bursts": collected["bursts"],
-        "sentinels": collected["sentinels"],
-        "background": collected["background"],
-        "drop_triggers": collected["drop_triggers"],
-        "new_sentinel_cells": n_sentinels,
-        "new_background_cells": n_bg,
-    }
-
-    # 5. Score + verify + enqueue.
+    # 4. Verify new candidates FIRST (v3 group 4). This run has not
+    # collected yet, so "new candidates" are the previous slot's collection
+    # output: score observations written since the previous slot's start.
+    # The alerts-table cooldown dedups candidates already verified by an
+    # earlier slot; each slot's collection is verified by the next slot
+    # (a one-slot pipeline lag), and a skipped slot's deals are re-observed
+    # by the next collection pass. The verify budget is spent BEFORE
+    # collection can burn it.
+    prev_start_iso = datetime.fromtimestamp(
+        slot_start_ts(slot - 1), tz=timezone.utc).isoformat()
     new_ids: list[str] = []
     verified_deals: list[dict] = []
     for w in targets:
         candidates = score_new_observations(
-            db, w, run_start, cooldown_hours=w.get("cooldown_hours", 24))
+            db, w, prev_start_iso, cooldown_hours=w.get("cooldown_hours", 24))
         watch_new: list[str] = []
         for c in candidates:
             ok, conf = verify(db, w, c, guard)
@@ -309,8 +378,13 @@ def cmd_check(args, db, watches, guard):
             # cooldown reads it); delivery state lives in the outbox.
             add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
                       verified_at=utcnow_iso())
-            aid, _action = enqueue_from_confirmation(db, w, c, conf)
-            watch_new.append(aid)
+            aid, action = enqueue_from_confirmation(db, w, c, conf)
+            # v3: dedup is per (watch, departure week). A deduped candidate
+            # was already outboxed without a meaningful drop and must NOT
+            # be emitted to relay again -- only inserted and rearmed
+            # alerts join the relay batch.
+            if action in RELAYABLE_ACTIONS:
+                watch_new.append(aid)
             duration = (date.fromisoformat(conf["return_date"])
                         - date.fromisoformat(conf["depart_date"])).days
             verified_deals.append({
@@ -320,6 +394,19 @@ def cmd_check(args, db, watches, guard):
                 "cap": w["absolute_cap_usd"]})
         new_ids.extend(watch_new)
         summary["watches"][w["id"]] = {"new_alerts": watch_new}
+
+    # 5. Collect, paced: sentinels > bursts > background.
+    collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
+                                 deadline_fn=deadline_fn)
+    summary["collect"] = {
+        "attempts": collected["attempts"],
+        "bursts": collected["bursts"],
+        "sentinels": collected["sentinels"],
+        "background": collected["background"],
+        "drop_triggers": collected["drop_triggers"],
+        "new_sentinel_cells": n_sentinels,
+        "new_background_cells": n_bg,
+    }
 
     # 6. Burst triggers for newly under-cap deals.
     n_triggers = sentinel.detect_under_cap_triggers(

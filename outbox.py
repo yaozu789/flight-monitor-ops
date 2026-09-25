@@ -1,21 +1,31 @@
-"""Outbox orchestration (v2): alert rendering, durable queueing, retry rechecks.
+"""Outbox orchestration (v3): alert rendering, durable queueing, retry rechecks.
 
 All state lives in the shared store.py contract; this module only
 orchestrates: render -> enqueue -> prepare (via store) -> retry (recheck
-first, re-render the message on confirmation, retire on disappearance).
+first, re-render the message on confirmation, retire on disappearance or on
+a third consecutive unknown recheck).
 
-Alerts are idempotent on alert_id: store.enqueue_alert applies the
-meaningful-drop dedup (re-arm to pending only on a drop >= max($15, 5%)).
+v3 alert identity is (watch_id, departure ISO week): one alert slot per
+watch per week. store.enqueue_alert applies the meaningful-drop dedup
+(re-arm to pending only on a drop >= max($15, 5%) below the last outboxed
+price). Deduped candidates are never emitted to relay: cmd_check relays
+only enqueue actions in RELAYABLE_ACTIONS.
 """
 from __future__ import annotations
 
 import store
 import verifier
 
+# Enqueue actions that may be emitted to the relay batch. "deduped" means
+# the candidate was already outboxed for this (watch, week) without a
+# meaningful drop -- it stays silent.
+RELAYABLE_ACTIONS = ("inserted", "rearmed")
 
-def make_alert_id(watch_id: str, fingerprint: str) -> str:
-    """Stable across runs for the same deal: f"{watch_id}:{fingerprint}"."""
-    return f"{watch_id}:{fingerprint}"
+
+def make_alert_id(watch_id: str, depart_week: str) -> str:
+    """v3 alert identity: one slot per (watch, departure week)."""
+    return f"{watch_id}:{depart_week}"
+
 
 
 def _stops_text(stops) -> str:
@@ -66,10 +76,13 @@ def render_alert_message(watch, confirmation, fingerprint, first_seen_at) -> str
 def enqueue_from_confirmation(db, watch, candidate, confirmation) -> tuple[str, str]:
     """Build alert_id, render message, store.enqueue_alert(...).
 
-    Returns (alert_id, action) with action in {"inserted","deduped","rearmed"}.
+    v3: alert identity is (watch_id, departure week) -- one alert slot per
+    watch per week; the fingerprint is still stored on the row for the
+    verifier's recheck matching. Returns (alert_id, action) with action in
+    {"inserted", "deduped", "rearmed"}.
     """
     watch_id = watch.get("watch_id", watch.get("id"))
-    alert_id = make_alert_id(watch_id, candidate["fingerprint"])
+    alert_id = make_alert_id(watch_id, store.depart_week(candidate["depart_date"]))
     message = render_alert_message(
         watch, confirmation, candidate["fingerprint"],
         store.first_seen(db, candidate["fingerprint"]))
@@ -95,13 +108,17 @@ def drain_pending(db, slot) -> list[dict]:
     return store.prepare_handoff(db, slot, None)
 
 
-def recheck_retries(db, watches, guard, slot) -> dict:
+def recheck_retries(db, watches, guard, slot, deadline_fn=None) -> dict:
     """Recheck every eligible retry candidate before a retry handoff.
 
     - confirmed: re-render the message from the FRESH confirmation
       (spec item 8) and collect the alert_id for re-prepare;
-    - unknown: leave the row untouched (no alert, no retire);
+    - unknown: bump the persisted unknown counter; on the third
+      consecutive unknown the row is retired (v3);
     - gone: retire the row (fare disappeared on recheck).
+
+    deadline_fn (optional): checked at the top of the candidate loop;
+    raises store.DeadlineExceeded for a controlled run stop.
 
     Returns {"retry_ids": [...], "retired": [...], "unknown": [...]}.
     """
@@ -113,6 +130,8 @@ def recheck_retries(db, watches, guard, slot) -> dict:
     retired: list[str] = []
     unknown: list[str] = []
     for row in store.eligible_retry_candidates(db, slot):
+        if deadline_fn is not None and deadline_fn():
+            raise store.DeadlineExceeded("retry recheck deadline exceeded")
         watch = watch_map.get(row["watch_id"])
         if watch is None:
             unknown.append(row["alert_id"])
@@ -129,5 +148,12 @@ def recheck_retries(db, watches, guard, slot) -> dict:
             store.retire_outbox(db, row["alert_id"], "fare disappeared on recheck")
             retired.append(row["alert_id"])
         else:
-            unknown.append(row["alert_id"])
+            n = store.note_unknown_recheck(db, row["alert_id"])
+            if n >= store.UNKNOWN_MAX:
+                store.retire_outbox(
+                    db, row["alert_id"],
+                    f"unknown on {n} consecutive rechecks")
+                retired.append(row["alert_id"])
+            else:
+                unknown.append(row["alert_id"])
     return {"retry_ids": retry_ids, "retired": retired, "unknown": unknown}

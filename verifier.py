@@ -33,10 +33,17 @@ def _cfg_for(watch: dict, origin: str | None, destination: str | None) -> dict:
 
 
 def _match(row: dict, depart_date: str, return_date: str) -> str:
-    """Fingerprint of a poller result for the candidate's exact dates."""
+    """Fingerprint of a poller result for the candidate's exact dates.
+
+    v3: the row's per-leg flight numbers / departure times join the hash,
+    exactly as they did when the candidate's observation was saved -- so a
+    recheck only matches the same flights, and old rows (fields absent)
+    fall back to the Phase-1 scheme.
+    """
     return store.make_fingerprint(
         row.get("origin") or "", row.get("destination") or "",
-        depart_date, return_date, row.get("airline"), row.get("stops"))
+        depart_date, return_date, row.get("airline"), row.get("stops"),
+        row.get("flight_numbers"), row.get("depart_times"))
 
 
 def _confirmation(match: dict, depart_date: str, return_date: str) -> dict:

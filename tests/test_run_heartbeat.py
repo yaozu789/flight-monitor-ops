@@ -59,7 +59,7 @@ def args_for(cmd, scheduled=False):
                           duration=7, depart="2026-10-01", return_="2026-10-08")
 
 
-def ok_fn(args, db, watches, guard):
+def ok_fn(args, db, watches, guard, **kwargs):
     return 0
 
 
@@ -113,7 +113,7 @@ class RunHeartbeatTests(unittest.TestCase):
     def test_scheduled_crash_pings_fail(self):
         db, guard = self._ctx(self)
 
-        def boom(args, db, watches, guard):
+        def boom(args, db, watches, guard, **kwargs):
             raise RuntimeError("simulated crash")
 
         rc = fm_run.run_guarded("check", args_for("check", True), db, [],
