@@ -32,6 +32,19 @@ FIXTURE_HTML = (
     / "search_page_jfk_lhr_nonstop_ds1.html"
 ).read_text()
 
+# Live results pages (captured 2026-09-25) also embed Google's site route
+# list, which contains "/recaptcha/challenge". The vendored fixture is
+# trimmed and lacks it, which let a substring CAPTCHA detector pass every
+# test while flagging every real search. Append a verbatim excerpt so all
+# "ok" responses look like production pages.
+LIVE_ROUTE_LIST = (
+    '<script>["/preferences/notifications","/preferences/notifications/*",'
+    '"/producer","/producer/*","/recaptcha/challenge","/recaptcha/challenge/*",'
+    '"/recaptcha/challengepage","/recaptcha/challengepage/*","/retail",'
+    '"/retail/*","/s2","/s2/*"]</script>'
+)
+FIXTURE_HTML = FIXTURE_HTML + LIVE_ROUTE_LIST
+
 CAPTCHA_BODY = (
     "<html><body><h1>About this page</h1>"
     "<p>Our systems have detected unusual traffic from your computer network. "
@@ -43,9 +56,11 @@ class FakeResponse:
     """Duck-typed stand-in for curl_cffi's Response (only what fli reads)."""
 
     def __init__(self, text: str = FIXTURE_HTML, status_code: int = 200,
-                 headers: dict | None = None):
+                 headers: dict | None = None,
+                 url: str = "https://www.google.com/travel/flights"):
         self.text = text
         self.status_code = status_code
+        self.url = url
         self.headers = headers or {}
 
     def raise_for_status(self) -> None:

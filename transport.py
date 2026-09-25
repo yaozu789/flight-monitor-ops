@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import threading
+from urllib.parse import urlparse
 import time
 
 from curl_cffi.requests import Session
@@ -248,19 +249,31 @@ def _do_send(method, orig, self_obj, args, kwargs):
     return resp
 
 
-def _classify_throttle(status, body) -> str | None:
-    """Kind of throttle for a (status, body) pair, or None.
+def _classify_throttle(status, body, final_url=None) -> str | None:
+    """Kind of throttle for a response, or None.
 
     429 -> "http_429"; 403 with the throttle body marker -> "suspect_403";
-    CAPTCHA / unusual-traffic marker -> "captcha".
+    a Google /sorry/ block URL or a CAPTCHA / unusual-traffic block page
+    -> "captcha".
     """
     if status == 429:
         return "http_429"
     if status == 403 and _has_suspect_403_marker(body):
         return "suspect_403"
+    if _is_sorry_url(final_url):
+        return "captcha"
     if _has_captcha_marker(body):
         return "captcha"
     return None
+
+
+def _is_sorry_url(url) -> bool:
+    """Google's block interstitial lives at /sorry/... or sorry.google.com."""
+    if not url:
+        return False
+    parsed = urlparse(str(url))
+    host = (parsed.hostname or "").lower()
+    return host == "sorry.google.com" or parsed.path.startswith("/sorry/")
 
 
 def _raise_if_throttled_response(guard, method, url, resp) -> None:
@@ -269,7 +282,7 @@ def _raise_if_throttled_response(guard, method, url, resp) -> None:
     status = getattr(resp, "status_code", None)
     headers = getattr(resp, "headers", {}) or {}
     body = getattr(resp, "text", "") or ""
-    kind = _classify_throttle(status, body)
+    kind = _classify_throttle(status, body, getattr(resp, "url", None))
     if kind is None:
         return
     detail = "%s on %s %s" % (kind.replace("_", " "), method, url)
@@ -285,7 +298,7 @@ def _raise_if_throttle(guard, method, url, exc) -> None:
     status = getattr(resp, "status_code", None)
     headers = getattr(resp, "headers", {}) or {}
     body = getattr(resp, "text", "") or ""
-    kind = _classify_throttle(status, body)
+    kind = _classify_throttle(status, body, getattr(resp, "url", None))
     if kind is None:
         return
     detail = "%s on %s %s (from error)" % (kind.replace("_", " "), method, url)
@@ -294,8 +307,28 @@ def _raise_if_throttle(guard, method, url, exc) -> None:
 
 
 def _has_captcha_marker(body) -> bool:
+    """A CAPTCHA / unusual-traffic block page, not a results page.
+
+    Every normal Google Flights results page (~2 MB) embeds a site route
+    list containing "/recaptcha/challenge", so a bare substring match flags
+    every successful search as a CAPTCHA. A page that carries a parsed
+    ds:1 results payload is not a block page (a /sorry/ URL still is; see
+    _classify_throttle).
+    """
     lowered = (body or "").lower()
-    return any(marker in lowered for marker in CAPTCHA_MARKERS)
+    if not any(marker in lowered for marker in CAPTCHA_MARKERS):
+        return False
+    # Markers present: a block page only if there is no real results
+    # payload. Use fli's own parser, not a bare "ds:1" substring.
+    return _results_payload(body) is None
+
+
+def _results_payload(body):
+    import fli.search._tfs
+    try:
+        return fli.search._tfs.extract_payload(body)
+    except Exception:  # noqa: BLE001 - unparsable means "no payload"
+        return None
 
 
 def _has_suspect_403_marker(body) -> bool:

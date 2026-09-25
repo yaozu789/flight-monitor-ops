@@ -228,6 +228,56 @@ class BudgetTransportTest(unittest.TestCase):
         self.assertEqual(backoff["kind"], "captcha")
         self.assertTrue(backoff["until_ts"] > time.time())
 
+    def test_live_results_page_is_not_captcha(self):
+        """A normal results page (ds:1 payload + Google's route list with
+        "/recaptcha/challenge") passes through: no throttle, no backoff."""
+        g = self.make_guard()
+        fake = install_fake_transport(g, mode="ok")
+        resp = Session().get("http://example.invalid")
+        self.assertIn("/recaptcha/challenge", resp.text)
+        self.assertIsNone(store.get_backoff(self.db))
+        self.assertEqual(fake.sends, 1)
+
+    def _classify_via_send(self, resp):
+        """Send one request through the real transport wrapper, returning
+        the ThrottleDetected kind (or None) and the persisted backoff."""
+        uninstall_fake_transport()
+        store.clear_backoff(self.db)
+        g = self.make_guard()
+        install_fake_transport(g, mode="ok")
+        transport.set_send_handler(lambda m, u, k, proceed: resp)
+        try:
+            Session().get("http://example.invalid")
+            kind = None
+        except transport.ThrottleDetected as e:
+            kind = e.kind
+        return kind, store.get_backoff(self.db)
+
+    def test_block_page_with_incidental_ds1_is_captcha(self):
+        """A block page mentioning "ds:1"/"ds:10" in its JS (no real
+        payload) is still a CAPTCHA."""
+        from fake_transport import CAPTCHA_BODY
+        for extra in ('<script>var k="ds:1";</script>',
+                      '<script>var k="ds:10";</script>',
+                      "<script>AF_initDataCallback({key: 'ds:1', data:</script>"):
+            with self.subTest(extra=extra):
+                kind, backoff = self._classify_via_send(
+                    FakeResponse(text=CAPTCHA_BODY + extra))
+                self.assertEqual(kind, "captcha")
+                self.assertEqual(backoff["kind"], "captcha")
+
+    def test_sorry_url_is_captcha_even_with_payload(self):
+        """Google's /sorry/ block URL is a CAPTCHA regardless of body."""
+        for url in ("https://www.google.com/sorry/index?continue=x",
+                    "https://sorry.google.com/"):
+            with self.subTest(url=url):
+                kind, _ = self._classify_via_send(FakeResponse(url=url))
+                self.assertEqual(kind, "captcha")
+
+    def test_429_with_payload_is_still_429(self):
+        kind, _ = self._classify_via_send(FakeResponse(status_code=429))
+        self.assertEqual(kind, "http_429")
+
     # -- blank pages tripwire -----------------------------------------
 
     def test_blank_pages_tripwire(self):
