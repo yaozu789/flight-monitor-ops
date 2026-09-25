@@ -56,6 +56,7 @@ from store import (  # noqa: E402
     add_broad_scan,
     add_health,
     claim_slot,
+    deadline_streak,
     finish_slot,
     get_backoff,
     init_db,
@@ -85,6 +86,9 @@ LOCK_TTL_S = 1500
 # instead of wedging the lock until TTL expiry. Checked at loop tops in
 # collection code via the deadline_fn passed to fn.
 RUN_DEADLINE_S = 1200
+# A deadline stop is a designed bound, so it pings success -- unless it
+# keeps happening: this many consecutive deadline slots ping /fail instead.
+DEADLINE_FAIL_STREAK = 3
 
 # Only scheduled runs of these commands ping Healthchecks.
 PING_COMMANDS = {"check", "broad"}
@@ -211,6 +215,12 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             # lock is released by the finally below, and the cycle pings
             # success -- never /fail.
             finish_slot(db, slot, "deadline")
+            streak = deadline_streak(db)
+            if streak >= DEADLINE_FAIL_STREAK:
+                add_health(db, "run_deadline", False,
+                           f"{streak} consecutive deadline stops: {e}")
+                _ping_fail(args, cmd_name, db)
+                return 1
             add_health(db, "run_deadline", True,
                        f"controlled stop after {RUN_DEADLINE_S}s: {e}")
             rc = _noop("deadline", slot_id=slot, detail=str(e))
@@ -317,18 +327,61 @@ def cmd_canary(args, db, watches, guard):
     return 0 if ok else 2
 
 
+def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals):
+    """Score observations written since *since_iso*, verify each under-cap
+    candidate (verify budget), and enqueue confirmed deals.
+
+    Appends relayable alert IDs to *new_ids* and confirmed deals to
+    *verified_deals*; returns {watch_id: [relayable alert IDs]}.
+    """
+    per_watch: dict[str, list[str]] = {}
+    for w in targets:
+        candidates = score_new_observations(
+            db, w, since_iso, cooldown_hours=w.get("cooldown_hours", 24))
+        watch_new: list[str] = []
+        for c in candidates:
+            ok, conf = verify(db, w, c, guard)
+            if not ok:
+                continue  # unknown: never alert on an unverified fare
+            # The alerts table stays the scoring-history record (the scorer's
+            # cooldown reads it); delivery state lives in the outbox.
+            add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
+                      verified_at=utcnow_iso())
+            aid, action = enqueue_from_confirmation(db, w, c, conf)
+            # v3: dedup is per (watch, departure week). A deduped candidate
+            # was already outboxed without a meaningful drop and must NOT
+            # be emitted to relay again -- only inserted and rearmed
+            # alerts join the relay batch.
+            if action in RELAYABLE_ACTIONS:
+                watch_new.append(aid)
+            duration = (date.fromisoformat(conf["return_date"])
+                        - date.fromisoformat(conf["depart_date"])).days
+            verified_deals.append({
+                "watch_id": w["id"], "fingerprint": c["fingerprint"],
+                "price_usd": conf["price_usd"],
+                "depart_date": conf["depart_date"], "duration": duration,
+                "cap": w["absolute_cap_usd"]})
+        new_ids.extend(watch_new)
+        per_watch[w["id"]] = watch_new
+    return per_watch
+
+
 def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
     """One scheduled collection cycle (v3 group 4 ordering):
 
     1. Mint sentinel anchors + background grid (idempotent).
     2. Drain durable pending handoffs -- before any collection.
     3. Recheck prepared-but-unconfirmed handoffs (verify budget).
-    4. Verify new candidates FIRST (verify budget): score the previous
-       slot's collection output -- this run has not collected yet -- so
-       verification spend is prioritized ahead of fresh collection.
+    4. Leftover verify (verify budget): candidates from the previous slot
+       that were not verified there (e.g. that run hit its deadline or
+       budget before its own verify pass).
     5. Collect: sentinels > bursts > background, paced across the 48 slots.
-    6. Queue burst triggers (new under-cap deals).
-    7. Prepare the new handoffs for the agent to relay.
+    6. Same-slot verify: candidates from THIS run's collection are verified
+       immediately, so a deal found now is alerted now, not ~30 min later
+       (spec: never delay a verified alert). The 24-attempt verify reserve
+       guarantees collection cannot starve this pass.
+    7. Queue burst triggers (new under-cap deals).
+    8. Prepare the new handoffs for the agent to relay.
     """
     run_start = utcnow_iso()
     slot = slot_id()
@@ -354,46 +407,15 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
     if retry_ids:
         reprepare_retries(db, slot, retry_ids)
 
-    # 4. Verify new candidates FIRST (v3 group 4). This run has not
-    # collected yet, so "new candidates" are the previous slot's collection
-    # output: score observations written since the previous slot's start.
-    # The alerts-table cooldown dedups candidates already verified by an
-    # earlier slot; each slot's collection is verified by the next slot
-    # (a one-slot pipeline lag), and a skipped slot's deals are re-observed
-    # by the next collection pass. The verify budget is spent BEFORE
-    # collection can burn it.
+    # 4. Leftover verify: the previous slot's candidates that it did not
+    # verify itself. Candidates it did verify are skipped by the
+    # alerts-table cooldown.
     prev_start_iso = datetime.fromtimestamp(
         slot_start_ts(slot - 1), tz=timezone.utc).isoformat()
     new_ids: list[str] = []
     verified_deals: list[dict] = []
-    for w in targets:
-        candidates = score_new_observations(
-            db, w, prev_start_iso, cooldown_hours=w.get("cooldown_hours", 24))
-        watch_new: list[str] = []
-        for c in candidates:
-            ok, conf = verify(db, w, c, guard)
-            if not ok:
-                continue  # unknown: never alert on an unverified fare
-            # The alerts table stays the scoring-history record (the scorer's
-            # cooldown reads it); delivery state lives in the outbox.
-            add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
-                      verified_at=utcnow_iso())
-            aid, action = enqueue_from_confirmation(db, w, c, conf)
-            # v3: dedup is per (watch, departure week). A deduped candidate
-            # was already outboxed without a meaningful drop and must NOT
-            # be emitted to relay again -- only inserted and rearmed
-            # alerts join the relay batch.
-            if action in RELAYABLE_ACTIONS:
-                watch_new.append(aid)
-            duration = (date.fromisoformat(conf["return_date"])
-                        - date.fromisoformat(conf["depart_date"])).days
-            verified_deals.append({
-                "watch_id": w["id"], "fingerprint": c["fingerprint"],
-                "price_usd": conf["price_usd"],
-                "depart_date": conf["depart_date"], "duration": duration,
-                "cap": w["absolute_cap_usd"]})
-        new_ids.extend(watch_new)
-        summary["watches"][w["id"]] = {"new_alerts": watch_new}
+    per_watch = _verify_candidates(db, targets, guard, prev_start_iso,
+                                   new_ids, verified_deals)
 
     # 5. Collect, paced: sentinels > bursts > background.
     collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
@@ -408,12 +430,20 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
         "new_background_cells": n_bg,
     }
 
-    # 6. Burst triggers for newly under-cap deals.
+    # 6. Same-slot verify: this run's own collection output.
+    same_slot = _verify_candidates(db, targets, guard, run_start,
+                                   new_ids, verified_deals)
+    for wid, ids in same_slot.items():
+        per_watch.setdefault(wid, []).extend(ids)
+    for wid, ids in per_watch.items():
+        summary["watches"][wid] = {"new_alerts": ids}
+
+    # 7. Burst triggers for newly under-cap deals.
     n_triggers = sentinel.detect_under_cap_triggers(
         db, verified_deals, run_start, slot)
     summary["triggers_queued"] = n_triggers
 
-    # 7. Prepare the new handoffs (eligibility enforced inside the UPDATE).
+    # 8. Prepare the new handoffs (eligibility enforced inside the UPDATE).
     if new_ids:
         prepare_handoff(db, slot, new_ids)
 

@@ -801,6 +801,18 @@ def finish_slot(db: sqlite3.Connection, slot: int, status: str) -> None:
     db.commit()
 
 
+def deadline_streak(db: sqlite3.Connection) -> int:
+    """Consecutive most-recent finished slots whose status is "deadline"."""
+    streak = 0
+    for r in db.execute(
+            "SELECT status FROM run_slots WHERE status != 'in_progress' "
+            "ORDER BY slot_id DESC"):
+        if r["status"] != "deadline":
+            break
+        streak += 1
+    return streak
+
+
 def slot_done(db: sqlite3.Connection, slot: int) -> bool:
     row = db.execute("SELECT 1 FROM run_slots WHERE slot_id=?",
                      (slot,)).fetchone()

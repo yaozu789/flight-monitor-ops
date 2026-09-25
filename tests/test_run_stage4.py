@@ -93,6 +93,48 @@ class Stage4OrchestrationTests(unittest.TestCase):
         self.assertEqual(order[0], "collect")
         self.assertEqual(order[1], "drain_state=handoff_prepared")
 
+    def test_same_slot_verify(self):
+        """A deal collected in this run is verified and handed off in the
+        SAME run, after collection -- not deferred to the next slot."""
+        db, guard = _ctx(self)
+        slot = store.slot_id()
+        order = []
+
+        def collect_writes_deal(db_, guard_, groups, slot_, run_start, **kw):
+            order.append("collect")
+            store.add_observation(
+                db_, watch_id="w1", origin="SFO", destination="JFK",
+                depart_date="2026-11-01", return_date="2026-11-08",
+                airline="UA", stops=0, cabin="economy", price_usd=420.0,
+                booking_url="https://example.invalid/b")
+            return {"attempts": 1, "bursts": 0, "sentinels": 1,
+                    "background": 0, "drop_triggers": 0}
+
+        def fake_verify(db_, watch, cand, guard_, **kw):
+            order.append("verify")
+            return True, {"price_usd": cand["price_usd"],
+                          "depart_date": cand["depart_date"],
+                          "return_date": cand["return_date"],
+                          "airline": cand["airline"], "stops": cand["stops"],
+                          "booking_url": cand["booking_url"],
+                          "observed_at": store.utcnow_iso()}
+
+        with mock.patch.object(fm_sentinel, "mint_sentinels", return_value=0), \
+                mock.patch.object(fm_sentinel, "ensure_background_grid",
+                                  return_value=0), \
+                mock.patch.object(fm_sentinel, "collect", collect_writes_deal), \
+                mock.patch.object(fm_sentinel, "detect_under_cap_triggers",
+                                  return_value=0), \
+                mock.patch.object(fm_run, "verify", fake_verify):
+            args = SimpleNamespace(cmd="check", scheduled=False, watch="w1")
+            rc = fm_run.cmd_check(args, db, [WATCH], guard)
+        self.assertEqual(rc, 0)
+        self.assertEqual(order, ["collect", "verify"])
+        rows = db.execute("SELECT state, prepared_slot FROM outbox").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "handoff_prepared")
+        self.assertEqual(rows[0]["prepared_slot"], slot)
+
     def test_three_handoffs_one_slot(self):
         """Drained + retried + new handoffs can all prepare in one slot."""
         db, guard = _ctx(self)
