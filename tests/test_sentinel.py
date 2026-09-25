@@ -205,13 +205,54 @@ class TestMint(SentinelTestBase):
 
     def test_background_grid_counts(self):
         n = sentinel.ensure_background_grid(self.db, GROUPS, today=TODAY)
-        # 24 weekly departures (14..180d) x 10 durations (5..14) x 2 groups
-        self.assertEqual(n, 480)
+        # 26 weekly departures (90..270d, the default 3-9 month window)
+        # x 10 durations (5..14) x 2 groups
+        self.assertEqual(n, 520)
         self.assertEqual(
             sentinel.ensure_background_grid(self.db, GROUPS, today=TODAY), 0)
         durs = {r["duration"] for r in self.db.execute(
             "SELECT DISTINCT duration FROM cells WHERE role='background'")}
         self.assertEqual(durs, set(range(5, 15)))
+
+
+class TestConfiguredWindow(SentinelTestBase):
+    def test_window_and_durations_from_config(self):
+        """window_days / durations from watches.yaml drive both sentinels
+        and the background grid."""
+        cfg = {"g1": {"origins": ["SFO"], "destinations": ["NRT"],
+                      "window_days": (30, 60), "durations": (4, 6)}}
+        sentinel.mint_sentinels(self.db, cfg, today=TODAY)
+        sentinel.ensure_background_grid(self.db, cfg, today=TODAY)
+        today_d = date.fromisoformat(TODAY)
+        lo = (today_d + timedelta(days=30)).isoformat()
+        hi = (today_d + timedelta(days=60)).isoformat()
+        rows = self.db.execute(
+            "SELECT role, depart_date, duration FROM cells").fetchall()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertTrue(lo <= r["depart_date"] <= hi, dict(r))
+            self.assertIn(r["duration"], (4, 5, 6))
+        sent = {r["duration"] for r in rows if r["role"] == "sentinel"}
+        self.assertEqual(sent, {6})  # 7 clamped into 4..6
+
+    def test_background_cells_retire_as_window_moves(self):
+        """Background departures that fall out of the window (e.g. into
+        the past) are retired so rotation stops spending on them."""
+        cfg = {"g1": {"origins": ["SFO"], "destinations": ["NRT"]}}
+        sentinel.ensure_background_grid(self.db, cfg, today=TODAY)
+        later = (date.fromisoformat(TODAY) + timedelta(days=60)).isoformat()
+        sentinel.ensure_background_grid(self.db, cfg, today=later)
+        lo = (date.fromisoformat(later) + timedelta(days=90)).isoformat()
+        stale = self.db.execute(
+            "SELECT COUNT(*) AS c FROM cells WHERE role='background' "
+            "AND active=1 AND depart_date < ?", (lo,)).fetchone()["c"]
+        self.assertEqual(stale, 0)
+
+    def test_burst_steps_use_configured_durations(self):
+        trig = {"depart_date": "2027-01-10", "duration": 5}
+        durs = [d for _, kind, _, d in sentinel._burst_steps(trig, [4, 5, 6])
+                if kind == "duration"]
+        self.assertEqual(durs, [4, 6])
 
 
 # ---------------------------------------------------------------- rotation

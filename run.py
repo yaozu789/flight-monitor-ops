@@ -362,6 +362,17 @@ def cadence_slots(watches: list[dict]) -> int:
     return minutes // 30
 
 
+def group_cfg_for(w: dict) -> dict:
+    """Collection config for one watch: airports plus the departure window
+    (``window_months``, 30-day months) and trip lengths
+    (``trip_length_days``) from watches.yaml."""
+    lo_mo, hi_mo = w.get("window_months", [3, 9])
+    lo_len, hi_len = w.get("trip_length_days", [5, 14])
+    return {"origins": w["origins"], "destinations": w["destinations"],
+            "window_days": (int(lo_mo) * 30, int(hi_mo) * 30),
+            "durations": (int(lo_len), int(hi_len))}
+
+
 def get_watch(watches: list[dict], watch_id: str) -> dict:
     for w in watches:
         if w["id"] == watch_id:
@@ -517,8 +528,7 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
     slot = slot if slot is not None else slot_id()
     summary: dict = {"slot_id": slot, "watches": {}}
     targets = [get_watch(watches, args.watch)] if args.watch else watches
-    groups_cfg = {w["id"]: {"origins": w["origins"],
-                            "destinations": w["destinations"]} for w in targets}
+    groups_cfg = {w["id"]: group_cfg_for(w) for w in targets}
 
     # 1. Rolling sentinel anchors + background grid (idempotent).
     n_sentinels = sentinel.mint_sentinels(db, groups_cfg)
