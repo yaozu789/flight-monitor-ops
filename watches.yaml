@@ -1,0 +1,20 @@
+# Cheap Flight Monitor — watch configuration (Phase 1: japan + nyc)
+# Phase 2 adds: hkg, shanghai, beijing, la, san-diego
+
+defaults:
+  origins: [SFO, OAK, SJC]
+  cabin: economy
+  max_stops: 1
+  trip_length_days: [5, 14]
+  window_months: [3, 9]        # departure window, months from today
+  relative_threshold: 0.35      # Phase 2: alert at >=35% below rolling median
+  cooldown_hours: 24            # don't re-alert same itinerary within 24h
+  currency: USD
+
+watches:
+  - id: japan
+    destinations: [NRT, HND, KIX]
+    absolute_cap_usd: 500
+  - id: nyc
+    destinations: [EWR, JFK, LGA]
+    absolute_cap_usd: 250
