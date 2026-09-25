@@ -76,7 +76,7 @@ class PriceHistoryTests(unittest.TestCase):
 
     def test_sparse_history_makes_no_claim(self):
         self.obs(1, 500.0)
-        self.obs(1, 480.0, hours=1)
+        self.obs(1, 480.0)  # same timestamp: always the same UTC day
         t = self.text(450.0, self.hist())
         self.assertIn("SFO -> NRT", t)
         self.assertIn("2 fares seen on 1 day(s)", t)
