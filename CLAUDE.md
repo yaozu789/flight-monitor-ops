@@ -5,7 +5,7 @@ Personal cheap-flight radar for Yaozu. It watches SFO/OAK/SJC round trips to des
 ## Roles (see `WORKFLOW.md`)
 - **Claude Code:** writes code and tests, opens PRs from `claude/<topic>` branches, and merges after CI is green and review has no blocking objections.
 - **Codex** (`codex exec`, model `gpt-6-astra`): main reviewer. **Cursor** (`cursor-agent -p --mode ask --model gpt-5.6-sol-xhigh`) is the backup when Codex is out of quota. The author is never the main reviewer, and reviewers stay non-Claude.
-- **Muse:** hosts and runs the monitor on its cloud VM, as an agent turn per scheduled run. It has a **read-only** deploy key (SSH through a proxy CONNECT tunnel). It reads requests from `ops/muse-inbox/` (newest file) and replies in chat. Yaozu pastes the replies here, and Claude files them as issues.
+- **Muse:** hosts and runs the monitor on its cloud VM, as an agent turn per scheduled run. It pulls over **HTTPS** with a read-only fine-grained token, stored in `/home/hatch/.git-credentials` (mode 600) on its VM. Its SSH deploy key is a backup, because the proxy often kills SSH. It reads requests from `ops/muse-inbox/` (newest file) and replies in chat. If it can't pull, paste the inbox file, including code patches with sha256 hashes. Muse's real home is `/home/hatch`, not `/root`. Yaozu pastes the replies here, and Claude files them as issues.
 - **Yaozu:** decides and **approves every deploy**, schedule, limit, destination or credential change.
 
 ## Commands
