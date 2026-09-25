@@ -91,7 +91,10 @@ class BudgetGuard:
         self._daily_ceiling = daily_ceiling
         self._category_caps = (dict(CATEGORY_CAPS) if category_caps is None
                                else dict(category_caps))
-        self._day = day or store.today_str()
+        # A fixed day only when given (tests); otherwise the UTC day is
+        # resolved at each reserve/read, so a run crossing midnight charges
+        # the new day, not yesterday's balance.
+        self._fixed_day = day
         self._run_lock = threading.Lock()
         self._reserve_lock = threading.Lock()
         self._run_total = 0
@@ -99,6 +102,10 @@ class BudgetGuard:
         self._run_allowance = per_run_max
         self._reserve_db = None  # lazy private connection for reserve()
         self._reserve_owns_conn = False
+
+    @property
+    def _day(self) -> str:
+        return self._fixed_day or store.today_str()
 
     # -- connection handling ------------------------------------------
 
@@ -183,9 +190,19 @@ class BudgetGuard:
                               retry_after_s, detail)
 
     def read_backoff(self) -> dict | None:
-        """Read the persisted backoff (for consecutive-count computation)."""
+        """The persisted backoff while it is active, else None."""
         with self._reserve_lock:
             return store.get_backoff(self._reserve_conn())
+
+    def read_throttle_state(self) -> dict | None:
+        """The persisted throttle row, active or expired (backoff history)."""
+        with self._reserve_lock:
+            return store.get_throttle_state(self._reserve_conn())
+
+    def clear_throttle_state(self) -> None:
+        """A successful response ends a run of consecutive throttles."""
+        with self._reserve_lock:
+            store.clear_backoff(self._reserve_conn())
 
     # -- the atomic reserve ---------------------------------------------
 

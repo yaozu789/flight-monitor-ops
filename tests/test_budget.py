@@ -455,11 +455,97 @@ class BudgetV3Test(BudgetTransportTest):
         backoff = store.get_backoff(self.db)
         self.assertIsNone(backoff["retry_after_s"])
         self.assertAlmostEqual(backoff["until_ts"], t0 + 900, delta=60)
-        # Consecutive: a second 429 without a header doubles the backoff.
+        # While the backoff is active, the send gate blocks without sending.
+        fake = transport._send_handler
+        sends_before = fake.sends
+        with self.assertRaises(transport.ThrottleDetected):
+            Session().get("http://example.invalid")
+        self.assertEqual(fake.sends, sends_before)
+        # After it expires (no clean response in between), history is kept:
+        # the next 429 without a header doubles the backoff.
+        self.db.execute("UPDATE throttle_state SET until_ts = ?",
+                        (time.time() - 1,))
+        self.db.commit()
+        t1 = time.time()
         with self.assertRaises(transport.ThrottleDetected):
             Session().get("http://example.invalid")
         backoff2 = store.get_backoff(self.db)
-        self.assertAlmostEqual(backoff2["until_ts"], t0 + 1800, delta=120)
+        self.assertAlmostEqual(backoff2["until_ts"], t1 + 1800, delta=120)
+        self.assertEqual(fake.sends, sends_before + 1)
+
+    def test_clean_response_resets_throttle_history(self):
+        g = self.make_guard()
+        install_fake_transport(g, mode="ok")
+        store.set_backoff(self.db, "http_429", time.time() - 1, None, "old")
+        Session().get("http://example.invalid")
+        self.assertIsNone(store.get_throttle_state(self.db))
+
+    def test_redirect_hops_are_each_budgeted(self):
+        """Redirects are followed by the wrapper, one reserved send per hop
+        (libcurl auto-follow would hide hops from the ledger)."""
+        g = self.make_guard()
+        fake = install_fake_transport(g, mode="ok")
+        seen = []
+
+        def handler(method, url, kwargs, proceed):
+            seen.append((url, kwargs.get("allow_redirects")))
+            if len(seen) < 3:
+                return FakeResponse(text="", status_code=302,
+                                    headers={"Location": f"/hop{len(seen)}"})
+            return FakeResponse()
+
+        transport.set_send_handler(handler)
+        resp = Session().get("https://www.google.com/travel/flights")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([u for u, _ in seen], [
+            "https://www.google.com/travel/flights",
+            "https://www.google.com/hop1", "https://www.google.com/hop2"])
+        self.assertTrue(all(a is False for _, a in seen))
+        self.assertEqual(g.spent_today(), 3)
+
+    def test_redirect_loop_is_bounded(self):
+        g = self.make_guard()
+        install_fake_transport(g, mode="ok")
+        transport.set_send_handler(lambda m, u, k, p: FakeResponse(
+            text="", status_code=302, headers={"location": "/again"}))
+        resp = Session().get("https://www.google.com/x")
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(g.spent_today(), transport.MAX_REDIRECTS + 1)
+
+    def test_deadline_blocks_sends(self):
+        g = self.make_guard()
+        fake = install_fake_transport(g, mode="ok")
+        transport.set_deadline_fn(lambda: True)
+        self.addCleanup(transport.set_deadline_fn, None)
+        with self.assertRaises(store.DeadlineExceeded):
+            Session().get("http://example.invalid")
+        self.assertEqual(fake.sends, 0)
+        self.assertFalse(isinstance(store.DeadlineExceeded("x"), Exception))
+
+    def test_day_resolved_per_reserve(self):
+        """A guard created before UTC midnight charges the new day after it."""
+        from unittest import mock
+        g = budget.BudgetGuard(self.db)  # no fixed day
+        with mock.patch.object(store, "today_str", return_value="2030-01-01"):
+            g.reserve("sentinel")
+        with mock.patch.object(store, "today_str", return_value="2030-01-02"):
+            g.reserve("sentinel")
+            self.assertEqual(g.spent_today(), 1)
+        self.assertEqual(store.count_today(self.db, "2030-01-01"), 1)
+
+    def test_migration_backfills_counters_from_ledger(self):
+        for _ in range(150):
+            self.db.execute(
+                "INSERT INTO budget_ledger (day, category, attempts, created_at)"
+                " VALUES ('2030-01-01', 'sentinel', 1, 'x')")
+        self.db.execute("DELETE FROM daily_counters")
+        self.db.commit()
+        store.init_db(self.db)
+        store.init_db(self.db)  # idempotent
+        self.assertEqual(store.count_today(self.db, "2030-01-01"), 150)
+        g = budget.BudgetGuard(self.db, day="2030-01-01")
+        with self.assertRaises(budget.BudgetExhausted):
+            g.reserve("verify")
 
     # -- BudgetExhausted through real fli Client.get (item 2) -----------
 
