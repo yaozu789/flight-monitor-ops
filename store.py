@@ -456,8 +456,9 @@ def latest_observations_since(db: sqlite3.Connection, watch_id: str, since_iso: 
     return [dict(r) for r in db.execute(
         """SELECT * FROM observations o
            WHERE watch_id = ? AND observed_at >= ?
-             AND observed_at = (SELECT MAX(observed_at) FROM observations
-                                WHERE watch_id = o.watch_id AND fingerprint = o.fingerprint)""",
+             AND id = (SELECT id FROM observations
+                       WHERE watch_id = o.watch_id AND fingerprint = o.fingerprint
+                       ORDER BY observed_at DESC, id DESC LIMIT 1)""",
         (watch_id, since_iso),
     ).fetchall()]
 
@@ -799,6 +800,23 @@ def finish_slot(db: sqlite3.Connection, slot: int, status: str) -> None:
         "UPDATE run_slots SET status=?, finished_at=? WHERE slot_id=?",
         (status, utcnow_iso(), slot))
     db.commit()
+
+
+def deadline_streak(db: sqlite3.Connection) -> int:
+    """Number of back-to-back slots, ending at the most recent one, whose
+    status is "deadline". Any other status (including an abandoned
+    in_progress row) or a gap in slot IDs ends the streak."""
+    streak = 0
+    expected = None
+    for r in db.execute("SELECT slot_id, status FROM run_slots "
+                        "ORDER BY slot_id DESC"):
+        if r["status"] != "deadline":
+            break
+        if expected is not None and r["slot_id"] != expected:
+            break
+        streak += 1
+        expected = r["slot_id"] - 1
+    return streak
 
 
 def slot_done(db: sqlite3.Connection, slot: int) -> bool:

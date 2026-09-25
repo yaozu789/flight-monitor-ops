@@ -110,6 +110,25 @@ class RunLifecycleTests(unittest.TestCase):
         row = store.outbox_get(db, "w1:drain1")
         self.assertEqual(row["state"], "handoff_prepared")
 
+    def test_backoff_noop_emits_drained_handoff(self):
+        """The drained alert is PRINTED in the no-op output, so the agent
+        relays it even though collection was skipped."""
+        import contextlib
+        import io
+        import json as _json
+        db, guard = self._ctx()
+        seed_pending(db)
+        store.set_backoff(db, "http429", time.time() + 3600, 60,
+                          "test backoff")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fm_run.run_guarded("check", args_for("check", False), db,
+                               [WATCH], guard, lambda *a, **k: 0)
+        doc = _json.loads(out.getvalue())
+        self.assertEqual(doc["reason"], "throttle_backoff")
+        self.assertEqual([a["alert_id"] for a in doc["handoff"]["alerts"]],
+                         ["w1:drain1"])
+
     def test_drain_runs_before_slot_noop(self):
         """An already-claimed slot short-circuits collection, but the
         drain already ran."""
@@ -153,6 +172,61 @@ class RunLifecycleTests(unittest.TestCase):
         # Success ping, never /fail.
         kinds = [k for k, _ in self.captured]
         self.assertEqual(kinds, ["success"])
+
+    def test_deadline_streak_pings_fail(self):
+        """Deadline stops are a designed bound, but three in a row mean the
+        run can never finish: the third pings /fail instead of success."""
+        db, guard = self._ctx()
+        slot = store.slot_id()
+        for prev in (slot - 2, slot - 1):
+            store.claim_slot(db, prev, "check")
+            store.finish_slot(db, prev, "deadline")
+
+        def slow_fn(args, db_, watches, guard_, drained=None,
+                    deadline_fn=None):
+            fm_run._check_deadline(deadline_fn)  # raises immediately
+            return 0  # pragma: no cover
+
+        with mock.patch.object(fm_run, "RUN_DEADLINE_S", 0):
+            rc = fm_run.run_guarded("check", args_for("check", True), db,
+                                    [WATCH], guard, slow_fn)
+        self.assertEqual(rc, 1)
+        self.assertEqual([k for k, _ in self.captured], ["fail"])
+        h = store.latest_health(db, "run_deadline")
+        self.assertFalse(h["ok"])
+        self.assertIsNone(store.lock_holder(db))
+
+    def test_deadline_streak_broken_by_completed_slot(self):
+        """A completed slot between deadline stops resets the streak."""
+        db, guard = self._ctx()
+        slot = store.slot_id()
+        for prev, status in ((slot - 3, "deadline"), (slot - 2, "completed"),
+                             (slot - 1, "deadline")):
+            store.claim_slot(db, prev, "check")
+            store.finish_slot(db, prev, status)
+
+        def slow_fn(args, db_, watches, guard_, drained=None,
+                    deadline_fn=None):
+            fm_run._check_deadline(deadline_fn)
+            return 0  # pragma: no cover
+
+        with mock.patch.object(fm_run, "RUN_DEADLINE_S", 0):
+            rc = fm_run.run_guarded("check", args_for("check", True), db,
+                                    [WATCH], guard, slow_fn)
+        self.assertEqual(rc, 0)
+        self.assertEqual([k for k, _ in self.captured], ["success"])
+
+    def test_deadline_streak_needs_back_to_back_slots(self):
+        """Deadline stops separated by a gap (a slot with no run) are not a
+        streak."""
+        db, guard = self._ctx()
+        slot = store.slot_id()
+        for prev in (slot - 3, slot - 1):  # slot - 2 never ran
+            store.claim_slot(db, prev, "check")
+            store.finish_slot(db, prev, "deadline")
+        store.claim_slot(db, slot, "check")
+        store.finish_slot(db, slot, "deadline")
+        self.assertEqual(store.deadline_streak(db), 2)
 
     def test_deadline_shorter_than_lock_ttl(self):
         """The deadline must stay below the lock TTL so a stopped run

@@ -39,7 +39,7 @@ import yaml  # noqa: E402
 import heartbeat  # noqa: E402
 import sentinel  # noqa: E402
 import transport  # noqa: E402
-from budget import BudgetExhausted, BudgetGuard  # noqa: E402
+from budget import PER_RUN_MAX, BudgetExhausted, BudgetGuard  # noqa: E402
 from canary import run_canary  # noqa: E402
 from outbox import (  # noqa: E402
     RELAYABLE_ACTIONS,
@@ -56,6 +56,7 @@ from store import (  # noqa: E402
     add_broad_scan,
     add_health,
     claim_slot,
+    deadline_streak,
     finish_slot,
     get_backoff,
     init_db,
@@ -85,9 +86,47 @@ LOCK_TTL_S = 1500
 # instead of wedging the lock until TTL expiry. Checked at loop tops in
 # collection code via the deadline_fn passed to fn.
 RUN_DEADLINE_S = 1200
+# A deadline stop is a designed bound, so it pings success -- unless it
+# keeps happening: this many consecutive deadline slots ping /fail instead.
+DEADLINE_FAIL_STREAK = 3
 
 # Only scheduled runs of these commands ping Healthchecks.
 PING_COMMANDS = {"check", "broad"}
+
+
+RELAY_INSTRUCTION = (
+    "Relay each message below VERBATIM to the user via the normal push. "
+    "Do not paraphrase, do not add claims, never use the word 'bookable'. "
+    "After relaying each, record it with: "
+    "python run.py outbox-mark --alert-id <id> "
+    "--state relay_attempted_unconfirmed. "
+    "After the USER confirms a deal, finalize it (human-driven only) with: "
+    "python run.py outbox-confirm --alert-id <id> --by <your name>."
+)
+
+
+RELAYABLE_STATES = ("handoff_prepared", "relay_attempted_unconfirmed")
+
+
+def _handoff_payload(db, slot, alert_ids, **extra) -> dict:
+    """The agent-facing relay batch for *alert_ids* (duplicates dropped)."""
+    seen: list[str] = []
+    for aid in alert_ids:
+        if aid not in seen:
+            seen.append(aid)
+    # Only rows actually handed off: a row whose preparation failed is still
+    # pending and must not be relayed (outbox-mark would reject it and the
+    # next drain would relay it again, untracked).
+    batch = [r for r in (outbox_get(db, aid) for aid in seen)
+             if r is not None and r["state"] in RELAYABLE_STATES]
+    return {
+        "slot_id": slot,
+        "alerts": [{"alert_id": r["alert_id"], "state": r["state"],
+                    "price_usd": r["price_usd"], "message": r["message_text"]}
+                   for r in batch],
+        **extra,
+        "agent_instruction": RELAY_INSTRUCTION,
+    }
 
 
 def _noop(reason: str, **extra) -> int:
@@ -118,6 +157,31 @@ def _check_deadline(deadline_fn) -> None:
     if deadline_fn is not None and deadline_fn():
         raise DeadlineExceeded(
             f"run deadline ({RUN_DEADLINE_S}s) exceeded")
+
+
+def _ids(rows) -> list[str]:
+    return [r["alert_id"] for r in rows or []]
+
+
+def _stop_handoff(exc, db=None, slot=None, drained=None) -> dict:
+    """Extra no-op fields carrying the relay batch of a stopped run: the
+    batch cmd_check attached to the exception, or -- when there is none
+    (the stop came before cmd_check could attach it, or the exception
+    rejected the attribute) -- the alerts run_guarded drained."""
+    payload = getattr(exc, "handoff", None)
+    if payload is None and db is not None and drained:
+        try:
+            payload = _handoff_payload(db, slot, _ids(drained))
+        except Exception:  # noqa: BLE001 - never mask the stop
+            payload = None
+    return {"handoff": payload} if payload and payload["alerts"] else {}
+
+
+def _emit_stop_handoff(exc, db=None, slot=None, drained=None) -> None:
+    """Print the relay batch of a stop that does not go through _noop."""
+    extra = _stop_handoff(exc, db, slot, drained)
+    if extra:
+        print(json.dumps({"status": "stopped", **extra}, indent=2))
 
 
 def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int:
@@ -166,12 +230,14 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
                        f"not collecting: {bo['kind']} backoff until "
                        f"{bo['until_ts']:.0f}")
             rc = _noop("throttle_backoff", kind=bo["kind"],
-                       retry_at=bo["until_ts"])
+                       retry_at=bo["until_ts"],
+                       handoff=_handoff_payload(db, slot, _ids(drained)))
             _ping_ok(args, cmd_name, db)
             return rc
         if not claim_slot(db, slot, "collect"):
             rc = _noop("slot_already_completed", slot_id=slot,
-                       detail="check and broad share one collection per slot")
+                       detail="check and broad share one collection per slot",
+                       handoff=_handoff_payload(db, slot, _ids(drained)))
             _ping_ok(args, cmd_name, db)
             return rc
         # Run deadline, shorter than the lock TTL: on exceed the run stops
@@ -184,9 +250,10 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         try:
             rc = fn(args, db, watches, guard,
                     drained=drained, deadline_fn=_deadline_exceeded)
-        except SystemExit:
+        except SystemExit as e:
             # An explicit exit from fn is a failure signal, not a success:
             # /fail, then let it propagate.
+            _emit_stop_handoff(e, db, slot, drained)
             _ping_fail(args, cmd_name, db)
             raise
         except ThrottleDetected as e:  # BaseException: caught explicitly
@@ -194,7 +261,8 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             add_health(db, "throttle", False,
                        f"throttle mid-run ({e.kind}); backoff persisted")
             rc = _noop("throttle_backoff", kind=e.kind,
-                       retry_after_s=e.retry_after_s, slot_id=slot)
+                       retry_after_s=e.retry_after_s, slot_id=slot,
+                       **_stop_handoff(e, db, slot, drained))
             _ping_ok(args, cmd_name, db)
             return rc
         except BudgetExhausted as e:  # BaseException: caught explicitly
@@ -203,7 +271,8 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
                        f"budget exhausted, collection stopped: {e}")
             rc = _noop("budget_exhausted", slot_id=slot,
                        spent_today=guard.spent_today(),
-                       spent_run=guard.spent_run(), detail=str(e))
+                       spent_run=guard.spent_run(), detail=str(e),
+                       **_stop_handoff(e, db, slot, drained))
             _ping_ok(args, cmd_name, db)
             return rc
         except DeadlineExceeded as e:
@@ -211,15 +280,24 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             # lock is released by the finally below, and the cycle pings
             # success -- never /fail.
             finish_slot(db, slot, "deadline")
+            streak = deadline_streak(db)
+            if streak >= DEADLINE_FAIL_STREAK:
+                add_health(db, "run_deadline", False,
+                           f"{streak} consecutive deadline stops: {e}")
+                _emit_stop_handoff(e, db, slot, drained)
+                _ping_fail(args, cmd_name, db)
+                return 1
             add_health(db, "run_deadline", True,
                        f"controlled stop after {RUN_DEADLINE_S}s: {e}")
-            rc = _noop("deadline", slot_id=slot, detail=str(e))
+            rc = _noop("deadline", slot_id=slot, detail=str(e),
+                       **_stop_handoff(e, db, slot, drained))
             _ping_ok(args, cmd_name, db)
             return rc
         except BaseException as e:  # noqa: BLE001 - crash: /fail, never green
             finish_slot(db, slot, "crashed")
             add_health(db, "crash", False, f"{type(e).__name__}: {e}")
             traceback.print_exc()
+            _emit_stop_handoff(e, db, slot, drained)
             _ping_fail(args, cmd_name, db)
             return 1
         if rc != 0:
@@ -317,18 +395,98 @@ def cmd_canary(args, db, watches, guard):
     return 0 if ok else 2
 
 
+def _note(db, kind: str, detail: str) -> None:
+    """Best-effort health note during stop cleanup: never raises."""
+    try:
+        add_health(db, kind, False, detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _finish_verified(db, slot, run_start, verified_deals, new_ids,
+                     strict=False) -> int:
+    """Steps 7-8: queue burst triggers for verified deals, then prepare
+    their handoffs. Each step is attempted independently; with
+    strict=False (a stop is already propagating) failures are recorded in
+    health instead of raised, so they cannot mask the original stop.
+    Returns the number of triggers queued."""
+    n_triggers = 0
+    try:
+        n_triggers = sentinel.detect_under_cap_triggers(
+            db, verified_deals, run_start, slot)
+    except Exception as e:  # noqa: BLE001
+        if strict:
+            raise
+        _note(db, "burst_triggers", f"{type(e).__name__}: {e}")
+    if new_ids:
+        try:
+            prepare_handoff(db, slot, new_ids)
+        except Exception as e:  # noqa: BLE001
+            if strict:
+                raise
+            _note(db, "handoff_prepare", f"{type(e).__name__}: {e}")
+    return n_triggers
+
+
+def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
+                       deadline_fn=None):
+    """Score observations written since *since_iso*, verify each under-cap
+    candidate (verify budget), and enqueue confirmed deals.
+
+    Appends relayable alert IDs to *new_ids* and confirmed deals to
+    *verified_deals*; returns {watch_id: [relayable alert IDs]}.
+    """
+    per_watch: dict[str, list[str]] = {}
+    for w in targets:
+        candidates = score_new_observations(
+            db, w, since_iso, cooldown_hours=w.get("cooldown_hours", 24))
+        watch_new: list[str] = []
+        for c in candidates:
+            _check_deadline(deadline_fn)
+            ok, conf = verify(db, w, c, guard)
+            if not ok:
+                continue  # unknown: never alert on an unverified fare
+            # The alerts table stays the scoring-history record (the scorer's
+            # cooldown reads it); delivery state lives in the outbox.
+            add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
+                      verified_at=utcnow_iso())
+            aid, action = enqueue_from_confirmation(db, w, c, conf)
+            # v3: dedup is per (watch, departure week). A deduped candidate
+            # was already outboxed without a meaningful drop and must NOT
+            # be emitted to relay again -- only inserted and rearmed
+            # alerts join the relay batch.
+            # Record immediately (not after the loop) so a budget/deadline
+            # stop later in this pass still hands this deal off.
+            if action in RELAYABLE_ACTIONS and aid not in new_ids:
+                watch_new.append(aid)
+                new_ids.append(aid)
+            duration = (date.fromisoformat(conf["return_date"])
+                        - date.fromisoformat(conf["depart_date"])).days
+            verified_deals.append({
+                "watch_id": w["id"], "fingerprint": c["fingerprint"],
+                "price_usd": conf["price_usd"],
+                "depart_date": conf["depart_date"], "duration": duration,
+                "cap": w["absolute_cap_usd"]})
+        per_watch[w["id"]] = watch_new
+    return per_watch
+
+
 def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
     """One scheduled collection cycle (v3 group 4 ordering):
 
     1. Mint sentinel anchors + background grid (idempotent).
     2. Drain durable pending handoffs -- before any collection.
     3. Recheck prepared-but-unconfirmed handoffs (verify budget).
-    4. Verify new candidates FIRST (verify budget): score the previous
-       slot's collection output -- this run has not collected yet -- so
-       verification spend is prioritized ahead of fresh collection.
+    4. Leftover verify (verify budget): candidates from the previous slot
+       that were not verified there (e.g. that run hit its deadline or
+       budget before its own verify pass).
     5. Collect: sentinels > bursts > background, paced across the 48 slots.
-    6. Queue burst triggers (new under-cap deals).
-    7. Prepare the new handoffs for the agent to relay.
+    6. Same-slot verify: candidates from THIS run's collection are verified
+       immediately, so a deal found now is alerted now, not ~30 min later
+       (spec: never delay a verified alert). The 24-attempt verify reserve
+       guarantees collection cannot starve this pass.
+    7. Queue burst triggers (new under-cap deals).
+    8. Prepare the new handoffs for the agent to relay.
     """
     run_start = utcnow_iso()
     slot = slot_id()
@@ -347,97 +505,72 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
         drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 
-    # 3. Retry pass (verify budget): recheck, re-render, retire.
-    retries = recheck_retries(db, watches, guard, slot,
-                              deadline_fn=deadline_fn)
-    retry_ids = retries["retry_ids"]
-    if retry_ids:
-        reprepare_retries(db, slot, retry_ids)
-
-    # 4. Verify new candidates FIRST (v3 group 4). This run has not
-    # collected yet, so "new candidates" are the previous slot's collection
-    # output: score observations written since the previous slot's start.
-    # The alerts-table cooldown dedups candidates already verified by an
-    # earlier slot; each slot's collection is verified by the next slot
-    # (a one-slot pipeline lag), and a skipped slot's deals are re-observed
-    # by the next collection pass. The verify budget is spent BEFORE
-    # collection can burn it.
+    # 3-4. Retry pass, then leftover verify: the previous slot's candidates
+    # that it did not
+    # verify itself. Candidates it did verify are skipped by the
+    # alerts-table cooldown.
     prev_start_iso = datetime.fromtimestamp(
         slot_start_ts(slot - 1), tz=timezone.utc).isoformat()
     new_ids: list[str] = []
+    retry_ids: list[str] = []
     verified_deals: list[dict] = []
-    for w in targets:
-        candidates = score_new_observations(
-            db, w, prev_start_iso, cooldown_hours=w.get("cooldown_hours", 24))
-        watch_new: list[str] = []
-        for c in candidates:
-            ok, conf = verify(db, w, c, guard)
-            if not ok:
-                continue  # unknown: never alert on an unverified fare
-            # The alerts table stays the scoring-history record (the scorer's
-            # cooldown reads it); delivery state lives in the outbox.
-            add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
-                      verified_at=utcnow_iso())
-            aid, action = enqueue_from_confirmation(db, w, c, conf)
-            # v3: dedup is per (watch, departure week). A deduped candidate
-            # was already outboxed without a meaningful drop and must NOT
-            # be emitted to relay again -- only inserted and rearmed
-            # alerts join the relay batch.
-            if action in RELAYABLE_ACTIONS:
-                watch_new.append(aid)
-            duration = (date.fromisoformat(conf["return_date"])
-                        - date.fromisoformat(conf["depart_date"])).days
-            verified_deals.append({
-                "watch_id": w["id"], "fingerprint": c["fingerprint"],
-                "price_usd": conf["price_usd"],
-                "depart_date": conf["depart_date"], "duration": duration,
-                "cap": w["absolute_cap_usd"]})
-        new_ids.extend(watch_new)
-        summary["watches"][w["id"]] = {"new_alerts": watch_new}
+    per_watch: dict[str, list[str]] = {}
+    try:
+        # 3. Retry pass (verify budget): recheck, re-render, retire.
+        retries = recheck_retries(db, watches, guard, slot,
+                                  deadline_fn=deadline_fn)
+        retry_ids = retries["retry_ids"]
+        if retry_ids:
+            reprepare_retries(db, slot, retry_ids)
 
-    # 5. Collect, paced: sentinels > bursts > background.
-    collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
-                                 deadline_fn=deadline_fn)
-    summary["collect"] = {
-        "attempts": collected["attempts"],
-        "bursts": collected["bursts"],
-        "sentinels": collected["sentinels"],
-        "background": collected["background"],
-        "drop_triggers": collected["drop_triggers"],
-        "new_sentinel_cells": n_sentinels,
-        "new_background_cells": n_bg,
-    }
+        per_watch = _verify_candidates(db, targets, guard, prev_start_iso,
+                                       new_ids, verified_deals,
+                                       deadline_fn=deadline_fn)
 
-    # 6. Burst triggers for newly under-cap deals.
-    n_triggers = sentinel.detect_under_cap_triggers(
-        db, verified_deals, run_start, slot)
+        # 5. Collect, paced: sentinels > bursts > background.
+        collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
+                                     deadline_fn=deadline_fn)
+        summary["collect"] = {
+            "attempts": collected["attempts"],
+            "bursts": collected["bursts"],
+            "sentinels": collected["sentinels"],
+            "background": collected["background"],
+            "drop_triggers": collected["drop_triggers"],
+            "new_sentinel_cells": n_sentinels,
+            "new_background_cells": n_bg,
+        }
+
+        # 6. Same-slot verify: this run's own collection output. collect()
+        # narrowed the per-run allowance to its paced share; verification is
+        # not paced (the daily ceiling and verify reserve still bound it), so
+        # restore the default before verifying.
+        guard.set_run_allowance(PER_RUN_MAX)
+        same_slot = _verify_candidates(db, targets, guard, run_start,
+                                       new_ids, verified_deals,
+                                       deadline_fn=deadline_fn)
+        for wid, ids in same_slot.items():
+            per_watch.setdefault(wid, []).extend(ids)
+    except BaseException as stop:
+        # A budget/deadline/throttle stop (or crash) mid-verify: deals
+        # already verified this slot must still be handed off AND emitted,
+        # or the agent never relays them. Cleanup failures are recorded but
+        # never replace the original stop.
+        _finish_verified(db, slot, run_start, verified_deals, new_ids)
+        try:
+            stop.handoff = _handoff_payload(
+                db, slot, drained_ids + retry_ids + new_ids)
+        except Exception as e:  # noqa: BLE001 - never mask the stop
+            _note(db, "handoff_emit", f"{type(e).__name__}: {e}")
+        raise
+    n_triggers = _finish_verified(db, slot, run_start, verified_deals,
+                                  new_ids, strict=True)
+    for wid, ids in per_watch.items():
+        summary["watches"][wid] = {"new_alerts": ids}
     summary["triggers_queued"] = n_triggers
-
-    # 7. Prepare the new handoffs (eligibility enforced inside the UPDATE).
-    if new_ids:
-        prepare_handoff(db, slot, new_ids)
-
-    batch = [r for r in
-             (outbox_get(db, aid) for aid in drained_ids + retry_ids + new_ids)
-             if r is not None]
-    summary["handoff"] = {
-        "slot_id": slot,
-        "alerts": [{"alert_id": r["alert_id"], "state": r["state"],
-                    "price_usd": r["price_usd"], "message": r["message_text"]}
-                   for r in batch],
-        "retried": retry_ids,
-        "retired": retries["retired"],
-        "unknown": retries["unknown"],
-        "agent_instruction": (
-            "Relay each message below VERBATIM to the user via the normal push. "
-            "Do not paraphrase, do not add claims, never use the word 'bookable'. "
-            "After relaying each, record it with: "
-            "python run.py outbox-mark --alert-id <id> "
-            "--state relay_attempted_unconfirmed. "
-            "After the USER confirms a deal, finalize it (human-driven only) with: "
-            "python run.py outbox-confirm --alert-id <id> --by <your name>."
-        ),
-    }
+    summary["handoff"] = _handoff_payload(
+        db, slot, drained_ids + retry_ids + new_ids,
+        retried=retry_ids, retired=retries["retired"],
+        unknown=retries["unknown"])
     print(json.dumps(summary, indent=2))
     return 0
 
