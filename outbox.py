@@ -14,6 +14,7 @@ only enqueue actions in RELAYABLE_ACTIONS.
 from __future__ import annotations
 
 import json
+import math
 from urllib.parse import quote
 
 import store
@@ -101,8 +102,12 @@ def history_chart_url(history, price, cap=None) -> str | None:
     = this recheck."""
     if not history or not history.get("daily_lows"):
         return None
-    labels = [day[5:] for day, _ in history["daily_lows"]] + ["recheck"]
-    lows = [round(p) for _, p in history["daily_lows"]]
+    points = [(day, p) for day, p in history["daily_lows"]
+              if isinstance(p, (int, float)) and math.isfinite(p)]
+    if not points or not math.isfinite(price):
+        return None
+    labels = [day[5:] for day, _ in points] + ["recheck"]
+    lows = [round(p) for _, p in points]
     datasets = [
         {"label": "daily low (stored)", "data": lows + [None],
          "fill": False},
@@ -155,8 +160,11 @@ def render_alert_message(watch, confirmation, fingerprint, first_seen_at,
         f"First seen {first_seen_at}; rechecked at {confirmation['observed_at']}.",
     ]
     lines.extend(_history_lines(history, confirmation["price_usd"]))
-    chart = history_chart_url(history, confirmation["price_usd"],
-                              watch.get("absolute_cap_usd"))
+    try:
+        chart = history_chart_url(history, confirmation["price_usd"],
+                                  watch.get("absolute_cap_usd"))
+    except Exception:  # noqa: BLE001 - a chart must never block an alert
+        chart = None
     if chart:
         lines.append(f"Chart: {chart}")
     if confirmation.get("booking_url"):

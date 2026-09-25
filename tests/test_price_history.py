@@ -120,6 +120,38 @@ class PriceHistoryTests(unittest.TestCase):
         self.assertIsNone(outbox.history_chart_url(self.hist(), 431.0, 500))
         self.assertNotIn("Chart:", self.text(431.0, self.hist()))
 
+    def test_bad_stored_price_never_blocks_alert(self):
+        """Non-finite prices are left out of the chart, and if the chart
+        builder fails for any reason the alert still renders, without it."""
+        from unittest import mock
+        h = {"daily_lows": [("2026-09-24", float("inf")), ("2026-09-25", 500.0)],
+             "origin": "SFO", "destination": "NRT", "depart_from": "a",
+             "depart_to": "b", "duration": 7}
+        self.assertNotIn("Infinity", outbox.history_chart_url(h, 431.0, 500))
+        self.assertIsNone(outbox.history_chart_url(
+            {**h, "daily_lows": [("2026-09-24", float("nan"))]}, 431.0, 500))
+        for d, p in ((3, 520.0), (2, 505.0), (1, 470.0)):
+            self.obs(d, p)
+        with mock.patch.object(outbox, "history_chart_url",
+                               side_effect=ValueError("bad data")):
+            text = outbox.render_alert_message(
+                {"id": "japan", "absolute_cap_usd": 500},
+                {**CONF, "price_usd": 431.0}, "fp", "then",
+                history=self.hist())
+        self.assertIn("Flight deal", text)
+        self.assertIn("Stored history", text)
+        self.assertNotIn("Chart:", text)
+
+    def test_full_window_url_length(self):
+        from datetime import date, timedelta
+        days = [((date(2026, 9, 1) + timedelta(days=i)).isoformat(), 400.0 + i)
+                for i in range(15)]
+        h = {"daily_lows": days, "origin": "SFO", "destination": "NRT",
+             "depart_from": "2026-12-01", "depart_to": "2026-12-07",
+             "duration": 7}
+        self.assertLess(len(outbox.history_chart_url(h, 431.0, 500)), 2000)
+        self.assertIsNotNone(outbox.history_chart_url(h, 431.0, None))
+
     def test_no_history_says_so(self):
         self.assertIn("none yet", self.text(431.0, self.hist()))
 
