@@ -101,7 +101,8 @@ except ImportError:
 SENTINEL_ANCHORS_PER_GROUP = 27
 SENTINEL_TOP_N = 1
 DETAIL_TOP_N = 3
-PER_RUN_ATTEMPT_CAP = 12
+PER_RUN_ATTEMPT_CAP = 12   # per 30-minute slot of cadence
+PER_RUN_HARD_CAP = 80      # spec: never more than 80 attempts in one run
 # v3 item 7: the old PER_RUN_ATTEMPT_FLOOR = 4 minimum is removed. When the
 # budget is exhausted the allowance is 0 -- no floor of attempts the run
 # cannot afford.
@@ -123,6 +124,10 @@ VERIFY_RESERVE = 24
 # (2 per step); a partial burst resumes in later slots until 60 attempts,
 # all steps complete, or BURST_EXPIRY_HOURS after the trigger was queued.
 BURST_MAX_ATTEMPTS = 60
+# Worst-case sends of one burst step (outbound page + 1 return page at
+# SENTINEL_TOP_N=1): a step is only started if it cannot push the burst
+# past BURST_MAX_ATTEMPTS.
+BURST_STEP_MAX_ATTEMPTS = 1 + 1
 BURST_EXPIRY_HOURS = 24
 
 
@@ -308,7 +313,14 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
 
 # ---------------------------------------------------------------- pacing
 
-def per_run_allowance(guard, slot) -> int:
+def daily_headroom(guard) -> int:
+    """Non-verify attempts still spendable today (the verify reserve is
+    held back for the verifier)."""
+    return (DAILY_CEILING - guard.spent_today()
+            - max(0, VERIFY_RESERVE - guard.spent_today("verify")))
+
+
+def per_run_allowance(guard, slot, cadence_slots: int = 1) -> int:
     """Adaptive pacing across the 48 daily slots.
 
     ``remaining = 150 - spent_today() - max(0, 24 - spent_today("verify"))``
@@ -317,13 +329,16 @@ def per_run_allowance(guard, slot) -> int:
     when the budget is exhausted (remaining <= 0) the allowance is 0, so
     the run stops instead of burning a floor of 4 attempts it cannot afford.
     """
-    remaining = (DAILY_CEILING - guard.spent_today()
-                 - max(0, VERIFY_RESERVE - guard.spent_today("verify")))
+    remaining = daily_headroom(guard)
     if remaining <= 0:
         return 0
-    slots_left = store.slots_left_today(slot)
-    paced = math.ceil(remaining / max(1, slots_left))
-    return min(PER_RUN_ATTEMPT_CAP, paced)
+    # Runs left today at the configured cadence (every cadence_slots
+    # 30-minute slots), not raw 30-minute slots: at a 2-hour cadence the
+    # day has 12 runs, each needing ~4x the per-slot share.
+    cadence_slots = max(1, int(cadence_slots))
+    runs_left = math.ceil(store.slots_left_today(slot) / cadence_slots)
+    paced = math.ceil(remaining / max(1, runs_left))
+    return min(PER_RUN_ATTEMPT_CAP * cadence_slots, PER_RUN_HARD_CAP, paced)
 
 
 # ---------------------------------------------------------------- collect
@@ -377,16 +392,24 @@ def _queue_drop_trigger(db, cell: dict, price: float, slot: int) -> bool:
 
 def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
                    top_n: int, category: str, result: dict, allowance: int,
-                   count_key: str, deadline_fn=None) -> None:
+                   count_key: str, deadline_fn=None, seen=None) -> None:
     remaining = allowance - result["attempts"]
     if remaining <= 0:
         return
-    for cell in store.due_cells(db, role, remaining):
+    seen = seen if seen is not None else set()
+    # Over-fetch so cells already checked this run (a second pass on
+    # leftover allowance) can be skipped without starving the phase.
+    for cell in store.due_cells(db, role, remaining + len(seen)):
+        if cell["id"] in seen:
+            continue
         if deadline_fn is not None and deadline_fn():
             raise store.DeadlineExceeded(
                 f"{role} phase deadline exceeded")
-        if result["attempts"] >= allowance:
+        # Only start a check this phase can afford in full (outbound page +
+        # top_n return pages); a half-finished check wastes its sends.
+        if allowance - result["attempts"] < 1 + top_n:
             break
+        seen.add(cell["id"])  # only once its check actually starts
         group_cfg = groups_cfg.get(cell["group_id"])
         if group_cfg is None:
             continue
@@ -402,7 +425,8 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
                 result["drop_triggers"] += 1
 
 
-def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None) -> dict:
+def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
+            cadence_slots: int = 1) -> dict:
     """One collection pass (v3 order).
 
     Priority: sentinels (due_sentinels, top_n=1, "sentinel") -> bursts
@@ -424,33 +448,83 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None) -> dict:
     """
     result = {"attempts": 0, "bursts": [], "sentinels": 0,
               "background": 0, "drop_triggers": 0}
-    allowance = per_run_allowance(guard, slot)
-    # v3 item 5: enforce the allowance on EVERY send, not just before a
-    # multi-attempt query. reserve() refuses once the run-local total hits
-    # this, so a top_n=3 query against a 2-attempt allowance stops at 2
-    # sends instead of overshooting to 4.
-    guard.set_run_allowance(allowance)
-    try:
+    allowance = per_run_allowance(guard, slot, cadence_slots)
+    # The guard's allowance is a cap on the RUN total, so set it relative to
+    # what this run already spent (retry/verify passes run before
+    # collection); an absolute value could leave collection 0 attempts.
+    run_start_spent = guard.spent_run()
+    guard.set_run_allowance(
+        min(PER_RUN_HARD_CAP, run_start_spent + allowance))
+    # Never let the relative allowance lift the run past the 80 hard cap.
+    allowance = min(allowance, max(0, PER_RUN_HARD_CAP - run_start_spent))
+
+    def phase(fn):
+        """Run one phase. A CATEGORY cap (e.g. sentinels' daily 54) only
+        ends that phase; daily/per-run/verify-reserve exhaustion ends
+        collection. Spend is reconciled with the guard afterwards, so sends
+        made just before an exception are still counted."""
+        try:
+            fn()
+            return True
+        except BudgetExhausted as e:
+            return getattr(e, "scope", None) == "category"
+        finally:
+            # Sends made just before an exception are in the guard's total
+            # but not yet in result["attempts"].
+            result["attempts"] = max(result["attempts"],
+                                     guard.spent_run() - run_start_spent)
+
+    # Sentinels get at most half of this run's allowance up front, so
+    # bursts and background progress all day instead of only after the
+    # sentinel cap is hit; unused allowance flows back to sentinels last.
+    sentinel_share = math.ceil(allowance / 2)
+    checked: set = set()  # cells checked this run: never twice
+
+    def sentinels(limit):
         _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "sentinel", SENTINEL_TOP_N, "sentinel",
-                       result, allowance, "sentinels", deadline_fn)
+                       result, limit, "sentinels", deadline_fn, checked)
+
+    def bursts():
         for trig in store.due_triggers(db, slot):
             if deadline_fn is not None and deadline_fn():
                 raise store.DeadlineExceeded("burst phase deadline exceeded")
-            if result["attempts"] >= allowance:
-                break
+            left = allowance - result["attempts"]
+            if left < BURST_STEP_MAX_ATTEMPTS:
+                break  # only start a burst that can finish a whole step
             group_cfg = groups_cfg.get(trig["group_id"])
             if group_cfg is None:
                 continue
             used = execute_burst(db, trig, guard, group_cfg, slot,
-                                 run_start=run_start, deadline_fn=deadline_fn)
+                                 run_start=run_start, deadline_fn=deadline_fn,
+                                 allowance=left)
             result["attempts"] += used
             result["bursts"].append(trig["id"])
+
+    def background():
         _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "background", DETAIL_TOP_N, "background",
-                       result, allowance, "background", deadline_fn)
-    except BudgetExhausted:
-        pass  # stop cleanly; partial progress is kept
+                       result, allowance, "background", deadline_fn, checked)
+
+    order = [lambda: sentinels(sentinel_share), bursts, background,
+             lambda: sentinels(allowance)]
+    if (slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N
+            and daily_headroom(guard) >= 1 + DETAIL_TOP_N):
+        # A background check needs 1 + DETAIL_TOP_N sends; the ~3-attempt
+        # share of a 30-minute run never fits one. Odd runs borrow up to a
+        # whole check (the daily ceiling and verify reserve still apply in
+        # reserve(), and pacing shrinks later runs to compensate).
+        allowance = min(1 + DETAIL_TOP_N,
+                        max(0, PER_RUN_HARD_CAP - run_start_spent))
+        guard.set_run_allowance(run_start_spent + allowance)
+    if slot % 2 == 1:
+        # Alternate runs lead with exploration, so a small allowance (about
+        # 3 at a 30-minute cadence) still reaches bursts and background.
+        order = [bursts, background, lambda: sentinels(sentinel_share),
+                 lambda: sentinels(allowance)]
+    for step in order:
+        if not phase(step):
+            break  # global budget stop: partial progress is kept
     return result
 
 
@@ -517,7 +591,7 @@ def _burst_steps(trigger):
 
 
 def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
-                  deadline_fn=None) -> int:
+                  deadline_fn=None, allowance=None) -> int:
     """Expand one due trigger (dict from ``store.due_triggers``).
 
     v3 group 4: the burst is RESUMABLE across slots. Progress (cumulative
@@ -562,7 +636,8 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
     total = 0
     cumulative = prog["attempts_used"]
     next_step = prog["next_step"]
-    allowance = per_run_allowance(guard, slot)
+    if allowance is None:
+        allowance = per_run_allowance(guard, slot)
     run_spent_entry = guard.spent_run()
     group_id = trigger["group_id"]
 
@@ -573,7 +648,9 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                           slot=slot, run_start=run_start)
 
     def _allowance_exhausted() -> bool:
-        return (guard.spent_run() - run_spent_entry) >= allowance
+        # A step is only started if the allowance covers the whole step.
+        return (allowance - (guard.spent_run() - run_spent_entry)
+                < BURST_STEP_MAX_ATTEMPTS)
 
     def _record(status: str) -> None:
         store.record_burst(db, trigger_id=trigger["id"], group_id=group_id,
@@ -585,7 +662,7 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
         for step_idx, kind, d_date, dur in steps:
             if step_idx < next_step:
                 continue  # already done in an earlier slot: resume point
-            if cumulative >= BURST_MAX_ATTEMPTS:
+            if cumulative + BURST_STEP_MAX_ATTEMPTS > BURST_MAX_ATTEMPTS:
                 break
             if _allowance_exhausted():
                 break

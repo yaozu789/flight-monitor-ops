@@ -280,6 +280,137 @@ class TestAllowance(SentinelTestBase):
 # ---------------------------------------------------------------- collect priority
 
 class TestCollectPriority(SentinelTestBase):
+    def test_cadence_aware_pacing(self):
+        """At a 2-hour cadence (4 slots per run) a run gets ~4x the share,
+        within the 80 hard cap."""
+        g = self.guard()
+        per_30 = sentinel.per_run_allowance(g, 0, 1)
+        per_2h = sentinel.per_run_allowance(g, 0, 4)
+        self.assertGreater(per_2h, per_30)
+        self.assertLessEqual(per_2h, sentinel.PER_RUN_HARD_CAP)
+
+    def test_odd_slot_leads_with_exploration(self):
+        """With a small allowance (3, about the 30-minute share) an odd
+        slot reaches background before sentinels; whole checks only."""
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        store.ensure_cells(self.db, [
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 7, "role": "sentinel", "weekday": 0},
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 8, "role": "background", "weekday": 0}])
+        calls = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append((category, top_n))
+            return (400.0, 1 + top_n)
+
+        self.patch(sentinel, "check_cell", fake_check)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 3)
+        sentinel.collect(self.db, self.guard(), GROUPS, slot=5,
+                         run_start=store.utcnow_iso())
+        self.assertEqual(calls[0][0], "background")
+        # A 3-attempt share is raised to one whole background check (4);
+        # it uses it all and no partial sentinel check starts after it.
+        self.assertEqual(calls, [("background", 3)])
+
+    def test_no_borrow_when_day_nearly_spent(self):
+        """With under one whole background check of daily headroom left,
+        an odd slot does not borrow (it would stop mid-check)."""
+        g = self.guard()
+        self.patch(sentinel, "daily_headroom", lambda guard: 3)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 3)
+        sentinel.collect(self.db, g, {}, slot=5, run_start=store.utcnow_iso())
+        self.assertEqual(g.run_allowance(), 3)
+
+    def test_skipped_cell_is_retried_in_leftover_pass(self):
+        """A cell that did not fit the first sentinel share is still
+        checked by the leftover pass (it was never started)."""
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        store.ensure_cells(self.db, [
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 7, "role": "sentinel", "weekday": 0}])
+        calls = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append(category)
+            return (400.0, 1 + top_n)
+
+        self.patch(sentinel, "check_cell", fake_check)
+        # allowance 3: sentinel share ceil(3/2)=2 fits one 2-send check.
+        # allowance 2: share 1 fits none; the leftover pass (2) fits one.
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 2)
+        sentinel.collect(self.db, self.guard(), GROUPS, slot=4,
+                         run_start=store.utcnow_iso())
+        self.assertEqual(calls, ["sentinel"])
+
+    def test_run_total_never_exceeds_80(self):
+        g = self.guard()
+        g.set_run_allowance(80)
+        for _ in range(36):
+            g.reserve("verify") if _ < 24 else g.reserve("retry_reserve")
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 48)
+        sentinel.collect(self.db, g, {}, slot=4, run_start=store.utcnow_iso())
+        self.assertLessEqual(g.run_allowance(), sentinel.PER_RUN_HARD_CAP)
+
+    def test_sentinel_cap_does_not_end_collection(self):
+        """Hitting the sentinel CATEGORY cap ends only the sentinel phase;
+        background still runs in the same collection pass."""
+        from budget import BudgetExhausted
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        store.ensure_cells(self.db, [
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 7, "role": "sentinel", "weekday": 0},
+            {"group_id": "japan_fall_2026", "depart_date": depart,
+             "duration": 8, "role": "background", "weekday": 0}])
+        calls = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append(category)
+            if category == "sentinel":
+                raise BudgetExhausted("category", "sentinel", 54, 54)
+            return (400.0, 1)
+
+        self.patch(sentinel, "check_cell", fake_check)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 6)
+        sentinel.collect(self.db, self.guard(), GROUPS, slot=5,
+                         run_start=store.utcnow_iso())
+        self.assertIn("background", calls)
+
+    def test_allowance_is_relative_to_run_spend(self):
+        """Attempts spent earlier in the run (retry/verify) do not eat the
+        collection allowance."""
+        g = self.guard()
+        g.set_run_allowance(80)
+        for _ in range(5):
+            g.reserve("verify")
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 3)
+        sentinel.collect(self.db, g, {}, slot=4, run_start=store.utcnow_iso())
+        self.assertEqual(g.run_allowance(), 5 + 3)
+
+    def test_burst_never_passes_60(self):
+        """A resumed burst at 59 attempts does not start a 2-send step."""
+        from datetime import datetime, timedelta as td, timezone as tz
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        tid = store.queue_trigger(
+            self.db, kind="under_cap", group_id="japan_fall_2026",
+            depart_week=store.depart_week(depart), depart_date=depart,
+            duration=7, price_usd=400.0, fingerprint="fp-cap", slot=1)
+        trig = [t for t in store.due_triggers(self.db, 2) if t["id"] == tid][0]
+        expires = (datetime.now(tz.utc) + td(hours=12)).isoformat()
+        store.init_burst_progress(self.db, tid, "japan_fall_2026",
+                                  trig["depart_week"], expires)
+        store.save_burst_progress(self.db, tid, next_step=5, attempts_used=59)
+        calls = []
+        self.patch(sentinel, "check_cell",
+                   lambda *a, **k: calls.append(1) or (400.0, 2))
+        used = sentinel.execute_burst(self.db, trig, self.guard(),
+                                      GROUPS["japan_fall_2026"], 3,
+                                      allowance=10)
+        self.assertEqual((used, calls), (0, []))
+
     def test_sentinels_before_bursts_before_background(self):
         # v3 group 4: collection priority is sentinels -> bursts ->
         # background (bursts no longer jump the queue).
@@ -308,9 +439,9 @@ class TestCollectPriority(SentinelTestBase):
 
         self.patch(sentinel, "execute_burst", fake_burst)
         self.patch(sentinel, "check_cell", fake_check)
-        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 6)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 6)
 
-        result = sentinel.collect(self.db, self.guard(), GROUPS, slot=5,
+        result = sentinel.collect(self.db, self.guard(), GROUPS, slot=4,
                                   run_start=store.utcnow_iso())
         kinds = [c[0] for c in calls]
         self.assertEqual(kinds[0], "sentinel")
@@ -319,7 +450,13 @@ class TestCollectPriority(SentinelTestBase):
         self.assertGreater(burst_at, 0)
         self.assertGreater(first_bg, burst_at)
         self.assertTrue(all(k == "sentinel" for k in kinds[:burst_at]))
-        self.assertTrue(all(k == "background" for k in kinds[first_bg:]))
+        # After background, only leftover allowance flowing back to
+        # sentinels may follow (never another burst).
+        tail = kinds[first_bg:]
+        self.assertNotIn("burst", tail)
+        if "sentinel" in tail:
+            self.assertTrue(all(k == "sentinel"
+                                for k in tail[tail.index("sentinel"):]))
         self.assertEqual(result["bursts"], [tid])
         self.assertEqual(result["sentinels"], 1)
         self.assertEqual(result["background"], 1)
@@ -347,7 +484,7 @@ class TestCollectPriority(SentinelTestBase):
         # v3: collect() drives the per-send allowance from the pacer, so pin
         # the paced value for this test; the guard's per_run_max=4 is what
         # the fake checks exhaust (2 checks x 2 reserves, then raise).
-        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 4)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 4)
         g = self.guard(per_run_max=4)  # 2 checks, then BudgetExhausted
         result = sentinel.collect(self.db, g, GROUPS, slot=5,
                                   run_start=store.utcnow_iso())
@@ -600,7 +737,7 @@ class TestBurst(SentinelTestBase):
             return (400.0, 2)
 
         self.patch(sentinel, "check_cell", fake_check)
-        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 4)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 4)
         used = sentinel.execute_burst(
             self.db, trig, self.guard(), GROUPS["japan_fall_2026"], slot=7,
             run_start=store.utcnow_iso())
@@ -646,7 +783,7 @@ class TestResumableBursts(SentinelTestBase):
 
     def _run_burst(self, trig, allowance):
         self.patch(sentinel, "check_cell", self._fake_check())
-        self.patch(sentinel, "per_run_allowance", lambda guard, slot: allowance)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: allowance)
         return sentinel.execute_burst(
             self.db, trig, self.guard(), GROUPS["japan_fall_2026"], slot=7,
             run_start=store.utcnow_iso())
@@ -674,7 +811,7 @@ class TestResumableBursts(SentinelTestBase):
 
         self.patch(sentinel, "check_cell", fake_check)
         # generous allowance: finish everything remaining (28 steps x 2)
-        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 60)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 60)
         trig2 = [t for t in store.due_triggers(self.db, 8)
                  if t["id"] == trig["id"]][0]
         used = sentinel.execute_burst(
@@ -762,7 +899,7 @@ class TestResumableBursts(SentinelTestBase):
             raise BudgetExhausted("boom")
 
         self.patch(sentinel, "check_cell", fake_check)
-        self.patch(sentinel, "per_run_allowance", lambda guard, slot: 200)
+        self.patch(sentinel, "per_run_allowance", lambda guard, slot, *a: 200)
         with self.assertRaises(BudgetExhausted):
             sentinel.execute_burst(
                 self.db, trig, self.guard(), GROUPS["japan_fall_2026"],

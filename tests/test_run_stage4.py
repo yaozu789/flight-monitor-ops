@@ -290,12 +290,13 @@ class Stage4OrchestrationTests(unittest.TestCase):
                 booking_url="https://example.invalid/b",
                 message_text="drained deal", origin="SFO", destination="JFK")
 
+        # A DAILY stop (a category cap alone no longer ends the run).
         rc, docs, db = self._run_with_stop(
-            BudgetExhausted("category", "retry_reserve", 12, 12), seed=seed,
+            BudgetExhausted("daily", "retry_reserve", 150, 150), seed=seed,
             extra_patches=[mock.patch.object(
                 fm_run, "recheck_retries",
-                side_effect=BudgetExhausted("category", "retry_reserve",
-                                            12, 12))])
+                side_effect=BudgetExhausted("daily", "retry_reserve",
+                                            150, 150))])
         self.assertEqual(rc, 0)
         self.assertEqual(docs[-1]["reason"], "budget_exhausted")
         self.assertEqual(self._relayed_prices(docs), [380.0])
@@ -333,6 +334,73 @@ class Stage4OrchestrationTests(unittest.TestCase):
         self.assertEqual(self._relayed_prices(docs), [])
         row = db.execute("SELECT state FROM outbox").fetchone()
         self.assertEqual(row["state"], "pending")
+
+    def test_retry_category_cap_does_not_stop_run(self):
+        """The retry category's own cap ends only the retry pass: retries
+        confirmed before it are handed off and collection still runs."""
+        from budget import BudgetExhausted
+        import outbox as fm_outbox
+        db, guard = _ctx(self)
+        slot = store.slot_id()
+        for aid, fp in (("w1:r1", "fp1"), ("w1:r2", "fp2")):
+            store.enqueue_alert(
+                db, alert_id=aid, watch_id="w1", fingerprint=fp,
+                price_usd=400.0, depart_date="2026-11-01",
+                return_date="2026-11-08", airline="UA", stops=0,
+                booking_url="", message_text="m", origin="SFO",
+                destination="JFK")
+            store.prepare_handoff(db, slot - 10, [aid])
+        calls = []
+
+        def recheck(row, db_, watch, guard_):
+            calls.append(row["alert_id"])
+            if len(calls) > 1:
+                raise BudgetExhausted("category", "retry_reserve", 12, 12)
+            return "confirmed", {"price_usd": 390.0,
+                                 "depart_date": row["depart_date"],
+                                 "return_date": row["return_date"],
+                                 "airline": "UA", "stops": 0,
+                                 "booking_url": "", "observed_at": "now",
+                                 "origin": "SFO", "destination": "JFK"}
+
+        collected = []
+        with mock.patch.object(fm_outbox.verifier, "recheck_alert_detailed",
+                               recheck), \
+                mock.patch.object(fm_sentinel, "mint_sentinels", return_value=0), \
+                mock.patch.object(fm_sentinel, "ensure_background_grid",
+                                  return_value=0), \
+                mock.patch.object(fm_sentinel, "collect",
+                                  lambda *a, **k: collected.append(1) or {
+                                      "attempts": 0, "bursts": [],
+                                      "sentinels": 0, "background": 0,
+                                      "drop_triggers": 0}):
+            args = SimpleNamespace(cmd="check", scheduled=False, watch="w1")
+            rc = fm_run.cmd_check(args, db, [WATCH], guard, slot=slot)
+        self.assertEqual(rc, 0)
+        self.assertEqual(collected, [1])
+        first = store.outbox_get(db, calls[0])
+        self.assertEqual(first["prepared_slot"], slot)
+
+    def test_cmd_check_uses_claimed_slot(self):
+        """cmd_check works under the slot run_guarded claimed, not a
+        recomputed one (a run can cross a half-hour boundary)."""
+        db, guard = _ctx(self)
+        with mock.patch.object(fm_sentinel, "mint_sentinels", return_value=0), \
+                mock.patch.object(fm_sentinel, "ensure_background_grid",
+                                  return_value=0), \
+                mock.patch.object(fm_sentinel, "collect",
+                                  lambda *a, **k: {"attempts": 0, "bursts": [],
+                                                   "sentinels": 0,
+                                                   "background": 0,
+                                                   "drop_triggers": 0}), \
+                mock.patch.object(fm_run, "slot_id", return_value=999999):
+            import io, json as _json, contextlib
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                fm_run.cmd_check(SimpleNamespace(cmd="check", scheduled=False,
+                                                 watch="w1"),
+                                 db, [WATCH], guard, slot=42)
+        self.assertEqual(_json.loads(out.getvalue())["slot_id"], 42)
 
     def test_tied_observations_score_once(self):
         """Rows of one fingerprint sharing an observed_at (collection stamps
@@ -383,11 +451,13 @@ class Stage4OrchestrationTests(unittest.TestCase):
                                             "detect_under_cap_triggers",
                                             return_value=0):
                         # stub the retry recheck to confirm the retry
+                        def fake_retries(*a, out=None, **k):
+                            out["retry_ids"].append("w1:retry")
+                            return out
+
                         with mock.patch.object(
                                 fm_run, "recheck_retries",
-                                return_value={"retry_ids": ["w1:retry"],
-                                              "retired": [],
-                                              "unknown": []}):
+                                side_effect=fake_retries):
                             args = SimpleNamespace(cmd="check", scheduled=False,
                                                    watch="w1")
                             rc = fm_run.cmd_check(args, db, [WATCH], guard)

@@ -865,20 +865,22 @@ def finish_slot(db: sqlite3.Connection, slot: int, status: str) -> None:
     db.commit()
 
 
-def deadline_streak(db: sqlite3.Connection) -> int:
-    """Number of back-to-back slots, ending at the most recent one, whose
-    status is "deadline". Any other status (including an abandoned
-    in_progress row) or a gap in slot IDs ends the streak."""
+def deadline_streak(db: sqlite3.Connection, max_gap: int = 1) -> int:
+    """Number of back-to-back runs, ending at the most recent one, whose
+    status is "deadline". Runs are back-to-back when their slots are at
+    most *max_gap* apart (the run cadence in slots: 1 at 30 min, 4 at
+    2 h). Any other status (including an abandoned in_progress row) or a
+    larger gap (a skipped run) ends the streak."""
     streak = 0
-    expected = None
+    prev = None
     for r in db.execute("SELECT slot_id, status FROM run_slots "
                         "ORDER BY slot_id DESC"):
         if r["status"] != "deadline":
             break
-        if expected is not None and r["slot_id"] != expected:
+        if prev is not None and prev - r["slot_id"] > max_gap:
             break
         streak += 1
-        expected = r["slot_id"] - 1
+        prev = r["slot_id"]
     return streak
 
 

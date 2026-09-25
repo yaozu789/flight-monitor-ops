@@ -253,7 +253,8 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         transport.set_deadline_fn(_deadline_exceeded)
         try:
             rc = fn(args, db, watches, guard,
-                    drained=drained, deadline_fn=_deadline_exceeded)
+                    drained=drained, deadline_fn=_deadline_exceeded,
+                    slot=slot)
         except SystemExit as e:
             # An explicit exit from fn is a failure signal, not a success:
             # /fail, then let it propagate.
@@ -284,7 +285,7 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             # lock is released by the finally below, and the cycle pings
             # success -- never /fail.
             finish_slot(db, slot, "deadline")
-            streak = deadline_streak(db)
+            streak = deadline_streak(db, max_gap=cadence_slots(watches))
             if streak >= DEADLINE_FAIL_STREAK:
                 add_health(db, "run_deadline", False,
                            f"{streak} consecutive deadline stops: {e}")
@@ -346,6 +347,21 @@ def load_config() -> tuple[dict, list[dict]]:
     return defaults, watches
 
 
+def cadence_slots(watches: list[dict]) -> int:
+    """Configured run cadence in 30-minute slots (watches.yaml
+    ``run_every_minutes``, default 30). Pacing and the deadline streak
+    follow it; the scheduler itself is configured on Muse to match."""
+    minutes = 30
+    for w in watches:
+        if w.get("run_every_minutes"):
+            minutes = int(w["run_every_minutes"])
+            break
+    if minutes < 30 or minutes % 30:
+        raise ValueError(
+            f"run_every_minutes must be a multiple of 30, got {minutes}")
+    return minutes // 30
+
+
 def get_watch(watches: list[dict], watch_id: str) -> dict:
     for w in watches:
         if w["id"] == watch_id:
@@ -359,7 +375,8 @@ def _add_scheduled(p) -> None:
                         "enables the Healthchecks ping and the env gate")
 
 
-def cmd_broad(args, db, watches, guard, *, drained=None, deadline_fn=None):
+def cmd_broad(args, db, watches, guard, *, drained=None, deadline_fn=None,
+              slot=None):
     w = get_watch(watches, args.watch)
     _check_deadline(deadline_fn)
     combos = broad_scan(w, duration_days=args.duration)
@@ -476,7 +493,8 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
     return per_watch
 
 
-def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
+def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
+              slot=None):
     """One scheduled collection cycle (v3 group 4 ordering):
 
     1. Mint sentinel anchors + background grid (idempotent).
@@ -494,7 +512,9 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
     8. Prepare the new handoffs for the agent to relay.
     """
     run_start = utcnow_iso()
-    slot = slot_id()
+    # The slot run_guarded CLAIMED, not a recomputed one: a run crossing a
+    # half-hour boundary must keep working under its claimed slot.
+    slot = slot if slot is not None else slot_id()
     summary: dict = {"slot_id": slot, "watches": {}}
     targets = [get_watch(watches, args.watch)] if args.watch else watches
     groups_cfg = {w["id"]: {"origins": w["origins"],
@@ -517,16 +537,20 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
     prev_start_iso = datetime.fromtimestamp(
         slot_start_ts(slot - 1), tz=timezone.utc).isoformat()
     new_ids: list[str] = []
-    retry_ids: list[str] = []
+    retries: dict = {"retry_ids": [], "retired": [], "unknown": []}
+    retry_ids: list[str] = retries["retry_ids"]
+    reprepared = False
     verified_deals: list[dict] = []
     per_watch: dict[str, list[str]] = {}
     try:
         # 3. Retry pass (verify budget): recheck, re-render, retire.
-        retries = recheck_retries(db, watches, guard, slot,
-                                  deadline_fn=deadline_fn)
-        retry_ids = retries["retry_ids"]
+        # retry_ids is filled in place, so a stop mid-pass keeps the
+        # retries confirmed before it (re-prepared in the except below).
+        recheck_retries(db, watches, guard, slot, deadline_fn=deadline_fn,
+                        out=retries)
         if retry_ids:
             reprepare_retries(db, slot, retry_ids)
+            reprepared = True
 
         per_watch = _verify_candidates(db, targets, guard, prev_start_iso,
                                        new_ids, verified_deals,
@@ -534,7 +558,8 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
 
         # 5. Collect, paced: sentinels > bursts > background.
         collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
-                                     deadline_fn=deadline_fn)
+                                     deadline_fn=deadline_fn,
+                                     cadence_slots=cadence_slots(watches))
         summary["collect"] = {
             "attempts": collected["attempts"],
             "bursts": collected["bursts"],
@@ -561,6 +586,11 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None):
         # or the agent never relays them. Cleanup failures are recorded but
         # never replace the original stop.
         _finish_verified(db, slot, run_start, verified_deals, new_ids)
+        if retry_ids and not reprepared:
+            try:
+                reprepare_retries(db, slot, retry_ids)
+            except Exception as e:  # noqa: BLE001 - never mask the stop
+                _note(db, "retry_reprepare", f"{type(e).__name__}: {e}")
         try:
             stop.handoff = _handoff_payload(
                 db, slot, drained_ids + retry_ids + new_ids)
@@ -673,6 +703,7 @@ def main() -> int:
     db = None
     try:
         defaults, watches = load_config()
+        cadence_slots(watches)  # reject a bad run_every_minutes before any work
         db = init_db(DB_PATH)
         sync_watches(db, watches, defaults)
         # The transport guard counts ACTUAL HTTP attempts and refuses to send

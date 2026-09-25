@@ -151,7 +151,7 @@ class RunLifecycleTests(unittest.TestCase):
         db, guard = self._ctx()
 
         def slow_fn(args, db_, watches, guard_, drained=None,
-                     deadline_fn=None):
+                     deadline_fn=None, slot=None):
             fm_run._check_deadline(deadline_fn)  # raises immediately
             return 0  # pragma: no cover
 
@@ -183,7 +183,7 @@ class RunLifecycleTests(unittest.TestCase):
             store.finish_slot(db, prev, "deadline")
 
         def slow_fn(args, db_, watches, guard_, drained=None,
-                    deadline_fn=None):
+                    deadline_fn=None, slot=None):
             fm_run._check_deadline(deadline_fn)  # raises immediately
             return 0  # pragma: no cover
 
@@ -206,7 +206,7 @@ class RunLifecycleTests(unittest.TestCase):
             store.finish_slot(db, prev, status)
 
         def slow_fn(args, db_, watches, guard_, drained=None,
-                    deadline_fn=None):
+                    deadline_fn=None, slot=None):
             fm_run._check_deadline(deadline_fn)
             return 0  # pragma: no cover
 
@@ -227,6 +227,19 @@ class RunLifecycleTests(unittest.TestCase):
         store.claim_slot(db, slot, "check")
         store.finish_slot(db, slot, "deadline")
         self.assertEqual(store.deadline_streak(db), 2)
+
+    def test_deadline_streak_follows_cadence(self):
+        """At a 2-hour cadence runs are 4 slots apart; three consecutive
+        deadline runs still form a streak, a skipped run breaks it."""
+        db, _ = self._ctx()
+        for sl in (100, 104, 108):
+            store.claim_slot(db, sl, "check")
+            store.finish_slot(db, sl, "deadline")
+        self.assertEqual(store.deadline_streak(db, max_gap=4), 3)
+        self.assertEqual(store.deadline_streak(db, max_gap=1), 1)
+        store.claim_slot(db, 116, "check")  # 108 -> 116 skips one run
+        store.finish_slot(db, 116, "deadline")
+        self.assertEqual(store.deadline_streak(db, max_gap=4), 1)
 
     def test_deadline_shorter_than_lock_ttl(self):
         """The deadline must stay below the lock TTL so a stopped run
@@ -340,10 +353,16 @@ class PipelineOrderTests(unittest.TestCase):
         self._patch(fm_run, "verify", fake_verify)
         self._patch(_sentinel, "check_cell", fake_check)
         self._patch(_sentinel, "per_run_allowance",
-                    lambda guard, slot: 200)
+                    lambda guard, slot, *a: 200)
+        # This test is about ORDER, not caps: lift the 80-per-run hard cap
+        # so every phase gets room.
+        self._patch(_sentinel, "PER_RUN_HARD_CAP", 1000)
 
+        # An even slot: sentinel-first order (odd slots lead with
+        # exploration; see test_odd_slot_leads_with_exploration).
+        even_slot = store.slot_id() - (store.slot_id() % 2)
         rc = fm_run.cmd_check(args_for("check", False), self.db, [WATCH],
-                              self.guard)
+                              self.guard, slot=even_slot)
         self.assertEqual(rc, 0)
 
         # v3 order: verify first, then sentinels, then bursts (whose
@@ -359,9 +378,11 @@ class PipelineOrderTests(unittest.TestCase):
         self.assertLess(first_sentinel, revalidate_at)
         self.assertLess(revalidate_at, first_burst)
         self.assertLess(first_burst, first_background)
+        last_background = len(events) - 1 - events[::-1].index("background")
         for i, e in enumerate(events):
             if e == "sentinel":
-                self.assertLess(i, first_burst)
+                # Before the bursts, or leftover allowance after background.
+                self.assertTrue(i < first_burst or i > last_background)
             elif e == "background":
                 self.assertGreater(i, first_burst)
         # The seeded candidate was actually verified and enqueued.
