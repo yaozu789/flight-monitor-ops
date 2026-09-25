@@ -1013,14 +1013,27 @@ def clear_backoff(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------- cells / triggers / bursts (plan 04)
 
 def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
+    """Insert missing cells; reactivate retired ones that are wanted again
+    (e.g. after a config change); promote a background cell to sentinel
+    when a sentinel anchor lands on the same (group, date, duration) --
+    the unique key has no role, so without this one of them was silently
+    dropped. Returns the number of cells inserted or changed."""
     n = 0
+    now = utcnow_iso()
     for c in cells:
         cur = db.execute(
-            """INSERT OR IGNORE INTO cells
+            """INSERT INTO cells
                (group_id, depart_date, duration, role, weekday, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (group_id, depart_date, duration) DO UPDATE SET
+                 role = CASE WHEN excluded.role = 'sentinel'
+                               OR cells.active = 0
+                             THEN excluded.role ELSE cells.role END,
+                 active = 1, retired_at = NULL
+               WHERE cells.active = 0
+                  OR (excluded.role = 'sentinel' AND cells.role <> 'sentinel')""",
             (c["group_id"], c["depart_date"], c["duration"], c["role"],
-             c["weekday"], utcnow_iso()))
+             c["weekday"], now))
         n += cur.rowcount
     db.commit()
     return n

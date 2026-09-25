@@ -146,14 +146,15 @@ class SentinelTestBase(unittest.TestCase):
 # ---------------------------------------------------------------- minting
 
 class TestMint(SentinelTestBase):
-    def test_mint_creates_27_per_group(self):
+    def test_mint_creates_about_27_per_group(self):
+        """~27 anchors (window // weekly-ish lattice step) per group."""
         n = sentinel.mint_sentinels(self.db, GROUPS, today=TODAY)
-        self.assertEqual(n, 54)
+        self.assertGreater(n, 0)
         for gid in GROUPS:
             rows = self.db.execute(
                 "SELECT * FROM cells WHERE group_id=? AND role='sentinel' "
                 "AND active=1", (gid,)).fetchall()
-            self.assertEqual(len(rows), 27)
+            self.assertTrue(24 <= len(rows) <= 27, len(rows))
             for r in rows:
                 self.assertEqual(r["duration"], 7)
 
@@ -173,11 +174,12 @@ class TestMint(SentinelTestBase):
         self.assertEqual(bad["c"], 0)
 
     def test_mint_idempotent(self):
-        self.assertEqual(sentinel.mint_sentinels(self.db, GROUPS, today=TODAY), 54)
+        first = sentinel.mint_sentinels(self.db, GROUPS, today=TODAY)
+        self.assertGreater(first, 0)
         self.assertEqual(sentinel.mint_sentinels(self.db, GROUPS, today=TODAY), 0)
         n = self.db.execute(
             "SELECT COUNT(*) AS c FROM cells WHERE role='sentinel'").fetchone()
-        self.assertEqual(n["c"], 54)
+        self.assertEqual(n["c"], first)
 
     def test_mint_retires_out_of_window(self):
         today_d = date.fromisoformat(TODAY)
@@ -255,6 +257,47 @@ class TestConfiguredWindow(SentinelTestBase):
         self.assertEqual(durs, [4, 6])
 
 
+class TestGridStability(SentinelTestBase):
+    def test_grid_does_not_grow_day_to_day(self):
+        """Minting every day for 60 days keeps ~27 sentinels and one weekly
+        background grid active; rows are reused, not re-created."""
+        cfg = {"g1": {"origins": ["SFO"], "destinations": ["NRT"]}}
+        start = date.fromisoformat(TODAY)
+        for i in range(60):
+            day = (start + timedelta(days=i)).isoformat()
+            sentinel.mint_sentinels(self.db, cfg, today=day)
+            sentinel.ensure_background_grid(self.db, cfg, today=day)
+            active = dict(self.db.execute(
+                "SELECT role, COUNT(*) FROM cells WHERE active=1 "
+                "GROUP BY role").fetchall())
+            self.assertTrue(24 <= active["sentinel"] <= 27, active)
+            self.assertLessEqual(active["background"], 27 * 10)
+        total = self.db.execute("SELECT COUNT(*) AS c FROM cells").fetchone()
+        self.assertLess(total["c"], 450)  # old code: >1,700 per group
+
+    def test_sentinel_promotes_colliding_background_cell(self):
+        """A sentinel anchor on an existing background (date, stay) cell
+        promotes it instead of being silently dropped."""
+        cfg = {"g1": {"origins": ["SFO"], "destinations": ["NRT"]}}
+        sentinel.ensure_background_grid(self.db, cfg, today=TODAY)
+        sentinel.mint_sentinels(self.db, cfg, today=TODAY)
+        want = {r["depart_date"] for r in self.db.execute(
+            "SELECT depart_date FROM cells WHERE role='sentinel' AND active=1")}
+        self.assertTrue(24 <= len(want) <= 27)
+
+    def test_retired_cell_reactivates_when_wanted_again(self):
+        cfg_wide = {"g1": {"origins": ["SFO"], "destinations": ["NRT"],
+                           "durations": (5, 14)}}
+        cfg_narrow = {"g1": {"origins": ["SFO"], "destinations": ["NRT"],
+                             "durations": (4, 6)}}
+        sentinel.ensure_background_grid(self.db, cfg_wide, today=TODAY)
+        sentinel.ensure_background_grid(self.db, cfg_narrow, today=TODAY)
+        sentinel.ensure_background_grid(self.db, cfg_wide, today=TODAY)
+        durs = {r["duration"] for r in self.db.execute(
+            "SELECT duration FROM cells WHERE role='background' AND active=1")}
+        self.assertEqual(durs, set(range(5, 15)))
+
+
 # ---------------------------------------------------------------- rotation
 
 class TestRotation(SentinelTestBase):
@@ -266,8 +309,11 @@ class TestRotation(SentinelTestBase):
             "LIMIT 1").fetchone()["id"]
         store.record_cell_check(self.db, first, slot=99, success=True,
                                 price_usd=400.0)
-        due = sentinel.due_sentinels(self.db, 27)
-        self.assertEqual(len(due), 27)
+        total = self.db.execute(
+            "SELECT COUNT(*) AS c FROM cells WHERE role='sentinel' "
+            "AND active=1").fetchone()["c"]
+        due = sentinel.due_sentinels(self.db, total)
+        self.assertEqual(len(due), total)
         self.assertEqual(due[-1]["id"], first)
         self.assertNotEqual(due[0]["id"], first)
 

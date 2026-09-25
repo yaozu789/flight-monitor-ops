@@ -160,15 +160,35 @@ def _sentinel_duration(group_cfg) -> int:
     return min(max(7, durs[0]), durs[-1])
 
 
+# Fixed calendar lattice (a Monday). Grid dates are computed from it, not
+# from "today", so the same dates are re-minted every day: cells enter at
+# the far end of the window and retire at the near end instead of a new set
+# being added daily (the old grid grew to 40 sentinels / 1,700+ background
+# cells per group).
+GRID_EPOCH = date(2026, 1, 5)
+
+
+def _lattice(start: date, end: date, step: int):
+    """Lattice points GRID_EPOCH + k*step within [start, end], as (k, date)."""
+    k = -(-(start - GRID_EPOCH).days // step)  # ceil
+    while True:
+        d = GRID_EPOCH + timedelta(days=k * step)
+        if d > end:
+            return
+        yield k, d
+        k += 1
+
+
 def mint_sentinels(db, groups_cfg, today=None) -> int:
-    """Idempotently mint 27 weekly anchors per group across the group's
+    """Idempotently mint ~27 fixed anchors per group across the group's
     departure window (``window_days``, default today+90d .. today+270d).
 
-    Anchor ``i``: ``window_start + i * (window_days // 27)`` days, snapped to
-    ``weekday == i % 7`` (+-3 days, clamped to the window). The stay is 7
-    days clamped into the group's ``durations``; ``role="sentinel"``.
-    Sentinel cells of a group departing more than 15 days outside its window
-    are retired (active=0). Returns the new-cell count.
+    Anchors sit on a fixed lattice (step = window // 27 days from
+    GRID_EPOCH), each snapped +-3 days to weekday ``k % 7`` so they spread
+    across weekdays. They stay fixed until they leave the window. The stay
+    is 7 days clamped into the group's ``durations``; ``role="sentinel"``.
+    Sentinels outside the window, or with a stay no longer configured, are
+    retired. Returns the new/reactivated cell count.
     """
     today_d = _coerce_today(today)
 
@@ -177,16 +197,15 @@ def mint_sentinels(db, groups_cfg, today=None) -> int:
         lo_d, hi_d = _window_days(group_cfg)
         win_start = today_d + timedelta(days=lo_d)
         win_end = today_d + timedelta(days=hi_d)
-        step = max(1, (win_end - win_start).days // SENTINEL_ANCHORS_PER_GROUP)
+        step = max(1, -(-(hi_d - lo_d) // SENTINEL_ANCHORS_PER_GROUP))  # ceil
         duration = _sentinel_duration(group_cfg)
-        for i in range(SENTINEL_ANCHORS_PER_GROUP):
-            base = win_start + timedelta(days=i * step)
-            target_wd = i % 7
-            delta = (target_wd - base.weekday()) % 7
+        for k, base in _lattice(win_start, win_end, step):
+            delta = ((k % 7) - base.weekday()) % 7
             if delta > 3:
                 delta -= 7
             d = base + timedelta(days=delta)
-            d = min(max(d, win_start), win_end)  # clamp to window
+            if not (win_start <= d <= win_end):
+                continue
             cells.append({
                 "group_id": group_id,
                 "depart_date": d.isoformat(),
@@ -196,12 +215,14 @@ def mint_sentinels(db, groups_cfg, today=None) -> int:
             })
     new_count = store.ensure_cells(db, cells)
 
-    # Roll the window forward: retire anchors that drifted out of range.
+    # Roll the window forward: retire anchors that left the window or whose
+    # stay length is no longer the configured sentinel stay.
     for group_id, group_cfg in groups_cfg.items():
         lo_d, hi_d = _window_days(group_cfg)
         _retire_outside(db, group_id, "sentinel",
-                        (today_d + timedelta(days=lo_d - 15)).isoformat(),
-                        (today_d + timedelta(days=hi_d + 15)).isoformat())
+                        (today_d + timedelta(days=lo_d)).isoformat(),
+                        (today_d + timedelta(days=hi_d)).isoformat(),
+                        durations={_sentinel_duration(group_cfg)})
     return new_count
 
 
@@ -232,9 +253,9 @@ def ensure_background_grid(db, groups_cfg, today=None) -> int:
     for group_id, group_cfg in groups_cfg.items():
         lo_d, hi_d = _window_days(group_cfg)
         durations = _durations(group_cfg)
-        d = today_d + timedelta(days=lo_d)
-        end = today_d + timedelta(days=hi_d)
-        while d <= end:
+        # Weekly departures on the fixed lattice (Mondays from GRID_EPOCH).
+        for _, d in _lattice(today_d + timedelta(days=lo_d),
+                             today_d + timedelta(days=hi_d), 7):
             for duration in durations:
                 cells.append({
                     "group_id": group_id,
@@ -243,7 +264,6 @@ def ensure_background_grid(db, groups_cfg, today=None) -> int:
                     "role": "background",
                     "weekday": d.weekday(),
                 })
-            d += timedelta(days=7)
     new_count = store.ensure_cells(db, cells)
 
     for group_id, group_cfg in groups_cfg.items():
