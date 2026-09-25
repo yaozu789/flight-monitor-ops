@@ -83,6 +83,29 @@ class FlattenTests(unittest.TestCase):
         self.assertNotIn("SFO", text)
 
 
+class VerifierQueryTests(unittest.TestCase):
+    def test_recheck_uses_grouped_airports(self):
+        """verify() and recheck_alert_detailed() query the watch's airport
+        groups, so an open-jaw itinerary (in NRT, back from HND) can match."""
+        from unittest import mock
+        import verifier
+        calls = []
+
+        def fake_query(o, d, dep, ret, cfg, **kw):
+            calls.append((o, d))
+            return []
+
+        watch = {"id": "japan", "absolute_cap_usd": 500,
+                 "origins": ["SFO", "OAK", "SJC"],
+                 "destinations": ["NRT", "HND", "KIX"]}
+        cand = {"origin": "SFO", "destination": "NRT", "fingerprint": "fp",
+                "depart_date": "2026-12-04", "return_date": "2026-12-11"}
+        with mock.patch.object(verifier.poller, "narrow_query", fake_query):
+            verifier.verify(None, watch, cand, None)
+            verifier.recheck_alert_detailed(cand, None, watch, None)
+        self.assertEqual(calls, [("SFO,OAK,SJC", "NRT,HND,KIX")] * 2)
+
+
 class RearmTests(unittest.TestCase):
     def test_rearm_replaces_whole_itinerary(self):
         """A cheaper, DIFFERENT flight in the same departure week replaces

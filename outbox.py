@@ -33,7 +33,9 @@ def _stops_text(stops) -> str:
         return "nonstop"
     if stops == 1:
         return "1 stop"
-    return f"{stops} stops"
+    # stops is the total over both directions (the search allows at most
+    # one stop EACH way), so say so rather than imply one long trip.
+    return f"{stops} stops total, both directions"
 
 
 def _watch_leg(watch: dict, plural_key: str, singular_key: str) -> str:

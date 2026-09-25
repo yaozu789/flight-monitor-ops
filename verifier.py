@@ -22,6 +22,17 @@ def _price(row: dict) -> float | None:
     return row.get("price_usd", row.get("price"))
 
 
+def _grouped_endpoints(watch: dict, origin, destination) -> tuple[str, str]:
+    """Recheck with the SAME grouped airports the collection used (e.g.
+    SFO,OAK,SJC -> NRT,HND,KIX), then match the exact itinerary by
+    fingerprint. Querying the candidate's own endpoints would force a
+    symmetric return (NRT->SFO) and miss open-jaw itineraries that return
+    from another airport in the group (HND->SFO)."""
+    origins = watch.get("origins") or [origin]
+    destinations = watch.get("destinations") or [destination]
+    return ",".join(origins), ",".join(destinations)
+
+
 def _cfg_for(watch: dict, origin: str | None, destination: str | None) -> dict:
     return {
         "origins": [origin],
@@ -80,8 +91,10 @@ def verify(db, watch, candidate, guard, *, top_n=3) -> tuple[bool, dict | None]:
     cap = watch["absolute_cap_usd"]
     depart = candidate["depart_date"]
     return_ = candidate["return_date"]
+    q_from, q_to = _grouped_endpoints(watch, candidate["origin"],
+                                      candidate["destination"])
     rows = poller.narrow_query(
-        candidate["origin"], candidate["destination"], depart, return_,
+        q_from, q_to, depart, return_,
         _cfg_for(watch, candidate["origin"], candidate["destination"]),
         top_n=top_n, attempt_category="verify")
     if not rows:
@@ -109,8 +122,10 @@ def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | Non
     cap = watch["absolute_cap_usd"]
     depart = alert_row["depart_date"]
     return_ = alert_row["return_date"]
+    q_from, q_to = _grouped_endpoints(watch, alert_row["origin"],
+                                      alert_row["destination"])
     rows = poller.narrow_query(
-        alert_row["origin"], alert_row["destination"], depart, return_,
+        q_from, q_to, depart, return_,
         _cfg_for(watch, alert_row["origin"], alert_row["destination"]),
         top_n=3, attempt_category="retry_reserve")
     if not rows:

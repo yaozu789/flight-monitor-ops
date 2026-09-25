@@ -25,6 +25,7 @@ CI (`.github/workflows/tests.yml`) runs the same suite on every push and PR. Its
 - `outbox.py` + `store.py`: states are `pending → handoff_prepared → relay_attempted_unconfirmed` (scheduler), and `user_confirmed` is human-only via `outbox-confirm`. There is no "sent" state, because Muse push gives no receipt. At most 2 handoffs, rechecked before a retry. Dedup is per (watch, departure week), re-alerting only on a drop of at least max($15, 5%).
 - `heartbeat.py`: healthchecks.io, pinged only on `--scheduled` runs. Success on a finished cycle, including legitimate no-ops. `/fail` on a crash, a non-zero return, 3 lock losses in a row, or 3 deadline stops in a row. The URL is read from the `HEALTHCHECKS_PING_URL` env var (on Muse: `.env`, mode 600), never logged.
 - fli convention: for round trips, **the outbound leg's price is the full round-trip total** (fli's own CLI and tests).
+- Itinerary endpoints are each direction's first departure and **final** arrival. Observations written before PR #17 stored the first leg's arrival (the layover) as `destination` for connecting flights, so their fingerprints differ from new rows. They are historical only (the live outbox was empty when this changed). Rechecks query the watch's grouped airports and match the exact fingerprint.
 
 ## Rules
 - Never commit `data/`, `*.db`, `.env`, tokens, or the ping URL.
