@@ -580,13 +580,19 @@ def enqueue_alert(db: sqlite3.Connection, *, alert_id: str, watch_id: str,
             return alert_id, "deduped"
         threshold = max(SIGNIFICANT_DROP_USD, SIGNIFICANT_DROP_PCT * baseline)
         if price_usd <= baseline - threshold:
+            # A cheaper deal in the same departure week may be a different
+            # itinerary: replace ALL itinerary fields, not just the price,
+            # so later rechecks verify the flight actually being alerted.
             db.execute(
                 """UPDATE outbox
-                   SET state='pending', price_usd=?, booking_url=?,
-                       message_text=?, last_price_usd=?, updated_at=?
+                   SET state='pending', fingerprint=?, origin=?, destination=?,
+                       depart_date=?, return_date=?, airline=?, stops=?,
+                       price_usd=?, booking_url=?, message_text=?,
+                       last_price_usd=?, updated_at=?
                    WHERE alert_id=?""",
-                (price_usd, booking_url, message_text, price_usd, now,
-                 alert_id))
+                (fingerprint, origin, destination, depart_date, return_date,
+                 airline, stops, price_usd, booking_url, message_text,
+                 price_usd, now, alert_id))
             db.commit()
             return alert_id, "rearmed"
     return alert_id, "deduped"

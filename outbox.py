@@ -33,7 +33,9 @@ def _stops_text(stops) -> str:
         return "nonstop"
     if stops == 1:
         return "1 stop"
-    return f"{stops} stops"
+    # stops is the total over both directions (the search allows at most
+    # one stop EACH way), so say so rather than imply one long trip.
+    return f"{stops} stops total, both directions"
 
 
 def _watch_leg(watch: dict, plural_key: str, singular_key: str) -> str:
@@ -53,12 +55,20 @@ def render_alert_message(watch, confirmation, fingerprint, first_seen_at) -> str
     "rechecked at <ts>", first-seen ts. Never uses the word "bookable" and
     never paraphrases safety claims beyond the data (no bookability claim).
     """
-    origin = _watch_leg(watch, "origins", "origin")
-    destination = _watch_leg(watch, "destinations", "destination")
+    # Actual airports from the rechecked itinerary; the watch's airport
+    # list is only a last resort (it would name e.g. SFO for an OAK fare).
+    origin = confirmation.get("origin") or _watch_leg(watch, "origins", "origin")
+    destination = (confirmation.get("destination")
+                   or _watch_leg(watch, "destinations", "destination"))
+    ret_from = confirmation.get("return_origin")
+    ret_to = confirmation.get("return_destination")
+    route = f"{origin} -> {destination}"
+    if (ret_from and ret_to) and (ret_from, ret_to) != (destination, origin):
+        route += f", returning {ret_from} -> {ret_to}"
     watch_id = watch.get("watch_id", watch.get("id", "watch"))
     lines = [
         f"Flight deal -- {watch_id}: ${confirmation['price_usd']:,.0f} round trip (USD)",
-        f"{origin} -> {destination}, {confirmation['depart_date']} -> "
+        f"{route}, {confirmation['depart_date']} -> "
         f"{confirmation['return_date']}",
         f"{confirmation.get('airline') or 'Unknown airline'} - "
         f"{_stops_text(confirmation.get('stops'))}",
@@ -98,8 +108,9 @@ def enqueue_from_confirmation(db, watch, candidate, confirmation) -> tuple[str, 
         stops=confirmation["stops"],
         booking_url=confirmation["booking_url"],
         message_text=message,
-        origin=candidate.get("origin"),
-        destination=candidate.get("destination"),
+        origin=confirmation.get("origin") or candidate.get("origin"),
+        destination=(confirmation.get("destination")
+                     or candidate.get("destination")),
     )
 
 
