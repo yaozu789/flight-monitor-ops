@@ -91,6 +91,67 @@ class PriceHistoryTests(unittest.TestCase):
         self.assertIn("ties the stored low", self.text(470.0, h))
         self.assertIn("$30 above the stored low", self.text(500.0, h))
 
+    def test_chart_link_encodes_stored_data_only(self):
+        """The chart URL carries exactly the stored daily lows, the cap and
+        the recheck -- decodable, no other data, no network call."""
+        import json
+        from urllib.parse import parse_qs, urlparse
+        for d, p in ((3, 520.0), (2, 505.0), (1, 470.0)):
+            self.obs(d, p)
+        h = self.hist()
+        url = outbox.history_chart_url(h, 431.0, cap=500)
+        parsed = urlparse(url)
+        self.assertEqual((parsed.scheme, parsed.netloc, parsed.path),
+                         ("https", "quickchart.io", "/chart"))
+        cfg = json.loads(parse_qs(parsed.query)["c"][0])
+        sets = {d["label"]: d["data"] for d in cfg["data"]["datasets"]}
+        self.assertEqual(sets["daily low (stored)"], [520, 505, 470, None])
+        self.assertEqual(sets["this recheck"], [None, None, None, 431])
+        self.assertEqual(sets["cap $500"], [500] * 4)
+        self.assertEqual(cfg["data"]["labels"][-1], "recheck")
+        self.assertIn("SFO-NRT", cfg["options"]["title"]["text"])
+        text = outbox.render_alert_message(
+            {"id": "japan", "absolute_cap_usd": 500},
+            {**CONF, "price_usd": 431.0}, "fp", "then", history=h)
+        self.assertIn("Chart: https://quickchart.io/chart?c=", text)
+        self.assertLess(len(url), 2000)
+
+    def test_no_chart_without_history(self):
+        self.assertIsNone(outbox.history_chart_url(self.hist(), 431.0, 500))
+        self.assertNotIn("Chart:", self.text(431.0, self.hist()))
+
+    def test_bad_stored_price_never_blocks_alert(self):
+        """Non-finite prices are left out of the chart, and if the chart
+        builder fails for any reason the alert still renders, without it."""
+        from unittest import mock
+        h = {"daily_lows": [("2026-09-24", float("inf")), ("2026-09-25", 500.0)],
+             "origin": "SFO", "destination": "NRT", "depart_from": "a",
+             "depart_to": "b", "duration": 7}
+        self.assertNotIn("Infinity", outbox.history_chart_url(h, 431.0, 500))
+        self.assertIsNone(outbox.history_chart_url(
+            {**h, "daily_lows": [("2026-09-24", float("nan"))]}, 431.0, 500))
+        for d, p in ((3, 520.0), (2, 505.0), (1, 470.0)):
+            self.obs(d, p)
+        with mock.patch.object(outbox, "history_chart_url",
+                               side_effect=ValueError("bad data")):
+            text = outbox.render_alert_message(
+                {"id": "japan", "absolute_cap_usd": 500},
+                {**CONF, "price_usd": 431.0}, "fp", "then",
+                history=self.hist())
+        self.assertIn("Flight deal", text)
+        self.assertIn("Stored history", text)
+        self.assertNotIn("Chart:", text)
+
+    def test_full_window_url_length(self):
+        from datetime import date, timedelta
+        days = [((date(2026, 9, 1) + timedelta(days=i)).isoformat(), 400.0 + i)
+                for i in range(15)]
+        h = {"daily_lows": days, "origin": "SFO", "destination": "NRT",
+             "depart_from": "2026-12-01", "depart_to": "2026-12-07",
+             "duration": 7}
+        self.assertLess(len(outbox.history_chart_url(h, 431.0, 500)), 2000)
+        self.assertIsNotNone(outbox.history_chart_url(h, 431.0, None))
+
     def test_no_history_says_so(self):
         self.assertIn("none yet", self.text(431.0, self.hist()))
 
