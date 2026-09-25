@@ -52,9 +52,13 @@ class HeartbeatPingTest(unittest.TestCase):
             self.sent_urls.append((url, timeout))
 
         heartbeat._send = fake_send
+        self.sleeps = []
+        self._orig_sleep = heartbeat._sleep
+        heartbeat._sleep = self.sleeps.append  # no real waiting in tests
 
     def tearDown(self):
         heartbeat._send = self._orig_send
+        heartbeat._sleep = self._orig_sleep
         heartbeat.stop_capture()  # never let capture leak between tests
         if self._orig_env is None:
             os.environ.pop("HEALTHCHECKS_PING_URL", None)
@@ -69,7 +73,7 @@ class HeartbeatPingTest(unittest.TestCase):
         self.assertEqual(len(self.sent_urls), 1)
         url, timeout = self.sent_urls[0]
         self.assertEqual(url, FAKE_URL)  # exactly the env URL, no /fail suffix
-        self.assertEqual(timeout, 10)
+        self.assertEqual(timeout, heartbeat.PING_TIMEOUT_S)
 
     def test_ping_fail_appends_fail_suffix(self):
         result = heartbeat.ping_fail()
@@ -167,10 +171,50 @@ class HeartbeatPingTest(unittest.TestCase):
             row = store.latest_health(db, "hc_ping")
             self.assertIsNotNone(row)
             self.assertEqual(row["ok"], 0)
-            self.assertEqual(row["detail"], "hc ping failed: ConnectionError")
+            self.assertEqual(
+                row["detail"],
+                "hc ping failed after 3 attempts: "
+                "ConnectionError, ConnectionError, ConnectionError")
             self.assertNotIn("example.invalid", row["detail"])
         finally:
             db.close()
+
+    def test_transient_timeout_is_retried(self):
+        """A ping that times out, then succeeds, is recorded ok -- one
+        stalled request through Muse's proxy must not lose the heartbeat."""
+        calls = []
+
+        def flaky_send(url, timeout=10):
+            assert url.startswith(SAFETY_PREFIX)
+            calls.append(url)
+            if len(calls) < 3:
+                raise TimeoutError("read timed out")
+
+        heartbeat._send = flaky_send
+        db = make_db()
+        try:
+            result = heartbeat.ping_success(db)
+            self.assertEqual(result, {"ping": "ok", "url_set": True})
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(self.sleeps, [heartbeat.PING_RETRY_DELAY_S] * 2)
+            row = store.latest_health(db, "hc_ping")
+            self.assertEqual(row["ok"], 1)
+            self.assertIn("attempt 3", row["detail"])
+            self.assertNotIn("example.invalid", row["detail"])
+        finally:
+            db.close()
+
+    def test_retries_are_bounded(self):
+        calls = []
+
+        def dead_send(url, timeout=10):
+            calls.append(url)
+            raise TimeoutError("read timed out")
+
+        heartbeat._send = dead_send
+        result = heartbeat.ping_success()
+        self.assertEqual(result, {"ping": "failed", "url_set": True})
+        self.assertEqual(len(calls), heartbeat.PING_ATTEMPTS)
 
     # -- capture mode ------------------------------------------------------
 
