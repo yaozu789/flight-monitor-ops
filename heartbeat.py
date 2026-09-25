@@ -28,6 +28,13 @@ import store  # noqa: E402  (project store.py: the v2 contract with add_health)
 
 PING_ENV_VAR = "HEALTHCHECKS_PING_URL"
 
+# Muse's egress proxy intermittently stalls hc-ping.com (observed ReadTimeouts
+# on 2 of 3 pings with the old single 10 s attempt). A lost success ping can
+# raise a false "down" alert, so retry a few times with a longer timeout.
+PING_ATTEMPTS = 3
+PING_TIMEOUT_S = 20
+PING_RETRY_DELAY_S = 5
+
 # In-memory capture for tests: when not None, pings are recorded instead of
 # sent. Never used in production paths.
 _capture: list[tuple[str, str]] | None = None
@@ -41,7 +48,14 @@ def _ping_url() -> str | None:
     return os.environ.get(PING_ENV_VAR) or None
 
 
-def _send(url: str, timeout: int = 10) -> None:
+def _sleep(seconds: float) -> None:
+    """Overridable delay between ping attempts (tests make it instant)."""
+    import time
+
+    time.sleep(seconds)
+
+
+def _send(url: str, timeout: int = PING_TIMEOUT_S) -> None:
     """Single overridable send primitive (tests monkeypatch this).
 
     GET the URL and raise for non-2xx. Anything raised propagates to the
@@ -62,7 +76,7 @@ def _record(db, ok: bool, detail: str) -> None:
         pass
 
 
-def _ping(kind: str, db=None, timeout: int = 10) -> dict:
+def _ping(kind: str, db=None, timeout: int = PING_TIMEOUT_S) -> dict:
     """Shared implementation for ping_success ("success") and ping_fail ("fail").
 
     Never raises. Returns {"ping": "ok"|"failed"|"skipped", "url_set": bool},
@@ -84,19 +98,28 @@ def _ping(kind: str, db=None, timeout: int = 10) -> dict:
         _record(db, True, "hc ping ok")
         return {"ping": "ok", "url_set": True, "captured": True}
 
-    try:
-        _send(target, timeout=timeout)
-    except Exception as e:  # noqa: BLE001 - heartbeat must never raise
-        # Exception class name only: the URL (or its value inside an error
-        # message) must never leak.
-        _record(db, False, f"hc ping failed: {type(e).__name__}")
-        return {"ping": "failed", "url_set": True}
+    errors: list[str] = []
+    for attempt in range(1, PING_ATTEMPTS + 1):
+        try:
+            _send(target, timeout=timeout)
+        except Exception as e:  # noqa: BLE001 - heartbeat must never raise
+            # Exception class name only: the URL (or its value inside an
+            # error message) must never leak.
+            errors.append(type(e).__name__)
+            if attempt < PING_ATTEMPTS:
+                _sleep(PING_RETRY_DELAY_S)
+            continue
+        detail = "hc ping ok" if attempt == 1 else (
+            f"hc ping ok on attempt {attempt} (after {', '.join(errors)})")
+        _record(db, True, detail)
+        return {"ping": "ok", "url_set": True}
 
-    _record(db, True, "hc ping ok")
-    return {"ping": "ok", "url_set": True}
+    _record(db, False, f"hc ping failed after {PING_ATTEMPTS} attempts: "
+                       f"{', '.join(errors)}")
+    return {"ping": "failed", "url_set": True}
 
 
-def ping_success(db=None, timeout: int = 10) -> dict:
+def ping_success(db=None, timeout: int = PING_TIMEOUT_S) -> dict:
     """GET <url> (plain ping = success).
 
     Returns {"ping": "ok"|"failed"|"skipped", "url_set": bool}. "skipped"
@@ -107,7 +130,7 @@ def ping_success(db=None, timeout: int = 10) -> dict:
     return _ping("success", db=db, timeout=timeout)
 
 
-def ping_fail(db=None, timeout: int = 10) -> dict:
+def ping_fail(db=None, timeout: int = PING_TIMEOUT_S) -> dict:
     """GET <url>/fail. Same return contract as ping_success."""
     return _ping("fail", db=db, timeout=timeout)
 
