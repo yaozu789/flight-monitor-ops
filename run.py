@@ -28,7 +28,7 @@ import os
 import sys
 import time
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -39,7 +39,12 @@ import yaml  # noqa: E402
 import heartbeat  # noqa: E402
 import sentinel  # noqa: E402
 import transport  # noqa: E402
-from budget import PER_RUN_MAX, BudgetExhausted, BudgetGuard  # noqa: E402
+from budget import (  # noqa: E402
+    CATEGORY_CAPS,
+    PER_RUN_MAX,
+    BudgetExhausted,
+    BudgetGuard,
+)
 from canary import run_canary  # noqa: E402
 from outbox import (  # noqa: E402
     RELAYABLE_ACTIONS,
@@ -51,6 +56,8 @@ from poller import narrow_query  # noqa: E402
 from scorer import score_new_observations  # noqa: E402
 from store import (  # noqa: E402
     DeadlineExceeded,
+    log_verify,
+    verify_logged,
     acquire_lock,
     add_alert,
     add_health,
@@ -68,7 +75,6 @@ from store import (  # noqa: E402
     reset_lock_loss,
     set_outbox_user_confirmed,
     slot_id,
-    slot_start_ts,
     sync_watches,
     update_outbox_state,
     utcnow_iso,
@@ -85,6 +91,10 @@ LOCK_TTL_S = 1500
 # instead of wedging the lock until TTL expiry. Checked at loop tops in
 # collection code via the deadline_fn passed to fn.
 RUN_DEADLINE_S = 1200
+# How far back the leftover verify pass looks for unrechecked candidates.
+LEFTOVER_LOOKBACK_HOURS = 24
+# Verify attempts the backlog pass leaves for burst revalidations (2 each).
+BURST_VERIFY_RESERVE = 4
 # A deadline stop is a designed bound, so it pings success -- unless it
 # keeps happening: this many consecutive deadline slots ping /fail instead.
 DEADLINE_FAIL_STREAK = 3
@@ -465,7 +475,7 @@ def _finish_verified(db, slot, run_start, verified_deals, new_ids,
 
 
 def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
-                       deadline_fn=None):
+                       deadline_fn=None, verify_reserve=0):
     """Score observations written since *since_iso*, verify each under-cap
     candidate (verify budget), and enqueue confirmed deals.
 
@@ -473,20 +483,47 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
     *verified_deals*; returns {watch_id: [relayable alert IDs]}.
     """
     per_watch: dict[str, list[str]] = {}
+    try:
+        _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
+                     deadline_fn, per_watch, verify_reserve)
+    except BudgetExhausted as e:
+        # The verify category's own cap ends only this pass; collection and
+        # the rest of the run continue. Unverified candidates stay in the
+        # lookback window for a later run.
+        if getattr(e, "scope", None) != "category":
+            raise
+    return per_watch
+
+
+def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
+                 deadline_fn, per_watch, verify_reserve=0):
     for w in targets:
         candidates = score_new_observations(
             db, w, since_iso, cooldown_hours=w.get("cooldown_hours", 24))
-        watch_new: list[str] = []
+        watch_new: list[str] = per_watch.setdefault(w["id"], [])
         for c in candidates:
+            if verify_logged(db, w["id"], c["fingerprint"], c["observed_at"]):
+                continue  # this observation was already rechecked
+            if (verify_reserve
+                    and guard.spent_today("verify") + 2
+                    > CATEGORY_CAPS["verify"] - verify_reserve):
+                return  # leave the rest of the verify cap for bursts
             _check_deadline(deadline_fn)
             ok, conf = verify(db, w, c, guard)
             if not ok:
+                log_verify(db, w["id"], c["fingerprint"], c["observed_at"],
+                           "not_confirmed")
                 continue  # unknown: never alert on an unverified fare
+            # Durable handoff FIRST, then the scoring record, then the
+            # verify log: a failure before the log leaves the observation
+            # eligible for a later run instead of silently skipped.
+            aid, action = enqueue_from_confirmation(db, w, c, conf)
             # The alerts table stays the scoring-history record (the scorer's
             # cooldown reads it); delivery state lives in the outbox.
             add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
                       verified_at=utcnow_iso())
-            aid, action = enqueue_from_confirmation(db, w, c, conf)
+            log_verify(db, w["id"], c["fingerprint"], c["observed_at"],
+                       "confirmed")
             # v3: dedup is per (watch, departure week). A deduped candidate
             # was already outboxed without a meaningful drop and must NOT
             # be emitted to relay again -- only inserted and rearmed
@@ -503,8 +540,6 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
                 "price_usd": conf["price_usd"],
                 "depart_date": conf["depart_date"], "duration": duration,
                 "cap": w["absolute_cap_usd"]})
-        per_watch[w["id"]] = watch_new
-    return per_watch
 
 
 def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
@@ -543,12 +578,12 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 
-    # 3-4. Retry pass, then leftover verify: the previous slot's candidates
-    # that it did not
-    # verify itself. Candidates it did verify are skipped by the
-    # alerts-table cooldown.
-    prev_start_iso = datetime.fromtimestamp(
-        slot_start_ts(slot - 1), tz=timezone.utc).isoformat()
+    # 3-4. Retry pass, then leftover verify: under-cap observations from the
+    # last LEFTOVER_LOOKBACK_HOURS not yet rechecked (e.g. an earlier run
+    # ran out of verify budget or hit its deadline). verify_log makes each
+    # observation verified at most once.
+    prev_start_iso = (datetime.now(timezone.utc)
+                      - timedelta(hours=LEFTOVER_LOOKBACK_HOURS)).isoformat()
     new_ids: list[str] = []
     retries: dict = {"retry_ids": [], "retired": [], "unknown": []}
     retry_ids: list[str] = retries["retry_ids"]
@@ -565,9 +600,13 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
             reprepare_retries(db, slot, retry_ids)
             reprepared = True
 
+        # The backlog pass leaves BURST_VERIFY_RESERVE of the daily verify
+        # cap for burst revalidations; the same-slot pass (fresh deals) is
+        # not limited.
         per_watch = _verify_candidates(db, targets, guard, prev_start_iso,
                                        new_ids, verified_deals,
-                                       deadline_fn=deadline_fn)
+                                       deadline_fn=deadline_fn,
+                                       verify_reserve=BURST_VERIFY_RESERVE)
 
         # 5. Collect, paced: sentinels > bursts > background.
         collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,

@@ -541,6 +541,59 @@ class TestCollectPriority(SentinelTestBase):
                                       allowance=10)
         self.assertEqual((used, calls), (0, []))
 
+    def test_burst_revalidates_when_resumed_next_day(self):
+        """A burst resumed on a later UTC day rechecks the trigger fare
+        first, without moving its resume point back."""
+        from datetime import datetime, timedelta as td, timezone as tz
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        tid = store.queue_trigger(
+            self.db, kind="under_cap", group_id="japan_fall_2026",
+            depart_week=store.depart_week(depart), depart_date=depart,
+            duration=7, price_usd=400.0, fingerprint="fp-day", slot=1)
+        trig = [t for t in store.due_triggers(self.db, 2) if t["id"] == tid][0]
+        store.init_burst_progress(
+            self.db, tid, "japan_fall_2026", trig["depart_week"],
+            (datetime.now(tz.utc) + td(hours=12)).isoformat())
+        store.save_burst_progress(self.db, tid, next_step=5, attempts_used=10)
+        self.db.execute("UPDATE burst_progress SET updated_at=? "
+                        "WHERE trigger_id=?", ("2000-01-01T00:00:00+00:00", tid))
+        self.db.commit()
+        calls = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append((category, cell["depart_date"], cell["duration"]))
+            return (500.0, 2)  # fare gone: above the trigger price
+
+        self.patch(sentinel, "check_cell", fake_check)
+        sentinel.execute_burst(self.db, trig, self.guard(),
+                               GROUPS["japan_fall_2026"], 3, allowance=10)
+        self.assertEqual(calls, [("verify", depart, 7)])
+        self.assertEqual(store.get_burst_progress(self.db, tid)["status"],
+                         "dropped")
+
+    def test_partial_progress_does_not_count_as_revalidated(self):
+        """Progress saved today WITHOUT a passed recheck (e.g. a budget stop
+        right after it) still forces a recheck on the next resume."""
+        from datetime import datetime, timedelta as td, timezone as tz
+        depart = (date.fromisoformat(TODAY) + timedelta(days=100)).isoformat()
+        tid = store.queue_trigger(
+            self.db, kind="under_cap", group_id="japan_fall_2026",
+            depart_week=store.depart_week(depart), depart_date=depart,
+            duration=7, price_usd=400.0, fingerprint="fp-part", slot=1)
+        trig = [t for t in store.due_triggers(self.db, 2) if t["id"] == tid][0]
+        store.init_burst_progress(
+            self.db, tid, "japan_fall_2026", trig["depart_week"],
+            (datetime.now(tz.utc) + td(hours=12)).isoformat())
+        store.save_burst_progress(self.db, tid, next_step=5, attempts_used=10)
+        calls = []
+        self.patch(sentinel, "check_cell",
+                   lambda db, cell, *a, category, **k:
+                   calls.append(category) or (500.0, 2))
+        sentinel.execute_burst(self.db, trig, self.guard(),
+                               GROUPS["japan_fall_2026"], 3, allowance=10)
+        self.assertEqual(calls, ["verify"])
+
     def test_sentinels_before_bursts_before_background(self):
         # v3 group 4: collection priority is sentinels -> bursts ->
         # background (bursts no longer jump the queue).

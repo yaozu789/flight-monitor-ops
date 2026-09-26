@@ -4,6 +4,7 @@ Verifies the collection pipeline ordering in run.cmd_check without any
 network: sentinel.collect and the poller are stubbed, the fake transport
 guard is installed so any accidental real send would fail loudly.
 """
+import io
 import os
 import sys
 import unittest
@@ -412,6 +413,134 @@ class Stage4OrchestrationTests(unittest.TestCase):
                                         "destinations": ["NRT"]})
         self.assertEqual(default["window_days"], (90, 270))
         self.assertEqual(default["durations"], (5, 14))
+
+    def _stub_collection(self):
+        return [mock.patch.object(fm_sentinel, "mint_sentinels", return_value=0),
+                mock.patch.object(fm_sentinel, "ensure_background_grid",
+                                  return_value=0),
+                mock.patch.object(fm_sentinel, "collect",
+                                  lambda *a, **k: {"attempts": 0, "bursts": [],
+                                                   "sentinels": 0,
+                                                   "background": 0,
+                                                   "drop_triggers": 0}),
+                mock.patch.object(fm_sentinel, "detect_under_cap_triggers",
+                                  return_value=0)]
+
+    def _run_check(self, db, guard, verify_fn):
+        import contextlib
+        with contextlib.ExitStack() as st:
+            for p_ in self._stub_collection():
+                st.enter_context(p_)
+            st.enter_context(mock.patch.object(fm_run, "verify", verify_fn))
+            st.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            return fm_run.cmd_check(
+                SimpleNamespace(cmd="check", scheduled=False, watch="w1"),
+                db, [WATCH], guard)
+
+    def _obs(self, db, hours_ago, price=420.0, dep="2026-11-01"):
+        from datetime import datetime, timedelta, timezone
+        store.add_observation(
+            db, watch_id="w1", origin="SFO", destination="JFK",
+            depart_date=dep, return_date=dep[:8] + "08", airline="UA",
+            stops=0, cabin="economy", price_usd=price, booking_url="",
+            observed_at=(datetime.now(timezone.utc)
+                         - timedelta(hours=hours_ago)).isoformat())
+
+    def test_deferred_candidate_is_verified_later(self):
+        """An under-cap observation from hours ago that no run managed to
+        recheck (budget/deadline) is still picked up (audit #18)."""
+        db, guard = _ctx(self)
+        self._obs(db, hours_ago=5)
+        calls = []
+
+        def v(db_, w, c, g, **k):
+            calls.append(c["fingerprint"])
+            return False, None
+
+        self._run_check(db, guard, v)
+        self.assertEqual(len(calls), 1)
+
+    def test_each_observation_verified_once(self):
+        db, guard = _ctx(self)
+        self._obs(db, hours_ago=5)
+        calls = []
+
+        def v(db_, w, c, g, **k):
+            calls.append(c["observed_at"])
+            return False, None
+
+        self._run_check(db, guard, v)
+        self._run_check(db, guard, v)
+        self.assertEqual(len(calls), 1)          # not re-verified
+        self._obs(db, hours_ago=0)               # fresh evidence
+        self._run_check(db, guard, v)
+        self.assertEqual(len(calls), 2)
+
+    def test_verify_category_cap_does_not_stop_run(self):
+        from budget import BudgetExhausted
+        db, guard = _ctx(self)
+        self._obs(db, hours_ago=0)  # inside the old and new windows alike
+        collected = []
+
+        def v(*a, **k):
+            raise BudgetExhausted("category", "verify", 24, 24)
+
+        import contextlib
+        with contextlib.ExitStack() as st:
+            for p_ in self._stub_collection()[:2] + self._stub_collection()[3:]:
+                st.enter_context(p_)
+            st.enter_context(mock.patch.object(
+                fm_sentinel, "collect",
+                lambda *a, **k: collected.append(1) or {
+                    "attempts": 0, "bursts": [], "sentinels": 0,
+                    "background": 0, "drop_triggers": 0}))
+            st.enter_context(mock.patch.object(fm_run, "verify", v))
+            st.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            rc = fm_run.cmd_check(
+                SimpleNamespace(cmd="check", scheduled=False, watch="w1"),
+                db, [WATCH], guard)
+        self.assertEqual((rc, collected), (0, [1]))
+
+    def test_failed_enqueue_leaves_observation_eligible(self):
+        """If queuing the confirmed alert fails, the observation is NOT
+        logged as verified, so a later run retries it."""
+        db, guard = _ctx(self)
+        self._obs(db, hours_ago=1)
+        ok = lambda *a, **k: (True, {  # noqa: E731
+            "price_usd": 400.0, "depart_date": "2026-11-01",
+            "return_date": "2026-11-08", "airline": "UA", "stops": 0,
+            "booking_url": "", "observed_at": "now",
+            "origin": "SFO", "destination": "JFK"})
+        with mock.patch.object(fm_run, "enqueue_from_confirmation",
+                               side_effect=RuntimeError("disk full")):
+            with self.assertRaises(RuntimeError):
+                self._run_check(db, guard, ok)
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) AS c FROM verify_log").fetchone()["c"], 0)
+        self._run_check(db, guard, ok)
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) AS c FROM outbox").fetchone()["c"], 1)
+
+    def test_backlog_leaves_verify_reserve_for_bursts(self):
+        db, guard = _ctx(self)
+        for i in range(3):
+            self._obs(db, hours_ago=2 + i, dep=f"2026-11-0{i + 1}")
+        for _ in range(19):  # 19 + 2 > 24 - 4: backlog must stop
+            guard.reserve("verify")
+        calls = []
+        self._run_check(db, guard,
+                        lambda *a, **k: calls.append(1) or (False, None))
+        self.assertEqual(calls, [])
+
+    def test_verify_log_is_per_watch(self):
+        store.init_db  # noqa: B018 - module import check
+        db, _ = _ctx(self)
+        store.log_verify(db, "w1", "fp", "2026-09-25T00:00:00+00:00",
+                         "not_confirmed")
+        self.assertTrue(store.verify_logged(db, "w1", "fp",
+                                            "2026-09-25T00:00:00+00:00"))
+        self.assertFalse(store.verify_logged(db, "w2", "fp",
+                                             "2026-09-25T00:00:00+00:00"))
 
     def test_tied_observations_score_once(self):
         """Rows of one fingerprint sharing an observed_at (collection stamps
