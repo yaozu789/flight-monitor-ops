@@ -241,6 +241,23 @@ class RunLifecycleTests(unittest.TestCase):
         store.finish_slot(db, 116, "deadline")
         self.assertEqual(store.deadline_streak(db, max_gap=4), 1)
 
+    def test_broad_is_disabled_before_lock_and_slot(self):
+        """broad answers a no-op without the lock, a slot claim, a drain,
+        or any send, so a same-slot check still collects."""
+        import contextlib
+        import io
+        import json as _json
+        db, guard = self._ctx()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = fm_run.cmd_broad(args_for("broad", False), db, [WATCH], guard)
+        self.assertEqual(rc, 0)
+        self.assertEqual(_json.loads(out.getvalue())["reason"],
+                         "broad_scan_disabled")
+        self.assertFalse(store.slot_done(db, store.slot_id()))
+        self.assertIsNone(store.lock_holder(db))
+        self.assertEqual(guard.spent_today(), 0)
+
     def test_deadline_shorter_than_lock_ttl(self):
         """The deadline must stay below the lock TTL so a stopped run
         never wedges the lock for the next slot."""
