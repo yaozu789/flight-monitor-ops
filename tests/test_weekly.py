@@ -81,7 +81,7 @@ class BuildReportTests(unittest.TestCase):
         self.assertIn("2 fares stored on 2 day(s)", text)
         self.assertIn("nyc (cap $250)", text)
         self.assertIn("Prior 7 days: no fares stored.", text)
-        self.assertIn("Deal alerts this week: none", text)
+        self.assertIn("Deal alerts handed off this week: none", text)
         self.assertIn("Google requests: 3 in 7 days", text)
         self.assertTrue(text.endswith("Weekly report: 2026-W40"))
         url = next(l for l in text.splitlines() if l.startswith("Chart"))
@@ -98,29 +98,48 @@ class BuildReportTests(unittest.TestCase):
         self.assertNotIn("Chart", text)
 
 
-class PrepareTests(unittest.TestCase):
-    def test_emitted_at_most_twice_until_marked(self):
-        db = fresh_db(self)
+class PrepareClaimTests(unittest.TestCase):
+    def setUp(self):
+        self.db = fresh_db(self)
+        self.addCleanup(setattr, weekly, "_armed_week", None)
+
+    def emits(self):
+        return self.db.execute(
+            "SELECT emits FROM weekly_reports").fetchone()["emits"]
+
+    def test_not_stored_before_due(self):
         early = MON_DUE - timedelta(minutes=1)
-        self.assertIsNone(weekly.prepare(db, WATCHES, 100, now=early))
-        self.assertIsNone(db.execute(
+        self.assertIsNone(weekly.prepare(self.db, WATCHES, now=early))
+        self.assertIsNone(weekly.claim(self.db, 100))
+        self.assertIsNone(self.db.execute(
             "SELECT 1 FROM weekly_reports").fetchone())
-        self.assertIsNotNone(weekly.prepare(db, WATCHES, 100, now=MON_DUE))
-        # Same slot again: no second emit, but the batch still carries it.
-        self.assertIsNone(weekly.prepare(db, WATCHES, 100, now=MON_DUE))
-        self.assertEqual(weekly.for_slot(db, 100)["week"], "2026-W40")
-        self.assertIsNotNone(weekly.prepare(db, WATCHES, 104, now=MON_DUE))
-        self.assertIsNone(weekly.for_slot(db, 100))
-        self.assertIsNone(weekly.prepare(db, WATCHES, 108, now=MON_DUE))
-        self.assertIsNone(weekly.for_slot(db, 108))
+
+    def test_emit_counted_at_claim_not_prepare(self):
+        """A run killed between prepare and printing spends no emit."""
+        weekly.prepare(self.db, WATCHES, now=MON_DUE)
+        self.assertEqual(self.emits(), 0)
+        self.assertEqual(weekly.claim(self.db, 100)["week"], "2026-W40")
+        self.assertEqual(self.emits(), 1)
+
+    def test_once_per_invocation_and_slot_max_two(self):
+        weekly.prepare(self.db, WATCHES, now=MON_DUE)
+        self.assertIsNotNone(weekly.claim(self.db, 100))
+        self.assertIsNone(weekly.claim(self.db, 100))  # disarmed
+        weekly.prepare(self.db, WATCHES, now=MON_DUE)  # same slot, new run
+        self.assertIsNone(weekly.claim(self.db, 100))
+        weekly.prepare(self.db, WATCHES, now=MON_DUE)
+        self.assertIsNotNone(weekly.claim(self.db, 104))
+        weekly.prepare(self.db, WATCHES, now=MON_DUE)
+        self.assertIsNone(weekly.claim(self.db, 108))  # cap reached
+        self.assertEqual(self.emits(), 2)
 
     def test_mark_stops_emits(self):
-        db = fresh_db(self)
-        weekly.prepare(db, WATCHES, 100, now=MON_DUE)
-        self.assertTrue(weekly.mark(db, "2026-W40"))
-        self.assertFalse(weekly.mark(db, "2026-W40"))
-        self.assertIsNone(weekly.for_slot(db, 100))
-        self.assertIsNone(weekly.prepare(db, WATCHES, 104, now=MON_DUE))
+        weekly.prepare(self.db, WATCHES, now=MON_DUE)
+        weekly.claim(self.db, 100)
+        self.assertTrue(weekly.mark(self.db, "2026-W40"))
+        self.assertFalse(weekly.mark(self.db, "2026-W40"))
+        weekly.prepare(self.db, WATCHES, now=MON_DUE)
+        self.assertIsNone(weekly.claim(self.db, 104))
 
 
 class ScheduledRunTests(unittest.TestCase):
@@ -141,6 +160,7 @@ class ScheduledRunTests(unittest.TestCase):
                                     return_value="2026-W40")
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.addCleanup(setattr, weekly, "_armed_week", None)
 
     def run_check(self, scheduled, fn=lambda *a, **k: 0):
         out = io.StringIO()
@@ -170,6 +190,14 @@ class ScheduledRunTests(unittest.TestCase):
         self.assertEqual(doc["reason"], "deadline")
         self.assertEqual(doc["handoff"]["alerts"], [])
         self.assertEqual(doc["handoff"]["weekly_report"]["week"], "2026-W40")
+
+    def test_repeat_runs_in_slot_do_not_resend(self):
+        store.claim_slot(self.db, store.slot_id(), "check")
+        _, out = self.run_check(True)
+        self.assertIn("weekly_report", json.loads(out)["handoff"])
+        for scheduled in (True, False):
+            _, out = self.run_check(scheduled)
+            self.assertNotIn("weekly_report", json.loads(out)["handoff"])
 
     def test_manual_run_does_not_prepare(self):
         store.claim_slot(self.db, store.slot_id(), "check")

@@ -142,10 +142,19 @@ def _handoff_payload(db, slot, alert_ids, **extra) -> dict:
                                 f"Alert: {r['alert_id']} event {r['event_no']}")}
                    for r in batch],
         **({"weekly_report": report}
-           if (report := weekly.for_slot(db, slot)) else {}),
+           if (report := _claim_report(db, slot)) else {}),
         **extra,
         "agent_instruction": RELAY_INSTRUCTION,
     }
+
+
+def _claim_report(db, slot):
+    """The weekly report armed for this run, if any; never blocks alerts."""
+    try:
+        return weekly.claim(db, slot)
+    except Exception as e:  # noqa: BLE001
+        _note(db, "weekly_report", f"{type(e).__name__}: {e}")
+        return None
 
 
 def _noop(reason: str, **extra) -> int:
@@ -250,7 +259,7 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             # The weekly report (no network) rides this run's relay batch,
             # including no-op and stop outputs.
             try:
-                weekly.prepare(db, watches, slot)
+                weekly.prepare(db, watches)
             except Exception as e:  # noqa: BLE001 - never block collection
                 add_health(db, "weekly_report", False,
                            f"{type(e).__name__}: {e}")

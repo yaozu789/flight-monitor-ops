@@ -143,11 +143,12 @@ def build_report(db, watches, now: datetime, week: str) -> str:
         """SELECT watch_id, COUNT(*) AS n FROM outbox
            WHERE prepared_at >= ? GROUP BY watch_id ORDER BY watch_id""",
         (since.isoformat(),)).fetchall()
-    lines.append("Deal alerts this week: " + (", ".join(
+    lines.append("Deal alerts handed off this week: " + (", ".join(
         f"{r['watch_id']} {r['n']}" for r in alerts) or "none"))
     used = db.execute(
         "SELECT COALESCE(SUM(attempts), 0) AS n FROM budget_ledger "
-        "WHERE day > ?", (since.date().isoformat(),)).fetchone()["n"]
+        "WHERE created_at >= ?",
+        (since.isoformat(timespec="seconds"),)).fetchone()["n"]
     throttles = db.execute(
         "SELECT COUNT(*) AS n FROM health WHERE check_name = 'throttle' "
         "AND ok = 0 AND checked_at >= ?", (since.isoformat(),)).fetchone()["n"]
@@ -160,9 +161,16 @@ def build_report(db, watches, now: datetime, week: str) -> str:
     return "\n".join(lines)
 
 
-def prepare(db, watches, slot: int, now: datetime | None = None) -> dict | None:
-    """Store this week's report once it is due, and claim it for *slot* if it
-    is unrelayed and under its emit cap. Returns the claimed row or None."""
+# The week armed by prepare() in THIS process: claim() hands it to at most
+# one relay batch per invocation, so repeat or manual runs cannot re-send it.
+_armed_week: str | None = None
+
+
+def prepare(db, watches, now: datetime | None = None) -> str | None:
+    """Scheduled runs only: store this week's report once it is due and arm
+    it for this invocation's relay batch. Returns the week or None."""
+    global _armed_week
+    _armed_week = None
     now = now or datetime.now(timezone.utc)
     week = report_week(now)
     if week is None:
@@ -176,20 +184,25 @@ def prepare(db, watches, slot: int, now: datetime | None = None) -> dict | None:
             (week, build_report(db, watches, now, week),
              now.isoformat(timespec="seconds")))
         db.commit()
+    _armed_week = week
+    return week
+
+
+def claim(db, slot: int) -> dict | None:
+    """Called while building the relay batch, right before it is printed:
+    count one emit (unrelayed, under the cap, not already sent in *slot*)
+    and return the report for the batch. Disarms either way."""
+    global _armed_week
+    week, _armed_week = _armed_week, None
+    if week is None:
+        return None
     row = db.execute(
         """UPDATE weekly_reports SET emits = emits + 1, last_slot = ?
            WHERE week = ? AND relayed_at IS NULL AND emits < ?
              AND (last_slot IS NULL OR last_slot <> ?)
-           RETURNING *""", (slot, week, REPORT_MAX_EMITS, slot)).fetchone()
+           RETURNING week, message_text""",
+        (slot, week, REPORT_MAX_EMITS, slot)).fetchone()
     db.commit()
-    return dict(row) if row else None
-
-
-def for_slot(db, slot) -> dict | None:
-    """The report claimed for *slot* and not yet relayed, for the payload."""
-    row = db.execute(
-        """SELECT week, message_text FROM weekly_reports
-           WHERE last_slot = ? AND relayed_at IS NULL""", (slot,)).fetchone()
     return {"week": row["week"], "message": row["message_text"]} if row else None
 
 
