@@ -714,9 +714,14 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                            attempts=total, status=status)
 
     steps = list(_burst_steps(trigger, _durations(group_cfg)))
+    # Resuming on a later UTC day: recheck the trigger fare first, before
+    # spending a new day's budget on a deal that may already be gone.
+    revalidate_again = (next_step > 0
+                        and prog["updated_at"][:10] < store.today_str())
     try:
         for step_idx, kind, d_date, dur in steps:
-            if step_idx < next_step:
+            redo = revalidate_again and step_idx == 0
+            if step_idx < next_step and not redo:
                 continue  # already done in an earlier slot: resume point
             if cumulative + BURST_STEP_MAX_ATTEMPTS > BURST_MAX_ATTEMPTS:
                 break
@@ -728,7 +733,10 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
             price, used = _one_off(d_date, dur, category)
             total += used
             cumulative += used
-            next_step = step_idx + 1
+            if redo:
+                revalidate_again = False  # resume point stays where it was
+            else:
+                next_step = step_idx + 1
             if kind == "revalidate" and (price is None
                                         or price > trigger["price_usd"]):
                 store.mark_trigger(db, trigger["id"], "dropped")

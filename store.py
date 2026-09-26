@@ -208,6 +208,15 @@ CREATE INDEX IF NOT EXISTS idx_bursts_group_week ON bursts (group_id, depart_wee
 -- allowance (or the run deadline / budget) stops as "partial" and is
 -- resumed by later slots until 60 attempts, all steps, or expiry -- it is
 -- NEVER marked permanently done after one partial allowance.
+CREATE TABLE IF NOT EXISTS verify_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    observed_at TEXT NOT NULL,   -- the candidate observation that was checked
+    verified_at TEXT NOT NULL,
+    outcome TEXT NOT NULL        -- confirmed | not_confirmed
+);
+CREATE INDEX IF NOT EXISTS idx_verify_log_fp ON verify_log (fingerprint, observed_at);
 CREATE TABLE IF NOT EXISTS burst_progress (
     trigger_id INTEGER PRIMARY KEY REFERENCES triggers (id),
     group_id TEXT NOT NULL,
@@ -583,6 +592,28 @@ def price_history(db: sqlite3.Connection, watch_id: str, depart_date: str,
         out.update({"since": daily[0][0], "low": low, "low_day": low_day,
                     "median_daily_low": median, "recent": daily[-recent:]})
     return out
+
+
+def log_verify(db: sqlite3.Connection, watch_id: str, fingerprint: str,
+               observed_at: str, outcome: str) -> None:
+    """Record that the candidate observation (fingerprint, observed_at) was
+    rechecked, so it is verified at most once however long it stays in the
+    candidate lookback."""
+    db.execute(
+        """INSERT INTO verify_log (watch_id, fingerprint, observed_at,
+                                   verified_at, outcome)
+           VALUES (?, ?, ?, ?, ?)""",
+        (watch_id, fingerprint, observed_at, utcnow_iso(), outcome))
+    db.commit()
+
+
+def verify_logged(db: sqlite3.Connection, fingerprint: str,
+                  observed_at: str) -> bool:
+    """True when this fingerprint was already rechecked for an observation
+    at or after *observed_at* (a newer observation is fresh evidence)."""
+    return db.execute(
+        "SELECT 1 FROM verify_log WHERE fingerprint = ? AND observed_at >= ?",
+        (fingerprint, observed_at)).fetchone() is not None
 
 
 def first_seen(db: sqlite3.Connection, fingerprint: str) -> str | None:

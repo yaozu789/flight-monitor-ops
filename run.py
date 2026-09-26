@@ -28,7 +28,7 @@ import os
 import sys
 import time
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -51,6 +51,8 @@ from poller import narrow_query  # noqa: E402
 from scorer import score_new_observations  # noqa: E402
 from store import (  # noqa: E402
     DeadlineExceeded,
+    log_verify,
+    verify_logged,
     acquire_lock,
     add_alert,
     add_health,
@@ -68,7 +70,6 @@ from store import (  # noqa: E402
     reset_lock_loss,
     set_outbox_user_confirmed,
     slot_id,
-    slot_start_ts,
     sync_watches,
     update_outbox_state,
     utcnow_iso,
@@ -85,6 +86,8 @@ LOCK_TTL_S = 1500
 # instead of wedging the lock until TTL expiry. Checked at loop tops in
 # collection code via the deadline_fn passed to fn.
 RUN_DEADLINE_S = 1200
+# How far back the leftover verify pass looks for unrechecked candidates.
+LEFTOVER_LOOKBACK_HOURS = 24
 # A deadline stop is a designed bound, so it pings success -- unless it
 # keeps happening: this many consecutive deadline slots ping /fail instead.
 DEADLINE_FAIL_STREAK = 3
@@ -473,13 +476,31 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
     *verified_deals*; returns {watch_id: [relayable alert IDs]}.
     """
     per_watch: dict[str, list[str]] = {}
+    try:
+        _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
+                     deadline_fn, per_watch)
+    except BudgetExhausted as e:
+        # The verify category's own cap ends only this pass; collection and
+        # the rest of the run continue. Unverified candidates stay in the
+        # lookback window for a later run.
+        if getattr(e, "scope", None) != "category":
+            raise
+    return per_watch
+
+
+def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
+                 deadline_fn, per_watch):
     for w in targets:
         candidates = score_new_observations(
             db, w, since_iso, cooldown_hours=w.get("cooldown_hours", 24))
-        watch_new: list[str] = []
+        watch_new: list[str] = per_watch.setdefault(w["id"], [])
         for c in candidates:
+            if verify_logged(db, c["fingerprint"], c["observed_at"]):
+                continue  # this observation was already rechecked
             _check_deadline(deadline_fn)
             ok, conf = verify(db, w, c, guard)
+            log_verify(db, w["id"], c["fingerprint"], c["observed_at"],
+                       "confirmed" if ok else "not_confirmed")
             if not ok:
                 continue  # unknown: never alert on an unverified fare
             # The alerts table stays the scoring-history record (the scorer's
@@ -503,8 +524,6 @@ def _verify_candidates(db, targets, guard, since_iso, new_ids, verified_deals,
                 "price_usd": conf["price_usd"],
                 "depart_date": conf["depart_date"], "duration": duration,
                 "cap": w["absolute_cap_usd"]})
-        per_watch[w["id"]] = watch_new
-    return per_watch
 
 
 def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
@@ -543,12 +562,12 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 
-    # 3-4. Retry pass, then leftover verify: the previous slot's candidates
-    # that it did not
-    # verify itself. Candidates it did verify are skipped by the
-    # alerts-table cooldown.
-    prev_start_iso = datetime.fromtimestamp(
-        slot_start_ts(slot - 1), tz=timezone.utc).isoformat()
+    # 3-4. Retry pass, then leftover verify: under-cap observations from the
+    # last LEFTOVER_LOOKBACK_HOURS not yet rechecked (e.g. an earlier run
+    # ran out of verify budget or hit its deadline). verify_log makes each
+    # observation verified at most once.
+    prev_start_iso = (datetime.now(timezone.utc)
+                      - timedelta(hours=LEFTOVER_LOOKBACK_HOURS)).isoformat()
     new_ids: list[str] = []
     retries: dict = {"retry_ids": [], "retired": [], "unknown": []}
     retry_ids: list[str] = retries["retry_ids"]
