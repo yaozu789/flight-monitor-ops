@@ -123,7 +123,10 @@ def _handoff_payload(db, slot, alert_ids, **extra) -> dict:
         "slot_id": slot,
         "alerts": [{"alert_id": r["alert_id"], "event": r["event_no"],
                     "state": r["state"], "price_usd": r["price_usd"],
-                    "message": r["message_text"]}
+                    # The user-visible text carries the alert id and event,
+                    # so a confirmation names exactly the deal they saw.
+                    "message": (f"{r['message_text']}\n"
+                                f"Alert: {r['alert_id']} event {r['event_no']}")}
                    for r in batch],
         **extra,
         "agent_instruction": RELAY_INSTRUCTION,
@@ -395,11 +398,14 @@ def cmd_broad(args, db, watches, guard, *, drained=None, deadline_fn=None,
     The sentinel/background grid covers the window instead. main() answers
     before the lock and slot claim, so this can never make a same-slot
     check skip collection."""
-    print(json.dumps({"status": "noop", "reason": "broad_scan_disabled",
-                      "detail": "a sweep exceeds the daily background "
-                                "budget; the sentinel/background grid "
-                                "covers the window instead",
-                      "watch": getattr(args, "watch", None)}, indent=2))
+    payload = {"status": "noop", "reason": "broad_scan_disabled",
+               "detail": "a sweep exceeds the daily background budget; the "
+                         "sentinel/background grid covers the window instead",
+               "watch": getattr(args, "watch", None)}
+    if drained:
+        payload["handoff"] = _handoff_payload(
+            db, slot if slot is not None else slot_id(), _ids(drained))
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -640,7 +646,8 @@ def cmd_outbox_list(args, db, watches, guard):
     """List outbox alerts: the digest input."""
     rows = outbox_list(db, args.state)
     print(json.dumps({"alerts": [
-        {"alert_id": r["alert_id"], "state": r["state"],
+        {"alert_id": r["alert_id"], "event": r["event_no"],
+         "state": r["state"],
          "handoff_count": r["handoff_count"],
          "prepared_slot": r["prepared_slot"],
          "price_usd": r["price_usd"],
@@ -728,8 +735,11 @@ def main() -> int:
             transport.install_transport_guard(guard)
         if args.cmd == "broad":
             # Disabled: answer before the lock and slot claim, so it can
-            # never make a same-slot check skip collection.
-            return cmd_broad(args, db, watches, guard)
+            # never make a same-slot check skip collection. Pending alerts
+            # are still drained (atomic UPDATE ... RETURNING: no slot or
+            # lock needed) and printed for relay.
+            return cmd_broad(args, db, watches, guard,
+                             drained=drain_pending(db, slot_id()))
         if args.cmd == "narrow":
             return run_manual("narrow", args, db, watches, guard, cmd_narrow)
         if args.cmd == "canary":
