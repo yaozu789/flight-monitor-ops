@@ -716,8 +716,9 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
     steps = list(_burst_steps(trigger, _durations(group_cfg)))
     # Resuming on a later UTC day: recheck the trigger fare first, before
     # spending a new day's budget on a deal that may already be gone.
+    revalidated = prog.get("revalidated_at") or ""
     revalidate_again = (next_step > 0
-                        and prog["updated_at"][:10] < store.today_str())
+                        and revalidated[:10] < store.today_str())
     try:
         for step_idx, kind, d_date, dur in steps:
             redo = revalidate_again and step_idx == 0
@@ -745,10 +746,13 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                                           attempts_used=cumulative)
                 _record("dropped")
                 return total
-            # Persist every step so a later slot resumes exactly here.
+            # Persist every step so a later slot resumes exactly here; a
+            # passed revalidation is recorded separately, so a budget stop
+            # right after it cannot fake a same-day recheck.
             store.save_burst_progress(db, trigger["id"], status="active",
                                       next_step=next_step,
-                                      attempts_used=cumulative)
+                                      attempts_used=cumulative,
+                                      revalidated=(kind == "revalidate"))
         finished = (next_step >= len(steps)
                     or cumulative >= BURST_MAX_ATTEMPTS)
         if finished:

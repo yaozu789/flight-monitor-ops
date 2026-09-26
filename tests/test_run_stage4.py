@@ -501,6 +501,47 @@ class Stage4OrchestrationTests(unittest.TestCase):
                 db, [WATCH], guard)
         self.assertEqual((rc, collected), (0, [1]))
 
+    def test_failed_enqueue_leaves_observation_eligible(self):
+        """If queuing the confirmed alert fails, the observation is NOT
+        logged as verified, so a later run retries it."""
+        db, guard = _ctx(self)
+        self._obs(db, hours_ago=1)
+        ok = lambda *a, **k: (True, {  # noqa: E731
+            "price_usd": 400.0, "depart_date": "2026-11-01",
+            "return_date": "2026-11-08", "airline": "UA", "stops": 0,
+            "booking_url": "", "observed_at": "now",
+            "origin": "SFO", "destination": "JFK"})
+        with mock.patch.object(fm_run, "enqueue_from_confirmation",
+                               side_effect=RuntimeError("disk full")):
+            with self.assertRaises(RuntimeError):
+                self._run_check(db, guard, ok)
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) AS c FROM verify_log").fetchone()["c"], 0)
+        self._run_check(db, guard, ok)
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) AS c FROM outbox").fetchone()["c"], 1)
+
+    def test_backlog_leaves_verify_reserve_for_bursts(self):
+        db, guard = _ctx(self)
+        for i in range(3):
+            self._obs(db, hours_ago=2 + i, dep=f"2026-11-0{i + 1}")
+        for _ in range(19):  # 19 + 2 > 24 - 4: backlog must stop
+            guard.reserve("verify")
+        calls = []
+        self._run_check(db, guard,
+                        lambda *a, **k: calls.append(1) or (False, None))
+        self.assertEqual(calls, [])
+
+    def test_verify_log_is_per_watch(self):
+        store.init_db  # noqa: B018 - module import check
+        db, _ = _ctx(self)
+        store.log_verify(db, "w1", "fp", "2026-09-25T00:00:00+00:00",
+                         "not_confirmed")
+        self.assertTrue(store.verify_logged(db, "w1", "fp",
+                                            "2026-09-25T00:00:00+00:00"))
+        self.assertFalse(store.verify_logged(db, "w2", "fp",
+                                             "2026-09-25T00:00:00+00:00"))
+
     def test_tied_observations_score_once(self):
         """Rows of one fingerprint sharing an observed_at (collection stamps
         a whole run with run_start) yield ONE candidate, not duplicates."""

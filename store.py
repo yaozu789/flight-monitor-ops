@@ -225,7 +225,8 @@ CREATE TABLE IF NOT EXISTS burst_progress (
     next_step INTEGER NOT NULL DEFAULT 0,      -- 0=revalidate, 1..20=neighbours, 21..29=durations
     status TEXT NOT NULL DEFAULT 'active',     -- active|done|dropped|expired
     expires_at TEXT NOT NULL,                  -- trigger created_at + 24h
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    revalidated_at TEXT                        -- last successful fare recheck
 );
 """
 
@@ -352,6 +353,12 @@ def migrate_db(db: sqlite3.Connection) -> None:
         for name, ddl in _OBS_V3_COLUMNS:
             if name not in obs_cols:
                 db.execute(f"ALTER TABLE observations ADD COLUMN {name} {ddl}")
+    bp_cols = {r["name"] for r in db.execute(
+        "PRAGMA table_info(burst_progress)")}
+    if bp_cols and "revalidated_at" not in bp_cols:
+        # When the trigger fare was last rechecked successfully (separate
+        # from updated_at, which any partial progress also bumps).
+        db.execute("ALTER TABLE burst_progress ADD COLUMN revalidated_at TEXT")
     info = {r["name"] for r in db.execute("PRAGMA table_info(run_slots)")}
     if info and "claimed_at" not in info:
         # Patch-01 key was (slot_id, command); v2 keys slot_id alone.
@@ -607,13 +614,15 @@ def log_verify(db: sqlite3.Connection, watch_id: str, fingerprint: str,
     db.commit()
 
 
-def verify_logged(db: sqlite3.Connection, fingerprint: str,
+def verify_logged(db: sqlite3.Connection, watch_id: str, fingerprint: str,
                   observed_at: str) -> bool:
-    """True when this fingerprint was already rechecked for an observation
-    at or after *observed_at* (a newer observation is fresh evidence)."""
+    """True when this watch already rechecked this fingerprint for an
+    observation at or after *observed_at* (a newer observation is fresh
+    evidence)."""
     return db.execute(
-        "SELECT 1 FROM verify_log WHERE fingerprint = ? AND observed_at >= ?",
-        (fingerprint, observed_at)).fetchone() is not None
+        "SELECT 1 FROM verify_log WHERE watch_id = ? AND fingerprint = ? "
+        "AND observed_at >= ?",
+        (watch_id, fingerprint, observed_at)).fetchone() is not None
 
 
 def first_seen(db: sqlite3.Connection, fingerprint: str) -> str | None:
@@ -1225,7 +1234,8 @@ def get_burst_progress(db: sqlite3.Connection,
 def save_burst_progress(db: sqlite3.Connection, trigger_id: int, *,
                         next_step: int | None = None,
                         attempts_used: int | None = None,
-                        status: str | None = None) -> dict:
+                        status: str | None = None,
+                        revalidated: bool = False) -> dict:
     """Persist burst progress (called after every burst step so a later
     slot -- or a BudgetExhausted/deadline -- resumes exactly where this
     execution stopped). Returns the updated row."""
@@ -1240,6 +1250,9 @@ def save_burst_progress(db: sqlite3.Connection, trigger_id: int, *,
     if status is not None:
         sets.append("status=?")
         vals.append(status)
+    if revalidated:
+        sets.append("revalidated_at=?")
+        vals.append(vals[0])
     vals.append(trigger_id)
     db.execute(f"UPDATE burst_progress SET {', '.join(sets)} "
                f"WHERE trigger_id=?", vals)
