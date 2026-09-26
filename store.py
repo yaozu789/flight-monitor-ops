@@ -228,6 +228,16 @@ CREATE TABLE IF NOT EXISTS burst_progress (
     updated_at TEXT NOT NULL,
     revalidated_at TEXT                        -- last successful fare recheck
 );
+-- Weekly price report (weekly.py): one row per ISO week, relayed at most
+-- REPORT_MAX_EMITS times until the agent records it with report-mark.
+CREATE TABLE IF NOT EXISTS weekly_reports (
+    week TEXT PRIMARY KEY,        -- ISO week YYYY-Www
+    message_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    emits INTEGER NOT NULL DEFAULT 0,
+    last_slot INTEGER,            -- slot whose relay batch carries it
+    relayed_at TEXT               -- set by report-mark
+);
 """
 
 # Outbox lifecycle (v3): the SCHEDULER transition map is exactly

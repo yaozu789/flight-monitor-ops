@@ -39,6 +39,7 @@ import yaml  # noqa: E402
 import heartbeat  # noqa: E402
 import sentinel  # noqa: E402
 import transport  # noqa: E402
+import weekly  # noqa: E402
 from budget import (  # noqa: E402
     CATEGORY_CAPS,
     PER_RUN_MAX,
@@ -112,6 +113,8 @@ RELAY_INSTRUCTION = (
     "After the USER confirms a deal, finalize it (human-driven only) with: "
     "python run.py outbox-confirm --alert-id <alert_id> --event <event> "
     "--by <your name>."
+    " If weekly_report is present, relay its message VERBATIM too, then "
+    "record it with: python run.py report-mark --week <week>."
 )
 
 
@@ -138,6 +141,8 @@ def _handoff_payload(db, slot, alert_ids, **extra) -> dict:
                     "message": (f"{r['message_text']}\n"
                                 f"Alert: {r['alert_id']} event {r['event_no']}")}
                    for r in batch],
+        **({"weekly_report": report}
+           if (report := weekly.for_slot(db, slot)) else {}),
         **extra,
         "agent_instruction": RELAY_INSTRUCTION,
     }
@@ -183,12 +188,15 @@ def _stop_handoff(exc, db=None, slot=None, drained=None) -> dict:
     (the stop came before cmd_check could attach it, or the exception
     rejected the attribute) -- the alerts run_guarded drained."""
     payload = getattr(exc, "handoff", None)
-    if payload is None and db is not None and drained:
+    if payload is None and db is not None:
         try:
+            # Also with nothing drained: the weekly report may ride it.
             payload = _handoff_payload(db, slot, _ids(drained))
         except Exception:  # noqa: BLE001 - never mask the stop
             payload = None
-    return {"handoff": payload} if payload and payload["alerts"] else {}
+    if payload and (payload["alerts"] or payload.get("weekly_report")):
+        return {"handoff": payload}
+    return {}
 
 
 def _emit_stop_handoff(exc, db=None, slot=None, drained=None) -> None:
@@ -238,6 +246,14 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         # early-returns below so stranded handoffs are never stuck behind a
         # skipped collection.
         drained = drain_pending(db, slot)
+        if getattr(args, "scheduled", False):
+            # The weekly report (no network) rides this run's relay batch,
+            # including no-op and stop outputs.
+            try:
+                weekly.prepare(db, watches, slot)
+            except Exception as e:  # noqa: BLE001 - never block collection
+                add_health(db, "weekly_report", False,
+                           f"{type(e).__name__}: {e}")
         bo = get_backoff(db)
         if bo is not None:
             add_health(db, "throttle_backoff", True,
@@ -716,6 +732,23 @@ def cmd_outbox_confirm(args, db, watches, guard):
     return 0
 
 
+def cmd_report_mark(args, db, watches, guard):
+    """Agent-facing: record that the weekly report was relayed."""
+    if not weekly.mark(db, args.week):
+        raise SystemExit(f"report-mark failed: no unrelayed report for "
+                         f"{args.week}")
+    print(json.dumps({"week": args.week, "state": "relayed"}))
+    return 0
+
+
+def cmd_weekly_report(args, db, watches, guard):
+    """Preview the weekly report from stored data (no network, no state)."""
+    now = datetime.now(timezone.utc)
+    y, w, _ = now.isocalendar()
+    print(weekly.build_report(db, watches, now, f"{y}-W{w:02d} (preview)"))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cheap Flight Monitor (v2)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -758,6 +791,14 @@ def main() -> int:
                    help="the alert's event number, from the relay batch")
     p.add_argument("--by", required=True, help="actor name, recorded for audit")
 
+    p = sub.add_parser("report-mark",
+                       help="record the relayed weekly report (agent use)")
+    p.add_argument("--week", required=True,
+                   help="the report's week, from the relay batch")
+
+    sub.add_parser("weekly-report",
+                   help="preview the weekly report (stored data only)")
+
     args = ap.parse_args()
     db = None
     try:
@@ -789,6 +830,10 @@ def main() -> int:
             return cmd_outbox_list(args, db, watches, guard)
         if args.cmd == "outbox-confirm":
             return cmd_outbox_confirm(args, db, watches, guard)
+        if args.cmd == "report-mark":
+            return cmd_report_mark(args, db, watches, guard)
+        if args.cmd == "weekly-report":
+            return cmd_weekly_report(args, db, watches, guard)
         if args.cmd == "check":
             return run_guarded("check", args, db, watches, guard, cmd_check)
     except SystemExit:
