@@ -479,7 +479,7 @@ class Stage4OrchestrationTests(unittest.TestCase):
     def test_verify_category_cap_does_not_stop_run(self):
         from budget import BudgetExhausted
         db, guard = _ctx(self)
-        self._obs(db, hours_ago=5)
+        self._obs(db, hours_ago=0)  # inside the old and new windows alike
         collected = []
 
         def v(*a, **k):
