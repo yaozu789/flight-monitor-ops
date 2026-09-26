@@ -258,21 +258,6 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertIsNone(store.lock_holder(db))
         self.assertEqual(guard.spent_today(), 0)
 
-    def test_broad_still_emits_drained(self):
-        import contextlib
-        import io
-        import json as _json
-        db, guard = self._ctx()
-        seed_pending(db)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            fm_run.cmd_broad(args_for("broad", False), db, [WATCH], guard,
-                             drained=fm_run.drain_pending(db, store.slot_id()))
-        alerts = _json.loads(out.getvalue())["handoff"]["alerts"]
-        self.assertEqual([a["alert_id"] for a in alerts], ["w1:drain1"])
-        self.assertIn("Alert: w1:drain1 event 1", alerts[0]["message"])
-        self.assertFalse(store.slot_done(db, store.slot_id()))
-
     def test_deadline_shorter_than_lock_ttl(self):
         """The deadline must stay below the lock TTL so a stopped run
         never wedges the lock for the next slot."""

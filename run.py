@@ -735,11 +735,11 @@ def main() -> int:
             transport.install_transport_guard(guard)
         if args.cmd == "broad":
             # Disabled: answer before the lock and slot claim, so it can
-            # never make a same-slot check skip collection. Pending alerts
-            # are still drained (atomic UPDATE ... RETURNING: no slot or
-            # lock needed) and printed for relay.
-            return cmd_broad(args, db, watches, guard,
-                             drained=drain_pending(db, slot_id()))
+            # never make a same-slot check skip collection. It drains
+            # nothing: pending alerts wait for the next check, which drains
+            # first under the lock (no double relay). broad is not
+            # scheduled; its old cron is retired on Muse.
+            return cmd_broad(args, db, watches, guard)
         if args.cmd == "narrow":
             return run_manual("narrow", args, db, watches, guard, cmd_narrow)
         if args.cmd == "canary":
