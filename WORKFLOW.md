@@ -3,7 +3,7 @@
 | Role | Who |
 |---|---|
 | Write code + tests, open PRs | **Claude Code** (on Yaozu's Mac) |
-| Main code review | **Codex** (gpt-6-astra); **Cursor** (non-Claude model) as backup |
+| Main code review | **Codex** (gpt-6-sol; gpt-6-astra only for big design reviews or full audits); **Cursor** (non-Claude model) as backup |
 | Runtime-fit review, deploy, run, report | **Muse** (hosts the monitor) |
 | Test verdict | **CI** (`.github/workflows/tests.yml`, clean checkout) |
 | Decisions, deploy approval | **Yaozu** |

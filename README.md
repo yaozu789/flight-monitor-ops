@@ -1,67 +1,72 @@
-# Cheap Flight Monitor — Phase 1 (MVP)
+# Flight Monitor
 
-Personal flight-deal radar: Bay Area (SFO/OAK/SJC) → Japan + NYC area, flexible
-dates. Polls Google Flights via the `flights` PyPI package (fli), keeps price
-history in SQLite, scores deals, verifies fares with a second live query before
-alerting, and self-checks with a canary query.
+Personal cheap-flight radar. It watches SFO/OAK/SJC round trips to destination groups (currently Japan under $500 and NYC under $250), 3–9 months out, 5–14-day trips, economy, at most 1 stop. It alerts only on fares that are under the cap **and** confirmed by a live recheck of the same itinerary.
 
-## Setup
+- **Data:** Google Flights through the [fli](https://github.com/punitarani/fli) library (pinned commit, see `requirements.txt`).
+- **Runs on:** Muse, which runs `run.py check --scheduled` every 30 minutes and pushes alerts to Yaozu's phone.
+- **Built by:** Claude Code writes the code, Codex reviews, CI grades, Yaozu approves deploys. See `WORKFLOW.md`.
 
-Uses the existing venv with `flights` installed:
+For the full architecture, rules, and decisions made after the spec, read **`CLAUDE.md`**. The design is in `docs/spec.md`.
 
-```bash
-V=~/workspace/flitest_venv/bin/python
+## How the modules connect
+
+An arrow means "is used by". `run.py` imports all 12 modules, so its arrows are left out except for the top layer.
+
+```mermaid
+graph TD
+  store[store.py - SQLite, imports nothing] --> transport & budget & scorer & heartbeat
+  store --> sentinel & verifier & outbox & canary
+  transport --> poller
+  poller --> sentinel & verifier & canary
+  budget --> sentinel & outbox
+  verifier --> outbox
+  outbox --> weekly
+  dashboard[dashboard.py - imports nothing] --> weekly
+  sentinel & scorer & heartbeat & canary & weekly --> run[run.py - uses all 12]
 ```
 
-No cron is wired here — the scheduler invokes `run.py` and reads its JSON output.
+## What each file does
+
+| File | Job |
+|---|---|
+| `run.py` | The CLI and only entry point. `check --scheduled` is the 30-minute cycle: lock, drain queued alerts, collect, score, verify, queue, heartbeat. |
+| `sentinel.py` | Picks which dates to search each run: about 27 weekly departure dates per group, least recently checked first. A cheap hit starts a "burst" that searches nearby dates. |
+| `poller.py` | Runs the actual Google Flights searches through fli (broad scan and exact-date search). |
+| `transport.py` | Wraps every real HTTP request fli makes: counts it against the budget, and backs off on 429s, CAPTCHAs and blank pages. |
+| `budget.py` | The daily request limit (150/day). Refuses requests once it is spent. |
+| `store.py` | SQLite database: prices, alerts, budget ledger, health, lock. |
+| `scorer.py` | Flags fares at or below the watch's cap. No "new low" alerts. |
+| `verifier.py` | Rechecks a flagged fare live. No alert unless the same itinerary is still under the cap. |
+| `outbox.py` | Turns confirmed deals into alert messages and queues them for Muse. At most one alert per watch per departure week. It re-alerts only if the price drops at least max($15, 5%), or 72 hours after the earlier alert was retired (fare gone, or rechecks kept failing). |
+| `weekly.py` | Monday price report, sent even with no deals. Built from stored data only. |
+| `dashboard.py` | Builds the dashboard link. The data rides in the URL fragment, so the page (`dashboard/`) holds none. |
+| `heartbeat.py` | Pings healthchecks.io after each scheduled run, or `/fail` on a crash. If pings stop, healthchecks.io emails Yaozu. |
+| `canary.py` | Manual diagnostic: one fixed reference search to check that Google Flights still returns data (`run.py canary`). |
+| `watches.yaml` | Routes, caps and schedule settings. |
+| `tests/` | Offline test suite. `fake_transport.py` stands in for Google, so tests never touch the network. |
+| `ops/muse-inbox/` | Dated instructions for Muse. The newest file is the current task. |
+
+## Setup and tests
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests
+```
+
+CI (`.github/workflows/tests.yml`) runs the same suite on every push and PR.
 
 ## Commands
 
 ```bash
-cd ~/workspace/"Flight Monitor"
-
-# Flex-date sweep for a watch (SLOW: ~3 min per 15-day window chunk;
-# the 3-9 month window is chunked into <=93-day pieces). Prints cheapest
-# date combos; stores them in broad_scans for Phase 2 baselines.
-$V run.py broad --watch japan [--duration 7]
-
-# Specific-date round trip across all origin x destination airports (~2s per query)
-$V run.py narrow --watch japan --depart 2026-12-04 --return 2026-12-11
-
-# Self-health: fixed SFO->NRT reference query. Exit 0 = data layer alive,
-# exit 2 = blind (Google changed something / rate-limited).
-$V run.py canary
-
-# The 2-hourly job: narrow polls on sample dates for all watches (or one),
-# stores observations, scores (absolute cap / new low), verifies candidates
-# with a second query, records alerts. Prints JSON summary; exit 0 even
-# with zero deals, 1 only on infrastructure failure.
-$V run.py check [--watch japan]
+.venv/bin/python run.py check --scheduled   # the scheduled cycle (Muse runs this)
+.venv/bin/python run.py canary              # is Google Flights still returning data?
+.venv/bin/python run.py weekly-report       # preview the Monday report
+.venv/bin/python run.py dashboard-link      # print the dashboard link
+.venv/bin/python run.py outbox-list         # list outbox alerts (all states)
 ```
 
-## How alerting works
+Other commands: `narrow`, `outbox-mark`, `outbox-confirm`, `report-mark`. `broad` is disabled (it returns `broad_scan_disabled`). Run `run.py <command> -h` for options. Don't run real searches from a laptop without Yaozu's OK: they spend the shared Google rate limit.
 
-`check` prints `{"watches": {"japan": {"observations": N, "alerts": [...]}}}`.
-Each alert was live-verified and recorded in the `alerts` table. The scheduler
-turns these into chat + push messages. Dedup: same itinerary fingerprint won't
-re-alert within `cooldown_hours` (24h).
+## History
 
-## Files
-
-- `watches.yaml` — watch config (2 Phase-1 watches; Phase 2 adds 5 more)
-- `run.py` — CLI entrypoint (broad / narrow / canary / check)
-- `poller.py` — `broad_scan()` + `narrow_query()` via `flights`; empty results
-  return `None` ("unknown"), never zero
-- `store.py` — SQLite schema + helpers (`data/monitor.db`)
-- `scorer.py` — absolute-cap + new-observed-low scoring (rolling median: Phase 2)
-- `verifier.py` — second live query before any alert
-- `canary.py` — fixed SFO→NRT reference query → `health` table
-- `data/` — SQLite DB (created on first run)
-
-## Known limitations (Phase 1)
-
-- `check` uses fixed sample departures (+45/+75/+105/+135d, 7-day trips); using
-  `broad` output to pick candidate dates is Phase 2.
-- Scoring is absolute cap + new low only; no rolling-median anomaly yet.
-- The `flights` library reverse-engineers Google Flights — expect breakage a few
-  times a year; the canary exists to detect it.
+`PLAN.md` and `PROGRESS.md` are Muse's original plan and Phase 1 report, kept for history only.
