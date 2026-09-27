@@ -37,7 +37,7 @@ graph TD
 | `store.py` | SQLite database: prices, alerts, budget ledger, health, lock. |
 | `scorer.py` | Flags fares at or below the watch's cap. No "new low" alerts. |
 | `verifier.py` | Rechecks a flagged fare live. No alert unless the same itinerary is still under the cap. |
-| `outbox.py` | Turns confirmed deals into alert messages and queues them for Muse. At most one alert per watch per departure week, unless the price drops at least max($15, 5%). |
+| `outbox.py` | Turns confirmed deals into alert messages and queues them for Muse. At most one alert per watch per departure week. It re-alerts only if the price drops at least max($15, 5%), or if the fare disappeared and is back 72 hours later. |
 | `weekly.py` | Monday price report, sent even with no deals. Built from stored data only. |
 | `dashboard.py` | Builds the dashboard link. The data rides in the URL fragment, so the page (`dashboard/`) holds none. |
 | `heartbeat.py` | Pings healthchecks.io after each scheduled run, or `/fail` on a crash. If pings stop, healthchecks.io emails Yaozu. |
@@ -62,10 +62,10 @@ CI (`.github/workflows/tests.yml`) runs the same suite on every push and PR.
 .venv/bin/python run.py canary              # is Google Flights still returning data?
 .venv/bin/python run.py weekly-report       # preview the Monday report
 .venv/bin/python run.py dashboard-link      # print the dashboard link
-.venv/bin/python run.py outbox-list         # show queued alerts
+.venv/bin/python run.py outbox-list         # list outbox alerts (all states)
 ```
 
-Other commands: `broad`, `narrow`, `outbox-mark`, `outbox-confirm`, `report-mark`. Run `run.py <command> -h` for options. Don't run real searches from a laptop without Yaozu's OK: they spend the shared Google rate limit.
+Other commands: `narrow`, `outbox-mark`, `outbox-confirm`, `report-mark`. `broad` is disabled (it returns `broad_scan_disabled`). Run `run.py <command> -h` for options. Don't run real searches from a laptop without Yaozu's OK: they spend the shared Google rate limit.
 
 ## History
 
