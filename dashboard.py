@@ -12,9 +12,9 @@ import json
 import zlib
 from datetime import datetime, timedelta, timezone
 
-DASHBOARD_URL = "https://yaozu789.github.io/flight-monitor/"
+DASHBOARD_URL = "https://yaozu789.github.io/flight-monitor/dashboard/"
 PRICE_DAYS = 180
-RUN_DAYS = 28
+RUN_DAYS = 14
 
 
 def payload(db, watches, now: datetime | None = None) -> dict:
