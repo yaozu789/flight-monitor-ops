@@ -997,18 +997,23 @@ def record_run_stats(db: sqlite3.Connection, slot: int, attempts: int,
 
 
 def stall_streak(db: sqlite3.Connection, max_gap: int = 1) -> int:
-    """Back-to-back runs, ending at the most recent one, flagged stalled
-    (same back-to-back rule as deadline_streak)."""
+    """Stalled runs back to back, ending at the most recent run (same gap
+    rule as deadline_streak). A neutral run -- 0 attempts because nothing
+    was affordable -- neither counts nor breaks the streak; any other run
+    (progress, or no stats recorded: stop or crash) ends it."""
     streak = 0
     prev = None
-    for r in db.execute("SELECT slot_id, stalled FROM run_slots "
+    for r in db.execute("SELECT slot_id, attempts, stalled FROM run_slots "
                         "ORDER BY slot_id DESC"):
-        if not r["stalled"]:
-            break
         if prev is not None and prev - r["slot_id"] > max_gap:
             break
-        streak += 1
         prev = r["slot_id"]
+        if r["stalled"]:
+            streak += 1
+        elif r["attempts"] == 0 and r["stalled"] == 0:
+            continue  # neutral
+        else:
+            break
     return streak
 
 

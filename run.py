@@ -581,20 +581,21 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
 
 def _stalled(guard, collected) -> bool:
     """True when collection sent nothing although the run could afford a
-    check (allowance and daily headroom) and the sentinel or background cap
-    still had room for one (their cells are always due). A lone flag can
-    be legitimate (e.g. a 3-attempt allowance vs a 4-attempt background
-    check); only a streak of them fails the heartbeat."""
+    full sentinel or background check: its cost fits the allowance, the
+    daily headroom and that category's cap (their cells are always due).
+    A 0-attempt run that could afford neither is not stalled."""
     if collected["attempts"]:
         return False
     allowance = min(collected.get("allowance", 0),
                     sentinel.daily_headroom(guard))
-    if allowance < 1 + sentinel.SENTINEL_TOP_N:
-        return False
-    return any(CATEGORY_CAPS[category] - guard.spent_today(category)
-               >= 1 + top_n
-               for category, top_n in (("sentinel", sentinel.SENTINEL_TOP_N),
-                                       ("background", sentinel.DETAIL_TOP_N)))
+    for category, top_n in (("sentinel", sentinel.SENTINEL_TOP_N),
+                            ("background", sentinel.DETAIL_TOP_N)):
+        cost = 1 + top_n
+        if (allowance >= cost
+                and CATEGORY_CAPS[category] - guard.spent_today(category)
+                >= cost):
+            return True
+    return False
 
 
 def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,

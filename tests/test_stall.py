@@ -48,7 +48,9 @@ class StalledRuleTests(unittest.TestCase):
     def test_sentinel_capped_background_open_is_a_stall(self):
         """The 17b8e82 shape: sentinel cap spent, background untouched."""
         spend(self.db, "sentinel", 54)
-        self.assertTrue(self.stalled(allowance=3))
+        self.assertTrue(self.stalled(allowance=4))
+        # A background check costs 4: a 3-attempt allowance affords nothing.
+        self.assertFalse(self.stalled(allowance=3))
 
     def test_both_caps_spent_is_legitimate(self):
         spend(self.db, "sentinel", 54)
@@ -101,6 +103,17 @@ class StallStreakTests(unittest.TestCase):
         row = self.db.execute("SELECT attempts, stalled FROM run_slots "
                               "WHERE slot_id = ?", (base + 2,)).fetchone()
         self.assertEqual((row["attempts"], row["stalled"]), (0, 1))
+
+    def test_neutral_runs_neither_count_nor_break(self):
+        base = store.slot_id()
+        for i, (attempts, stalled) in enumerate(
+                [(0, 1), (0, 0), (0, 1), (0, 0), (0, 1)]):
+            store.claim_slot(self.db, base - 10 + i, "check")
+            store.record_run_stats(self.db, base - 10 + i, attempts, stalled)
+        self.assertEqual(store.stall_streak(self.db), 3)
+        store.claim_slot(self.db, base - 4, "check")
+        store.record_run_stats(self.db, base - 4, 6, False)  # progress
+        self.assertEqual(store.stall_streak(self.db), 0)
 
     def test_skipped_run_breaks_streak(self):
         base = store.slot_id()
