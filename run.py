@@ -36,6 +36,7 @@ sys.path.insert(0, str(BASE))
 
 import yaml  # noqa: E402
 
+import dashboard  # noqa: E402
 import heartbeat  # noqa: E402
 import sentinel  # noqa: E402
 import transport  # noqa: E402
@@ -784,6 +785,12 @@ def cmd_report_mark(args, db, watches, guard):
     return 0
 
 
+def cmd_dashboard_link(args, db, watches, guard):
+    """Print the monitoring dashboard link (stored data only, no network)."""
+    print(dashboard.link(db, watches))
+    return 0
+
+
 def cmd_weekly_report(args, db, watches, guard):
     """Preview the weekly report from stored data (no network, no state)."""
     now = datetime.now(timezone.utc)
@@ -839,6 +846,9 @@ def main() -> int:
     p.add_argument("--week", required=True,
                    help="the report's week, from the relay batch")
 
+    sub.add_parser("dashboard-link",
+                   help="print the monitoring dashboard link (stored data)")
+
     sub.add_parser("weekly-report",
                    help="preview the weekly report (stored data only)")
 
@@ -875,6 +885,8 @@ def main() -> int:
             return cmd_outbox_confirm(args, db, watches, guard)
         if args.cmd == "report-mark":
             return cmd_report_mark(args, db, watches, guard)
+        if args.cmd == "dashboard-link":
+            return cmd_dashboard_link(args, db, watches, guard)
         if args.cmd == "weekly-report":
             return cmd_weekly_report(args, db, watches, guard)
         if args.cmd == "check":

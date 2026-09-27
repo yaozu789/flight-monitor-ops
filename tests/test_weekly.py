@@ -84,6 +84,8 @@ class BuildReportTests(unittest.TestCase):
         self.assertIn("Deal alerts handed off this week: none", text)
         self.assertIn("Google requests: 3 in 7 days", text)
         self.assertTrue(text.endswith("Weekly report: 2026-W40"))
+        self.assertIn("Dashboard (zoom, runs, requests): "
+                      "https://yaozu789.github.io/flight-monitor/#v1.", text)
         url = next(l for l in text.splitlines() if l.startswith("Chart"))
         config = json.loads(unquote(url.split("?c=", 1)[1]))
         japan = config["data"]["datasets"][0]
