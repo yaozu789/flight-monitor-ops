@@ -37,7 +37,7 @@ graph TD
 | `store.py` | SQLite database: prices, alerts, budget ledger, health, lock. |
 | `scorer.py` | Flags fares at or below the watch's cap. No "new low" alerts. |
 | `verifier.py` | Rechecks a flagged fare live. No alert unless the same itinerary is still under the cap. |
-| `outbox.py` | Turns confirmed deals into alert messages and queues them for Muse. At most one alert per watch per departure week. It re-alerts only if the price drops at least max($15, 5%), or if the fare disappeared and is back 72 hours later. |
+| `outbox.py` | Turns confirmed deals into alert messages and queues them for Muse. At most one alert per watch per departure week. It re-alerts only if the price drops at least max($15, 5%), or 72 hours after the earlier alert was retired (fare gone, or rechecks kept failing). |
 | `weekly.py` | Monday price report, sent even with no deals. Built from stored data only. |
 | `dashboard.py` | Builds the dashboard link. The data rides in the URL fragment, so the page (`dashboard/`) holds none. |
 | `heartbeat.py` | Pings healthchecks.io after each scheduled run, or `/fail` on a crash. If pings stop, healthchecks.io emails Yaozu. |
