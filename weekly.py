@@ -14,6 +14,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
+import dashboard
 from outbox import CHART_BASE
 
 # Monday 16:00 UTC = 09:00 PDT / 08:00 PST (no tz database needed on the VM).
@@ -157,6 +158,8 @@ def build_report(db, watches, now: datetime, week: str) -> str:
     url = chart_url(db, watches, now)
     if url:
         lines.append(f"Chart (daily lows, last {CHART_DAYS} days): {url}")
+    lines.append("Dashboard (zoom, runs, requests): "
+                 + dashboard.link(db, watches, now))
     lines.append(f"Weekly report: {week}")
     return "\n".join(lines)
 

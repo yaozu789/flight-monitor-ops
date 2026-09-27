@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flight Monitor</title>
+<meta name="referrer" content="no-referrer">
+<!-- The link data (after #) is private: only same-origin scripts run, and
+     the page may not fetch, post or load images from anywhere. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none'">
+<script src="vendor/chart.umd.min.js"></script>
+<script src="vendor/hammer.min.js"></script>
+<script src="vendor/chartjs-plugin-zoom.min.js"></script>
+<script src="vendor/chartjs-adapter-date-fns.bundle.min.js"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Flight Monitor</h1>
+  <div class="sub" id="sub">Loading…</div>
+  <div id="app"></div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
