@@ -577,6 +577,7 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
         # 3 at a 30-minute cadence) still reaches bursts and background.
         order = [bursts, background, lambda: sentinels(sentinel_share),
                  lambda: sentinels(allowance)]
+    result["allowance"] = allowance
     for step in order:
         if not phase(step):
             break  # global budget stop: partial progress is kept
