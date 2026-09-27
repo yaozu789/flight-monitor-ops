@@ -7,14 +7,31 @@ const $ = (tag, attrs = {}, text) => {
 };
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
+// Real links are a few KB; a crafted one must not exhaust memory.
+const MAX_LINK = 64 * 1024, MAX_JSON = 2 * 1024 * 1024;
+
 async function decode(fragment) {
   if (!fragment.startsWith("v1.")) throw new Error("unknown link format");
+  if (fragment.length > MAX_LINK) throw new Error("link too long");
   const b64 = fragment.slice(3).replace(/-/g, "+").replace(/_/g, "/");
   const bin = Uint8Array.from(atob(b64 + "=".repeat((4 - b64.length % 4) % 4)),
                               c => c.charCodeAt(0));
-  const stream = new Blob([bin]).stream()
-    .pipeThrough(new DecompressionStream("deflate-raw"));
-  return JSON.parse(await new Response(stream).text());
+  const reader = new Blob([bin]).stream()
+    .pipeThrough(new DecompressionStream("deflate-raw")).getReader();
+  const parts = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > MAX_JSON) { reader.cancel(); throw new Error("link data too large"); }
+    parts.push(value);
+  }
+  const d = JSON.parse(await new Blob(parts).text());
+  if (d.v !== 1 || !Array.isArray(d.watches) || !Array.isArray(d.runs)
+      || typeof d.prices !== "object" || typeof d.spend !== "object"
+      || !Array.isArray(d.events)) throw new Error("unexpected link data");
+  return d;
 }
 
 const DAY = 86400000;
