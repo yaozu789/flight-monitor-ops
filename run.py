@@ -36,6 +36,7 @@ sys.path.insert(0, str(BASE))
 
 import yaml  # noqa: E402
 
+import dashboard  # noqa: E402
 import heartbeat  # noqa: E402
 import sentinel  # noqa: E402
 import transport  # noqa: E402
@@ -72,6 +73,8 @@ from store import (  # noqa: E402
     prepare_handoff,
     reprepare_retries,
     record_lock_loss,
+    record_run_stats,
+    stall_streak,
     release_lock,
     reset_lock_loss,
     set_outbox_user_confirmed,
@@ -99,6 +102,9 @@ BURST_VERIFY_RESERVE = 4
 # A deadline stop is a designed bound, so it pings success -- unless it
 # keeps happening: this many consecutive deadline slots ping /fail instead.
 DEADLINE_FAIL_STREAK = 3
+# Runs in a row that collected nothing although a check was affordable
+# (issue #29: 22 silent 0-attempt runs still pinged green) -> /fail.
+STALL_FAIL_STREAK = 3
 
 # Only scheduled runs of these commands ping Healthchecks.
 PING_COMMANDS = {"check", "broad"}
@@ -351,6 +357,13 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             _ping_fail(args, cmd_name, db)
             return rc
         finish_slot(db, slot, "completed")
+        streak = stall_streak(db, max_gap=cadence_slots(watches))
+        if streak >= STALL_FAIL_STREAK:
+            add_health(db, "collection_stall", False,
+                       f"{streak} runs in a row collected nothing although "
+                       f"a check was affordable")
+            _ping_fail(args, cmd_name, db)
+            return 1
         _ping_ok(args, cmd_name, db)
         return rc
     finally:
@@ -567,6 +580,25 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 "cap": w["absolute_cap_usd"]})
 
 
+def _stalled(guard, collected) -> bool:
+    """True when collection sent nothing although the run could afford a
+    full sentinel or background check: its cost fits the allowance, the
+    daily headroom and that category's cap (their cells are always due).
+    A 0-attempt run that could afford neither is not stalled."""
+    if collected["attempts"]:
+        return False
+    allowance = min(collected.get("allowance", 0),
+                    sentinel.daily_headroom(guard))
+    for category, top_n in (("sentinel", sentinel.SENTINEL_TOP_N),
+                            ("background", sentinel.DETAIL_TOP_N)):
+        cost = 1 + top_n
+        if (allowance >= cost
+                and CATEGORY_CAPS[category] - guard.spent_today(category)
+                >= cost):
+            return True
+    return False
+
+
 def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
               slot=None):
     """One scheduled collection cycle (v3 group 4 ordering):
@@ -646,6 +678,9 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
             "new_sentinel_cells": n_sentinels,
             "new_background_cells": n_bg,
         }
+
+        record_run_stats(db, slot, collected["attempts"],
+                         _stalled(guard, collected))
 
         # 6. Same-slot verify: this run's own collection output. collect()
         # narrowed the per-run allowance to its paced share; verification is
@@ -750,6 +785,12 @@ def cmd_report_mark(args, db, watches, guard):
     return 0
 
 
+def cmd_dashboard_link(args, db, watches, guard):
+    """Print the monitoring dashboard link (stored data only, no network)."""
+    print(dashboard.link(db, watches))
+    return 0
+
+
 def cmd_weekly_report(args, db, watches, guard):
     """Preview the weekly report from stored data (no network, no state)."""
     now = datetime.now(timezone.utc)
@@ -805,6 +846,9 @@ def main() -> int:
     p.add_argument("--week", required=True,
                    help="the report's week, from the relay batch")
 
+    sub.add_parser("dashboard-link",
+                   help="print the monitoring dashboard link (stored data)")
+
     sub.add_parser("weekly-report",
                    help="preview the weekly report (stored data only)")
 
@@ -841,6 +885,8 @@ def main() -> int:
             return cmd_outbox_confirm(args, db, watches, guard)
         if args.cmd == "report-mark":
             return cmd_report_mark(args, db, watches, guard)
+        if args.cmd == "dashboard-link":
+            return cmd_dashboard_link(args, db, watches, guard)
         if args.cmd == "weekly-report":
             return cmd_weekly_report(args, db, watches, guard)
         if args.cmd == "check":

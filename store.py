@@ -292,6 +292,14 @@ _OUTBOX_V2_COLUMNS = [
     ("unknown_count", "INTEGER NOT NULL DEFAULT 0"),  # v3: unknown rechecks
 ]
 
+# Per-run collection stats on run_slots (NULL for runs before they existed):
+# collection attempts, and whether the run collected nothing although a
+# sentinel or background check was affordable (a stall).
+_RUN_SLOTS_COLUMNS = [
+    ("attempts", "INTEGER"),
+    ("stalled", "INTEGER"),
+]
+
 # v3 columns on the observations table: per-leg flight numbers and departure
 # datetimes (JSON lists). NULL for old rows -- old fingerprints (computed
 # without these fields) keep matching the Phase-1 scheme verbatim.
@@ -373,6 +381,11 @@ def migrate_db(db: sqlite3.Connection) -> None:
     if info and "claimed_at" not in info:
         # Patch-01 key was (slot_id, command); v2 keys slot_id alone.
         db.execute("DROP TABLE IF EXISTS run_slots")
+        info = set()
+    if info:
+        for name, ddl in _RUN_SLOTS_COLUMNS:
+            if name not in info:
+                db.execute(f"ALTER TABLE run_slots ADD COLUMN {name} {ddl}")
     db.commit()
 
 
@@ -973,6 +986,34 @@ def deadline_streak(db: sqlite3.Connection, max_gap: int = 1) -> int:
             break
         streak += 1
         prev = r["slot_id"]
+    return streak
+
+
+def record_run_stats(db: sqlite3.Connection, slot: int, attempts: int,
+                     stalled: bool) -> None:
+    db.execute("UPDATE run_slots SET attempts=?, stalled=? WHERE slot_id=?",
+               (attempts, int(stalled), slot))
+    db.commit()
+
+
+def stall_streak(db: sqlite3.Connection, max_gap: int = 1) -> int:
+    """Stalled runs back to back, ending at the most recent run (same gap
+    rule as deadline_streak). A neutral run -- 0 attempts because nothing
+    was affordable -- neither counts nor breaks the streak; any other run
+    (progress, or no stats recorded: stop or crash) ends it."""
+    streak = 0
+    prev = None
+    for r in db.execute("SELECT slot_id, attempts, stalled FROM run_slots "
+                        "ORDER BY slot_id DESC"):
+        if prev is not None and prev - r["slot_id"] > max_gap:
+            break
+        prev = r["slot_id"]
+        if r["stalled"]:
+            streak += 1
+        elif r["attempts"] == 0 and r["stalled"] == 0:
+            continue  # neutral
+        else:
+            break
     return streak
 
 
