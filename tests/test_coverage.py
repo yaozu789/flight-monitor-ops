@@ -271,6 +271,25 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate["checks"]["no_deadline_stops"])
         self.assertFalse(gate["checks"]["no_throttles"])
 
+    def test_short_window_cannot_shorten_the_gate(self):
+        db = self._db(outcomes={"ok": 100}, old_history=False)
+        report = fm_run.coverage_report(db, [{"id": "nyc"}], BudgetGuard(db),
+                                        days=1, now=self.NOW)
+        self.assertEqual(report["days"], fm_run.GATE_DAYS)
+        self.assertFalse(report["gate"]["checks"]["history_days"])
+
+    def test_stop_counted_by_when_it_finished(self):
+        db = self._db(outcomes={"ok": 100})
+        db.execute(
+            """INSERT INTO run_slots (slot_id, command, status, claimed_at,
+               finished_at) VALUES (9, 'check', 'deadline', ?, ?)""",
+            ((self.NOW - timedelta(days=5, seconds=30)).isoformat(
+                timespec="seconds"),
+             (self.NOW - timedelta(days=4, hours=23)).isoformat(
+                 timespec="seconds")))
+        db.commit()
+        self.assertFalse(self._gate(db)["checks"]["no_deadline_stops"])
+
     def test_history_at_previous_stage_does_not_count(self):
         """Raising the ceiling restarts the 5-day clock."""
         db = self._db(outcomes={"ok": 100}, ceiling=100)

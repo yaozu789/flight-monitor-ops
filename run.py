@@ -891,6 +891,9 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
     """Refresh ages, query outcomes and the ramp-gate verdict (stored data
     only, no network)."""
     now = now or datetime.now(timezone.utc)
+    # The gate needs GATE_DAYS: a longer window may be asked for, never a
+    # shorter one (a short window would let a stage pass early).
+    days = max(int(days), GATE_DAYS)
     # Same text format as query_log.at / run_slots.claimed_at (whole
     # seconds), so the string comparisons below are exact.
     since = (now - timedelta(days=days)).isoformat(timespec="seconds")
@@ -912,7 +915,8 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
     queries = query_outcomes(db, since)
     stops = {r["status"]: r["c"] for r in db.execute(
         """SELECT status, COUNT(*) AS c FROM run_slots
-           WHERE status IN ('deadline', 'throttled') AND claimed_at >= ?
+           WHERE status IN ('deadline', 'throttled')
+             AND COALESCE(finished_at, claimed_at) >= ?
            GROUP BY status""", (since,))}
     deadline_stops = stops.get("deadline", 0)
     # A throttle can hit outside a collection query (e.g. a recheck), so
@@ -1001,7 +1005,8 @@ def main() -> int:
     p = sub.add_parser("coverage",
                        help="refresh ages, query outcomes, budget-ramp gate "
                             "(stored data only)")
-    p.add_argument("--days", type=int, default=GATE_DAYS)
+    p.add_argument("--days", type=int, default=GATE_DAYS,
+                   help=f"look-back window, at least {GATE_DAYS}")
 
     args = ap.parse_args()
     db = None
