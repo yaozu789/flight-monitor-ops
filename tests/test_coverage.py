@@ -276,6 +276,10 @@ class GateTests(unittest.TestCase):
         or run_slots row, only the transport's health record."""
         db = self._db(outcomes={"ok": 100})
         store.set_backoff(db, "429", 0.0, None, "manual canary")
+        db.execute("UPDATE health SET checked_at=? WHERE check_name='throttle'",
+                   ((self.NOW - timedelta(days=1)).isoformat(
+                       timespec="seconds"),))
+        db.commit()
         self.assertFalse(self._gate(db)["checks"]["no_throttles"])
 
     def test_short_window_cannot_shorten_the_gate(self):
