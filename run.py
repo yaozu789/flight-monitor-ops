@@ -414,10 +414,45 @@ def cadence_slots(watches: list[dict]) -> int:
     return minutes // 30
 
 
+def _window_cfg(name: str, spec: dict) -> dict:
+    """One named window from watches.yaml: ``days: [lo, hi]`` or
+    ``months: [lo, hi]`` (30-day months), ``refresh_hours``, and optionally
+    ``step_days`` or ``weekdays`` (0 = Monday)."""
+    if "days" in spec:
+        lo, hi = (int(x) for x in spec["days"])
+    elif "months" in spec:
+        lo, hi = (int(x) * 30 for x in spec["months"])
+    else:
+        raise ValueError(f"window {name!r} needs days: or months:")
+    if not 0 <= lo <= hi:
+        raise ValueError(f"window {name!r} has bad bounds {lo}..{hi}")
+    if "refresh_hours" not in spec:
+        raise ValueError(f"window {name!r} needs refresh_hours:")
+    return {"name": name, "lo": lo, "hi": hi,
+            "refresh_hours": int(spec["refresh_hours"]),
+            "step_days": spec.get("step_days"),
+            "weekdays": spec.get("weekdays")}
+
+
 def group_cfg_for(w: dict) -> dict:
-    """Collection config for one watch: airports plus the departure window
-    (``window_months``, 30-day months) and trip lengths
-    (``trip_length_days``) from watches.yaml."""
+    """Collection config for one watch: airports plus its departure windows
+    and trip lengths from watches.yaml.
+
+    With ``windows:`` (named, e.g. near/far) the watch must list its exact
+    trip lengths in ``nights:``; sentinels are minted for every window x
+    every length. Without it, the legacy single window (``window_months``,
+    30-day months) and ``trip_length_days`` range apply."""
+    if w.get("windows"):
+        if not w.get("nights"):
+            raise ValueError(f"watch {w['id']!r}: windows: requires nights:")
+        windows = [_window_cfg(n, spec)
+                   for n, spec in sorted(w["windows"].items())]
+        nights = sorted({int(n) for n in w["nights"]})
+        return {"origins": w["origins"], "destinations": w["destinations"],
+                "windows": windows, "nights": nights,
+                "window_days": (min(x["lo"] for x in windows),
+                                max(x["hi"] for x in windows)),
+                "durations": (nights[0], nights[-1])}
     lo_mo, hi_mo = w.get("window_months", [3, 9])
     lo_len, hi_len = w.get("trip_length_days", [5, 14])
     return {"origins": w["origins"], "destinations": w["destinations"],
