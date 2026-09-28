@@ -51,6 +51,65 @@ CATEGORY_CAPS = {
 }
 
 
+
+
+ALERT_MODES = ("collect", "cap")
+
+
+def alert_mode(w: dict) -> str:
+    """A watch's alert mode. watches.yaml defaults it to "collect"; a watch
+    dict without the key (legacy callers, tests) keeps the absolute-cap
+    rule it was written for."""
+    mode = w.get("alert_mode", "cap")
+    if mode not in ALERT_MODES:
+        raise ValueError(f"watch {w.get('id')!r}: unknown alert_mode {mode!r}")
+    return mode
+
+
+def is_legacy(watches) -> bool:
+    """Pre-redesign config: every watch on the cap rule, none with named
+    windows. Only then do the original CATEGORY_CAPS apply."""
+    return all(alert_mode(w) == "cap" and not w.get("windows")
+               for w in watches)
+
+
+def all_collect(watches) -> bool:
+    """True when every watch is in collect-only mode (redesign A2): nothing
+    scores, verifies, retries or bursts, so no budget is held for them."""
+    return bool(watches) and all(alert_mode(w) == "collect"
+                                 for w in watches)
+
+
+def effective_verify_reserve(watches) -> int:
+    """The verify reserve the guard and the pacer both hold back: 0 while
+    every watch only collects, else VERIFY_RESERVE."""
+    return 0 if all_collect(watches) else VERIFY_RESERVE
+
+
+def effective_category_caps(watches, daily_ceiling=DAILY_CEILING) -> dict:
+    """Per-category daily caps (maxima; the daily ceiling bounds the sum).
+
+    - Legacy config (``is_legacy``): the original CATEGORY_CAPS.
+    - Every watch collect-only: the whole ceiling goes to sentinels; the
+      alert-path categories get 0 (spec: collect mode releases them).
+    - Redesign with any alerting watch (mixed): sentinels get everything
+      but the verify reserve and the retry cap, so the stage gate
+      ``demand <= 0.9 x (ceiling - verify - retry)`` is actually fundable;
+      bursts run from surplus up to their 60 cap.
+    Background is 0 in every redesign config (spec: exploration off).
+    """
+    if is_legacy(watches):
+        return dict(CATEGORY_CAPS)
+    if all_collect(watches):
+        return {"sentinel": daily_ceiling, "verify": 0, "retry_reserve": 0,
+                "background": 0, "burst": 0, "manual": daily_ceiling}
+    retry = CATEGORY_CAPS["retry_reserve"]
+    return {"sentinel": daily_ceiling - VERIFY_RESERVE - retry,
+            "verify": CATEGORY_CAPS["verify"], "retry_reserve": retry,
+            "background": 0, "burst": CATEGORY_CAPS["burst"],
+            "manual": daily_ceiling}
+
+
 class BudgetExhausted(BaseException):
     """Raised when a reserve would exceed a budget. ``scope`` is one of
     "daily", "category", "per_run", "verify_reserve".
@@ -84,11 +143,13 @@ class BudgetGuard:
     """
 
     def __init__(self, db, *, per_run_max=PER_RUN_MAX,
-                 daily_ceiling=DAILY_CEILING, category_caps=None, day=None):
+                 daily_ceiling=DAILY_CEILING, category_caps=None, day=None,
+                 verify_reserve=VERIFY_RESERVE):
         self._db = db
         self._db_path = self._resolve_db_path(db)
         self._per_run_max = per_run_max
         self._daily_ceiling = daily_ceiling
+        self._verify_reserve = int(verify_reserve)
         self._category_caps = (dict(CATEGORY_CAPS) if category_caps is None
                                else dict(category_caps))
         # A fixed day only when given (tests); otherwise the UTC day is
@@ -106,6 +167,19 @@ class BudgetGuard:
     @property
     def _day(self) -> str:
         return self._fixed_day or store.today_str()
+
+    @property
+    def daily_ceiling(self) -> int:
+        return self._daily_ceiling
+
+    @property
+    def verify_reserve(self) -> int:
+        """Attempts held back for "verify"; the pacer reads the same value
+        (sentinel.daily_headroom), so the two can never disagree."""
+        return self._verify_reserve
+
+    def category_cap(self, category: str) -> int | None:
+        return self._category_caps.get(category)
 
     # -- connection handling ------------------------------------------
 
@@ -258,10 +332,11 @@ class BudgetGuard:
                     raise BudgetExhausted("daily", category,
                                           self._daily_ceiling, total)
                 # Verify reserve (v3 item 6): non-"verify" categories must
-                # not dip into the last VERIFY_RESERVE unspent attempts.
+                # not dip into the last verify_reserve unspent attempts
+                # (0 while every watch only collects).
                 if category != "verify":
                     verify_spent = store.count_today(db, day, "verify")
-                    headroom = max(0, VERIFY_RESERVE - verify_spent)
+                    headroom = max(0, self._verify_reserve - verify_spent)
                     # Allowed only if daily_remaining - 1 >= headroom.
                     if (self._daily_ceiling - total) - 1 < headroom:
                         raise BudgetExhausted("verify_reserve", category,

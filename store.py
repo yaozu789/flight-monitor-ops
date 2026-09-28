@@ -961,6 +961,55 @@ def retire_outbox(db: sqlite3.Connection, alert_id: str, reason: str) -> bool:
     return True
 
 
+def enter_collect_mode(db: sqlite3.Connection, watch_ids) -> dict:
+    """Silence the alert path for collect-only watches (redesign A2).
+
+    In ONE transaction: retire every non-terminal outbox row of these
+    watches, and expire their queued/active burst triggers together with
+    the burst progress. Run before the drain, so the first collect-mode run
+    can never relay an alert queued under the old cap rule. Idempotent: a
+    watch already in collect mode has nothing left to change. Returns the
+    changed counts; each retired alert is logged to health as
+    "mode_collect".
+    """
+    ids = sorted(set(watch_ids))
+    if not ids:
+        return {"outbox": 0, "triggers": 0, "bursts": 0}
+    marks = ",".join("?" * len(ids))
+    now = utcnow_iso()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        # Read, retire and log inside the same transaction, so the health
+        # audit and the returned count match exactly what was retired.
+        retired = [r["alert_id"] for r in db.execute(
+            f"""SELECT alert_id FROM outbox WHERE watch_id IN ({marks})
+                AND state IN ('pending', 'handoff_prepared',
+                              'relay_attempted_unconfirmed')""", ids)]
+        db.executemany(
+            """INSERT INTO health (check_name, ok, detail, checked_at)
+               VALUES ('outbox_retire', 1, ?, ?)""",
+            [(f"{aid}: mode_collect", now) for aid in retired])
+        db.execute(
+            f"""UPDATE outbox SET state='retired', updated_at=?
+                WHERE watch_id IN ({marks})
+                  AND state IN ('pending', 'handoff_prepared',
+                                'relay_attempted_unconfirmed')""",
+            [now, *ids])
+        trig = db.execute(
+            f"""UPDATE triggers SET status='expired'
+                WHERE group_id IN ({marks})
+                  AND status IN ('queued', 'burst_active')""", ids).rowcount
+        bursts = db.execute(
+            f"""UPDATE burst_progress SET status='expired', updated_at=?
+                WHERE group_id IN ({marks}) AND status='active'""",
+            [now, *ids]).rowcount
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    return {"outbox": len(retired), "triggers": trig, "bursts": bursts}
+
+
 # ---------------------------------------------------------------- slots & lock
 
 def claim_slot(db: sqlite3.Connection, slot: int, command: str) -> bool:
@@ -1203,7 +1252,8 @@ def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
 
 
 def due_cells(db: sqlite3.Connection, role: str, limit: int,
-              slot: int | None = None) -> list[dict]:
+              slot: int | None = None, overdue_only: bool = False,
+              group_ids=None) -> list[dict]:
     """Most overdue active cells first.
 
     Never-checked cells come first. With ``slot`` (the current 30-minute
@@ -1211,23 +1261,63 @@ def due_cells(db: sqlite3.Connection, role: str, limit: int,
     are: hours since the last check / ``refresh_hours``. That way a 48 h
     near-term cell outranks a 72 h far-term cell of the same age. Legacy
     cells (``refresh_hours`` NULL) and calls without ``slot`` fall back to
-    plain least-recently-checked rotation.
+    plain least-recently-checked rotation. ``overdue_only`` (needs
+    ``slot``) keeps only named-window cells at or past their target.
+    ``group_ids`` restricts to those groups BEFORE the limit, so cells of a
+    watch that is no longer configured never fill a run's batch.
     """
+    where, params = "role = ? AND active = 1", [role]
+    if group_ids is not None:
+        ids = sorted(set(group_ids))
+        if not ids:
+            return []
+        where += f" AND group_id IN ({','.join('?' * len(ids))})"
+        params += ids
+    if overdue_only:
+        return [dict(r) for r in db.execute(
+            f"""SELECT * FROM cells
+                WHERE {where} AND refresh_hours IS NOT NULL
+                  AND (last_checked_slot IS NULL
+                       OR (? - last_checked_slot) >= refresh_hours * 2)
+                ORDER BY last_checked_slot IS NULL DESC,
+                         (? - last_checked_slot) / (refresh_hours * 2.0) DESC,
+                         id ASC
+                LIMIT ?""", [*params, slot, slot, limit])]
     if slot is None:
         return [dict(r) for r in db.execute(
-            """SELECT * FROM cells
-               WHERE role = ? AND active = 1
-               ORDER BY last_checked_slot IS NULL DESC, last_checked_slot ASC,
-                        id ASC
-               LIMIT ?""", (role, limit))]
+            f"""SELECT * FROM cells
+                WHERE {where}
+                ORDER BY last_checked_slot IS NULL DESC,
+                         last_checked_slot ASC, id ASC
+                LIMIT ?""", [*params, limit])]
     return [dict(r) for r in db.execute(
-        """SELECT * FROM cells
-           WHERE role = ? AND active = 1
-           ORDER BY last_checked_slot IS NULL DESC,
-                    (? - last_checked_slot) / (COALESCE(refresh_hours, 48) * 2.0)
-                        DESC,
-                    last_checked_slot ASC, id ASC
-           LIMIT ?""", (role, slot, limit))]
+        f"""SELECT * FROM cells
+            WHERE {where}
+            ORDER BY last_checked_slot IS NULL DESC,
+                     (? - last_checked_slot)
+                         / (COALESCE(refresh_hours, 48) * 2.0) DESC,
+                     last_checked_slot ASC, id ASC
+            LIMIT ?""", [*params, slot, limit])]
+
+
+def overdue_sentinels(db: sqlite3.Connection, slot: int, group_ids) -> int:
+    """Active named-window sentinels of ``group_ids`` at or past their
+    refresh target (or never checked) at ``slot``. Only groups this run can
+    check count, so a removed watch's leftover cells never block bursts.
+    Legacy cells (no refresh target) never count. Bursts wait while this is
+    non-zero (spec: surplus only)."""
+    ids = sorted(set(group_ids))
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    return db.execute(
+        f"""SELECT COUNT(*) AS c FROM cells
+            WHERE role = 'sentinel' AND active = 1
+              AND group_id IN ({marks})
+              AND refresh_hours IS NOT NULL
+              AND (last_checked_slot IS NULL
+                   OR (? - last_checked_slot) >= refresh_hours * 2)""",
+        [*ids, slot]).fetchone()["c"]
 
 
 def record_cell_check(db: sqlite3.Connection, cell_id: int, slot: int,

@@ -323,6 +323,11 @@ def ensure_background_grid(db, groups_cfg, today=None) -> int:
 
     cells = []
     for group_id, group_cfg in groups_cfg.items():
+        if group_cfg.get("windows"):
+            # Named-window watches have no background grid (redesign: the
+            # 10-duration exploration is off); the retire pass below drops
+            # any cells an earlier config left.
+            continue
         lo_d, hi_d = _window_days(group_cfg)
         durations = _durations(group_cfg)
         # Weekly departures on the fixed lattice (Mondays from GRID_EPOCH).
@@ -441,9 +446,12 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
 
 def daily_headroom(guard) -> int:
     """Non-verify attempts still spendable today (the verify reserve is
-    held back for the verifier)."""
-    return (DAILY_CEILING - guard.spent_today()
-            - max(0, VERIFY_RESERVE - guard.spent_today("verify")))
+    held back for the verifier). Ceiling and reserve come from the guard,
+    so pacing matches what ``reserve()`` will actually allow."""
+    ceiling = getattr(guard, "daily_ceiling", DAILY_CEILING)
+    reserve = getattr(guard, "verify_reserve", VERIFY_RESERVE)
+    return (ceiling - guard.spent_today()
+            - max(0, reserve - guard.spent_today("verify")))
 
 
 def per_run_allowance(guard, slot, cadence_slots: int = 1) -> int:
@@ -518,14 +526,17 @@ def _queue_drop_trigger(db, cell: dict, price: float, slot: int) -> bool:
 
 def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
                    top_n: int, category: str, result: dict, allowance: int,
-                   count_key: str, deadline_fn=None, seen=None) -> None:
+                   count_key: str, deadline_fn=None, seen=None,
+                   collect_groups=frozenset(), overdue_only=False) -> None:
     remaining = allowance - result["attempts"]
     if remaining <= 0:
         return
     seen = seen if seen is not None else set()
     # Over-fetch so cells already checked this run (a second pass on
     # leftover allowance) can be skipped without starving the phase.
-    for cell in store.due_cells(db, role, remaining + len(seen), slot=slot):
+    for cell in store.due_cells(db, role, remaining + len(seen), slot=slot,
+                                overdue_only=overdue_only,
+                                group_ids=groups_cfg):
         if cell["id"] in seen:
             continue
         if deadline_fn is not None and deadline_fn():
@@ -546,13 +557,15 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
             top_n=top_n, category=category, slot=slot, run_start=run_start)
         result["attempts"] += used
         result[count_key] += 1
+        if cell["group_id"] in collect_groups:
+            continue  # collect-only: prices are stored, nothing triggers
         if _is_drop(prev_price, prev_ts, price):
             if _queue_drop_trigger(db, cell, price, slot):
                 result["drop_triggers"] += 1
 
 
 def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
-            cadence_slots: int = 1) -> dict:
+            cadence_slots: int = 1, collect_groups=frozenset()) -> dict:
     """One collection pass (v3 order).
 
     Priority: sentinels (due_sentinels, top_n=1, "sentinel") -> bursts
@@ -606,13 +619,21 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
     sentinel_share = math.ceil(allowance / 2)
     checked: set = set()  # cells checked this run: never twice
 
-    def sentinels(limit):
+    def sentinels(limit, overdue_only=False):
         _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "sentinel", SENTINEL_TOP_N, "sentinel",
-                       result, limit, "sentinels", deadline_fn, checked)
+                       result, limit, "sentinels", deadline_fn, checked,
+                       collect_groups, overdue_only)
 
     def bursts():
+        # Bursts spend only surplus: while any named-window sentinel is due,
+        # its refresh comes first (a 60-attempt burst could otherwise eat
+        # the budget the sentinel targets depend on).
+        if store.overdue_sentinels(db, slot, groups_cfg):
+            return
         for trig in store.due_triggers(db, slot):
+            if trig["group_id"] in collect_groups:
+                continue  # expired on entering collect mode; never burst
             if deadline_fn is not None and deadline_fn():
                 raise store.DeadlineExceeded("burst phase deadline exceeded")
             left = allowance - result["attempts"]
@@ -630,11 +651,13 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
     def background():
         _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "background", DETAIL_TOP_N, "background",
-                       result, allowance, "background", deadline_fn, checked)
+                       result, allowance, "background", deadline_fn, checked,
+                       collect_groups)
 
     order = [lambda: sentinels(sentinel_share), bursts, background,
              lambda: sentinels(allowance)]
-    if (slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N
+    windowed = any(c.get("windows") for c in groups_cfg.values())
+    if (not windowed and slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N
             and daily_headroom(guard) >= 1 + DETAIL_TOP_N):
         # A background check needs 1 + DETAIL_TOP_N sends; the ~3-attempt
         # share of a 30-minute run never fits one. Odd runs borrow up to a
@@ -648,6 +671,13 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
         # 3 at a 30-minute cadence) still reaches bursts and background.
         order = [bursts, background, lambda: sentinels(sentinel_share),
                  lambda: sentinels(allowance)]
+    if windowed:
+        # Named windows (redesign): every overdue sentinel first, with the
+        # whole allowance; then bursts from what is left (they wait while
+        # any sentinel is still due); then the plain rotation. No slot
+        # parity: the refresh targets, not alternation, decide priority.
+        order = [lambda: sentinels(allowance, overdue_only=True), bursts,
+                 background, lambda: sentinels(allowance)]
     result["allowance"] = allowance
     for step in order:
         if not phase(step):
