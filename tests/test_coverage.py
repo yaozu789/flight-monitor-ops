@@ -271,6 +271,13 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate["checks"]["no_deadline_stops"])
         self.assertFalse(gate["checks"]["no_throttles"])
 
+    def test_manual_search_throttle_blocks_the_step(self):
+        """A 429 during a manual narrow/canary search writes no query_log
+        or run_slots row, only the transport's health record."""
+        db = self._db(outcomes={"ok": 100})
+        store.set_backoff(db, "429", 0.0, None, "manual canary")
+        self.assertFalse(self._gate(db)["checks"]["no_throttles"])
+
     def test_short_window_cannot_shorten_the_gate(self):
         db = self._db(outcomes={"ok": 100}, old_history=False)
         report = fm_run.coverage_report(db, [{"id": "nyc"}], BudgetGuard(db),

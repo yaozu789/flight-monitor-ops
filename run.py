@@ -919,9 +919,15 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
              AND COALESCE(finished_at, claimed_at) >= ?
            GROUP BY status""", (since,))}
     deadline_stops = stops.get("deadline", 0)
-    # A throttle can hit outside a collection query (e.g. a recheck), so
-    # throttled runs count too.
-    throttles = queries["throttle"] + stops.get("throttled", 0)
+    # Every throttle the transport sees is logged to health (store.
+    # set_backoff), including manual narrow/canary searches that write no
+    # query_log or run_slots row; throttled runs and query rows count too.
+    health_throttles = db.execute(
+        """SELECT COUNT(*) AS c FROM health
+           WHERE check_name = 'throttle' AND ok = 0 AND checked_at >= ?""",
+        (since,)).fetchone()["c"]
+    throttles = max(health_throttles,
+                    queries["throttle"] + stops.get("throttled", 0))
     # History counts only at the CURRENT budget stage: days spent at the
     # previous ceiling say nothing about the one just raised.
     first = db.execute("SELECT MIN(at) AS a FROM query_log WHERE ceiling = ?",
