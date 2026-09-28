@@ -19,7 +19,7 @@ Source: the Claude × Codex redesign debate (6 rounds, 2026-09-28; kept in Yaozu
 - Bursts are clipped to the trigger's window, for both neighbour dates and durations.
 - **Trip lengths (Yaozu, 2026-09-28):**
   - **Asia** (Japan, HKG, Shanghai, Beijing): about a month, so sentinel 28 nights.
-  - **LA / SD:** weekend trips, leaving **Friday or Saturday morning** and returning Sunday (Fri 2 nights, Sat 1; `return_weekday: 6`). The near window enumerates **every Friday and Saturday** in D+7…D+42, independent of the 2-day lattice: 5–6 of each, with no fixed cap. Bursts on these windows give each neighbour its own Sunday-return stay and skip the duration sweep.
+  - **LA / SD** (before activation in PR B, add a departure-time filter so Saturday means a *morning* flight): weekend trips, leaving **Friday or Saturday morning** and returning Sunday (Fri 2 nights, Sat 1; `return_weekday: 6`). The near window enumerates **every Friday and Saturday** in D+7…D+42, independent of the 2-day lattice: 5–6 of each, with no fixed cap. Bursts on these windows give each neighbour its own Sunday-return stay and skip the duration sweep.
   - **NYC:** 1 or 2 weeks, so sentinel cells at both 7 and 14 nights (2 × 18 near anchors).
 - The background grid (10-duration exploration) is **disabled** (cap 0). **Later (Yaozu, 2026-09-28):** checking every trip length is wanted if bandwidth allows, but the priority lengths above come first. So exploration of other lengths returns only as **opportunistic surplus**: it spends only what is left after due sentinel work, verify, retry and bursts, and never delays a priority cell. That is a separate PR after stage 300 is stable.
 - Windows of one watch must not overlap (config error), because cells are keyed by (group, date, length). A background upsert never changes an active sentinel's window or refresh target.
@@ -83,6 +83,10 @@ Source: the Claude × Codex redesign debate (6 rounds, 2026-09-28; kept in Yaozu
 
 ## Sequencing
 0. Amend #28 → Yaozu approves → deploy. Keep the 30-minute schedule running meanwhile (it collects Japan far-window history).
-1. **PR A:** named windows, collect mode, verify-reserve function, outcome counters, digest rewrite. Stage A only, at 150.
+1. **PR A**, in four parts. Stage A (Japan, NYC) switches on in A2, never before collect mode:
+   - **A1:** named windows, exact trip lengths, weekend returns, burst clipping (dormant on `main`).
+   - **A2:** collect mode (expires queued/partial bursts on entry), verify-reserve function, category caps, background grid off, Stage A config at 150.
+   - **A3:** outcome counters and refresh-age reporting.
+   - **A4:** weekly digest rewrite.
 2. **PR B:** Phase 2 groups and ceiling ramp steps, each gated and each approved by Yaozu.
 3. **PR C:** relative alerts, switched on per watch as its buckets arm (≥ 14 days after collection starts).

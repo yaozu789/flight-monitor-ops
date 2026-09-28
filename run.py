@@ -432,6 +432,11 @@ def _window_cfg(name: str, spec: dict) -> dict:
         raise ValueError(f"window {name!r} needs refresh_hours:")
     if "return_weekday" in spec and not spec.get("weekdays"):
         raise ValueError(f"window {name!r}: return_weekday needs weekdays:")
+    days = list(spec.get("weekdays") or [])
+    if "return_weekday" in spec:
+        days.append(spec["return_weekday"])
+    if any(not 0 <= int(d) <= 6 for d in days):
+        raise ValueError(f"window {name!r}: weekdays run 0 (Mon) .. 6 (Sun)")
     return {"name": name, "lo": lo, "hi": hi,
             "refresh_hours": int(spec["refresh_hours"]),
             "step_days": spec.get("step_days"),

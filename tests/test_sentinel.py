@@ -1354,6 +1354,15 @@ class TestNamedWindows(SentinelTestBase):
                 "windows": {"near": {"days": [7, 42], "refresh_hours": 48},
                             "mid": {"days": [30, 90], "refresh_hours": 72}}})
 
+    def test_weekday_out_of_range_rejected(self):
+        import run
+        with self.assertRaises(ValueError):
+            run.group_cfg_for({
+                "id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+                "windows": {"near": {"days": [7, 42], "weekdays": [5, 7],
+                                     "return_weekday": 6,
+                                     "refresh_hours": 48}}})
+
     def test_weekend_window_leaves_fri_or_sat_returns_sunday(self):
         import run
         cfg = run.group_cfg_for({
