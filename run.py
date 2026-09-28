@@ -417,7 +417,9 @@ def cadence_slots(watches: list[dict]) -> int:
 def _window_cfg(name: str, spec: dict) -> dict:
     """One named window from watches.yaml: ``days: [lo, hi]`` or
     ``months: [lo, hi]`` (30-day months), ``refresh_hours``, and optionally
-    ``step_days`` or ``weekdays`` (0 = Monday)."""
+    ``step_days`` or ``weekdays`` (0 = Monday). ``return_weekday`` (with
+    ``weekdays``) fixes the return day instead of using ``nights``: leave
+    Fri or Sat, return Sun."""
     if "days" in spec:
         lo, hi = (int(x) for x in spec["days"])
     elif "months" in spec:
@@ -428,10 +430,13 @@ def _window_cfg(name: str, spec: dict) -> dict:
         raise ValueError(f"window {name!r} has bad bounds {lo}..{hi}")
     if "refresh_hours" not in spec:
         raise ValueError(f"window {name!r} needs refresh_hours:")
+    if "return_weekday" in spec and not spec.get("weekdays"):
+        raise ValueError(f"window {name!r}: return_weekday needs weekdays:")
     return {"name": name, "lo": lo, "hi": hi,
             "refresh_hours": int(spec["refresh_hours"]),
             "step_days": spec.get("step_days"),
-            "weekdays": spec.get("weekdays")}
+            "weekdays": spec.get("weekdays"),
+            "return_weekday": spec.get("return_weekday")}
 
 
 def group_cfg_for(w: dict) -> dict:
@@ -443,11 +448,22 @@ def group_cfg_for(w: dict) -> dict:
     every length. Without it, the legacy single window (``window_months``,
     30-day months) and ``trip_length_days`` range apply."""
     if w.get("windows"):
-        if not w.get("nights"):
-            raise ValueError(f"watch {w['id']!r}: windows: requires nights:")
         windows = [_window_cfg(n, spec)
                    for n, spec in sorted(w["windows"].items())]
-        nights = sorted({int(n) for n in w["nights"]})
+        if not w.get("nights") and not all(x["return_weekday"] is not None
+                                           for x in windows):
+            raise ValueError(f"watch {w['id']!r}: windows: requires nights:")
+        # Cells are keyed by (group, date, length), not window: overlapping
+        # windows would share rows and fight over their refresh target.
+        spans = sorted((x["lo"], x["hi"], x["name"]) for x in windows)
+        for (_, hi, a), (lo, _, b) in zip(spans, spans[1:]):
+            if lo <= hi:
+                raise ValueError(
+                    f"watch {w['id']!r}: windows {a!r} and {b!r} overlap")
+        nights = sorted({int(n) for n in w.get("nights") or []}
+                        | {(int(x["return_weekday"]) - int(d)) % 7 or 7
+                           for x in windows if x["return_weekday"] is not None
+                           for d in x["weekdays"]})
         return {"origins": w["origins"], "destinations": w["destinations"],
                 "windows": windows, "nights": nights,
                 "window_days": (min(x["lo"] for x in windows),

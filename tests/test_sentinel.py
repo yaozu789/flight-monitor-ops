@@ -1333,6 +1333,53 @@ class TestNamedWindows(SentinelTestBase):
         self.assertEqual(min(date.fromisoformat(d) for _, k, d, _ in first
                              if k == "neighbour"), lo)
 
+    def test_background_never_relabels_sentinels(self):
+        """The background grid shares (group, date, length) with some
+        sentinels; its upsert must not wipe their window or refresh target."""
+        cfg = {"g1": _windowed([NEAR, FAR], [7])}
+        sentinel.mint_sentinels(self.db, cfg, today=TODAY)
+        sentinel.ensure_background_grid(self.db, cfg, today=TODAY)
+        lost = self.db.execute(
+            "SELECT COUNT(*) AS c FROM cells WHERE role='sentinel' "
+            "AND (window_name IS NULL OR refresh_hours IS NULL)"
+        ).fetchone()["c"]
+        self.assertEqual(lost, 0)
+
+    def test_overlapping_windows_rejected(self):
+        import run
+        with self.assertRaises(ValueError):
+            run.group_cfg_for({
+                "id": "x", "origins": ["SFO"], "destinations": ["NRT"],
+                "nights": [7],
+                "windows": {"near": {"days": [7, 42], "refresh_hours": 48},
+                            "mid": {"days": [30, 90], "refresh_hours": 72}}})
+
+    def test_weekend_window_leaves_fri_or_sat_returns_sunday(self):
+        import run
+        cfg = run.group_cfg_for({
+            "id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+            "windows": {"near": {"days": [7, 42], "weekdays": [4, 5],
+                                 "return_weekday": 6, "refresh_hours": 48}}})
+        sentinel.mint_sentinels(self.db, {"la": cfg}, today=TODAY)
+        rows = self._active("la")
+        self.assertEqual(len(rows), 10)  # 5 Fridays + 5 Saturdays
+        for r in rows:
+            ret = (date.fromisoformat(r["depart_date"])
+                   + timedelta(days=r["duration"]))
+            self.assertEqual(ret.weekday(), 6)
+        self.assertEqual({(r["weekday"], r["duration"]) for r in rows},
+                         {(4, 2), (5, 1)})
+        trig = {"depart_date": rows[3]["depart_date"],
+                "duration": rows[3]["duration"],
+                "created_at": TODAY + "T12:00:00+00:00"}
+        steps = list(sentinel._burst_steps(
+            trig, sentinel._durations(cfg),
+            sentinel._trigger_window(trig, cfg)))
+        self.assertFalse([k for _, k, _, _ in steps if k == "duration"])
+        for _, k, d, n in steps:
+            ret = date.fromisoformat(d) + timedelta(days=n)
+            self.assertEqual(ret.weekday(), 6)
+
     def test_migration_adds_window_columns(self):
         path = os.path.join(self.tmpdir, "old.db")
         old = store.get_db(path)

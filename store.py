@@ -1169,9 +1169,9 @@ def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
     n = 0
     now = utcnow_iso()
     for c in cells:
-        # A named window's cell also takes the window's name and refresh
-        # target (a cell minted before windows existed, or by another
-        # window, is relabelled rather than duplicated).
+        # A sentinel takes its window's name and refresh target (a cell
+        # minted before windows existed is relabelled, not duplicated). A
+        # background upsert never changes an active sentinel's window.
         cur = db.execute(
             """INSERT INTO cells
                (group_id, depart_date, duration, role, weekday, created_at,
@@ -1182,12 +1182,19 @@ def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
                                OR cells.active = 0
                              THEN excluded.role ELSE cells.role END,
                  active = 1, retired_at = NULL,
-                 window_name = excluded.window_name,
-                 refresh_hours = excluded.refresh_hours
+                 window_name = CASE WHEN excluded.role = 'sentinel'
+                                      OR cells.active = 0
+                                    THEN excluded.window_name
+                                    ELSE cells.window_name END,
+                 refresh_hours = CASE WHEN excluded.role = 'sentinel'
+                                        OR cells.active = 0
+                                      THEN excluded.refresh_hours
+                                      ELSE cells.refresh_hours END
                WHERE cells.active = 0
                   OR (excluded.role = 'sentinel' AND cells.role <> 'sentinel')
-                  OR cells.window_name IS NOT excluded.window_name
-                  OR cells.refresh_hours IS NOT excluded.refresh_hours""",
+                  OR (excluded.role = 'sentinel'
+                      AND (cells.window_name IS NOT excluded.window_name
+                           OR cells.refresh_hours IS NOT excluded.refresh_hours))""",
             (c["group_id"], c["depart_date"], c["duration"], c["role"],
              c["weekday"], now, c.get("window"), c.get("refresh_hours")))
         n += cur.rowcount

@@ -19,9 +19,10 @@ Source: the Claude × Codex redesign debate (6 rounds, 2026-09-28; kept in Yaozu
 - Bursts are clipped to the trigger's window, for both neighbour dates and durations.
 - **Trip lengths (Yaozu, 2026-09-28):**
   - **Asia** (Japan, HKG, Shanghai, Beijing): about a month, so sentinel 28 nights.
-  - **LA / SD:** weekend trips, Friday → Sunday (2 nights). The near window enumerates **every Friday** in D+7…D+42, independent of the 2-day lattice: 5 Fridays, or 6 when D+7 is a Friday. There is no fixed cap.
+  - **LA / SD:** weekend trips, leaving **Friday or Saturday morning** and returning Sunday (Fri 2 nights, Sat 1; `return_weekday: 6`). The near window enumerates **every Friday and Saturday** in D+7…D+42, independent of the 2-day lattice: 5–6 of each, with no fixed cap. Bursts on these windows give each neighbour its own Sunday-return stay and skip the duration sweep.
   - **NYC:** 1 or 2 weeks, so sentinel cells at both 7 and 14 nights (2 × 18 near anchors).
-- The background grid (10-duration exploration) is **disabled** (cap 0). Re-enabling it is a separate decision.
+- The background grid (10-duration exploration) is **disabled** (cap 0). **Later (Yaozu, 2026-09-28):** checking every trip length is wanted if bandwidth allows, but the priority lengths above come first. So exploration of other lengths returns only as **opportunistic surplus**: it spends only what is left after due sentinel work, verify, retry and bursts, and never delays a priority cell. That is a separate PR after stage 300 is stable.
+- Windows of one watch must not overlap (config error), because cells are keyed by (group, date, length). A background upsert never changes an active sentinel's window or refresh target.
 - **Durations are explicit per group, with no clamping.** Today `_sentinel_duration()` clamps to the 5–14 range, and `_burst_steps()` sweeps that range. Asia must include 28, LA/SD 2, and NYC must mint both 7- and 14-night cells. Test: each group mints its lengths; burst duration steps stay within the group's lengths and the 60-attempt cap, and never retry an unaffordable step.
 - The window bounds the **departure** only. A return after the window (e.g. D+42 + 28) is valid.
 
@@ -32,15 +33,15 @@ Source: the Claude × Codex redesign debate (6 rounds, 2026-09-28; kept in Yaozu
   |---|---|---|
   | Asia near | 4 groups × 18 | 72 |
   | NYC near | 18 anchors × 2 lengths | 36 |
-  | LA + SD near | 2 groups × 5–6 Fridays | 10–12 |
+  | LA + SD near | 2 groups × 10–12 Fri/Sat | 20–24 |
   | Asia far | 4 groups × 26 | 69.3 |
-  | **Total sentinel** | | **187.3–189.3** |
+  | **Total sentinel** | | **197.3–201.3** |
 
   This is below the 195.3 used in the debate, so every gate still holds.
-- **Ceiling ramp 150 → 225 → 300.** At 300: 189.3 + verify 24 + retry 12 = 225.3 committed, with bursts (cap 60) running from the remaining surplus. Worst case 285.3.
+- **Ceiling ramp 150 → 225 → 300.** At 300: 201.3 + verify 24 + retry 12 = 237.3 committed, with bursts (cap 60) running from the remaining surplus. Worst case 297.3. Gate 0.9 × 264 = 237.6 ≥ 201.3.
 - **Stage activation gate:** demand ≤ 0.9 × (ceiling − verify reserve − retry cap).
   - Stage A (at 150): Japan near + far and NYC near (2 lengths) = 18 + 17.3 + 36 = **71.3/day**.
-  - At 225: + LA and SD near, + HKG = 71.3 + 10 + 35.3 = 116.6 (gate 170.1).
+  - At 225: + LA and SD near, + HKG = 71.3 + 24 + 35.3 = 130.6 (gate 170.1).
   - At 300: all 7 (gate 237.6).
 - **Step advancement** requires, over ≥ 5 days:
   - 0 throttles

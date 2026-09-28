@@ -191,6 +191,15 @@ def _window_dates(win: dict, start: date, end: date) -> list[date]:
     return out
 
 
+def _fixed_return_nights(win: dict | None, d: date) -> int | None:
+    """Stay that returns on the window's ``return_weekday`` (e.g. leave Fri
+    -> 2 nights, Sat -> 1 night for a Sunday return), or None when the
+    window uses the watch's ``nights``."""
+    if not win or win.get("return_weekday") is None:
+        return None
+    return (int(win["return_weekday"]) - d.weekday()) % 7 or 7
+
+
 def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
     return (today_d + timedelta(days=int(win["lo"])),
             today_d + timedelta(days=int(win["hi"])))
@@ -243,7 +252,9 @@ def mint_sentinels(db, groups_cfg, today=None) -> int:
             for win in group_cfg["windows"]:
                 start, end = _window_bounds(win, today_d)
                 for d in _window_dates(win, start, end):
-                    for duration in _durations(group_cfg):
+                    fixed = _fixed_return_nights(win, d)
+                    for duration in ([fixed] if fixed is not None
+                                     else _durations(group_cfg)):
                         cells.append({
                             "group_id": group_id,
                             "depart_date": d.isoformat(),
@@ -694,7 +705,9 @@ def _burst_steps(trigger, durations=None, window=None):
     ``window`` (``{"start", "end", "weekdays"}``, from ``_trigger_window``)
     clips neighbours to the trigger's departure window and weekdays, so a
     near-term trigger never searches past dates or a weekend window a
-    Tuesday. Step indices stay consecutive over the kept steps.
+    Tuesday. A fixed-return window (``return_weekday``) gives each
+    neighbour its own stay (Fri 2 nights, Sat 1) and has no duration sweep.
+    Step indices stay consecutive over the kept steps.
     """
     yield 0, "revalidate", trigger["depart_date"], trigger["duration"]
     base = date.fromisoformat(trigger["depart_date"])
@@ -707,8 +720,12 @@ def _burst_steps(trigger, durations=None, window=None):
                     continue
                 if window["weekdays"] and d.weekday() not in window["weekdays"]:
                     continue
-            yield (idx, "neighbour", d.isoformat(), trigger["duration"])
+            fixed = _fixed_return_nights(window, d)
+            yield (idx, "neighbour", d.isoformat(),
+                   fixed if fixed is not None else trigger["duration"])
             idx += 1
+    if window is not None and window.get("return_weekday") is not None:
+        return
     for dur in (durations or range(5, 15)):
         if dur == trigger["duration"]:
             continue
@@ -732,7 +749,8 @@ def _trigger_window(trigger, group_cfg):
         start, end = _window_bounds(win, queued)
         if start <= dep <= end:
             return {"start": start, "end": end,
-                    "weekdays": {int(w) for w in win.get("weekdays") or []}}
+                    "weekdays": {int(w) for w in win.get("weekdays") or []},
+                    "return_weekday": win.get("return_weekday")}
     return None
 
 
