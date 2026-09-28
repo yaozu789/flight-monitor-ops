@@ -644,8 +644,7 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
 
 def collect_watch_ids(watches) -> set[str]:
     """Watches in collect-only mode: prices are stored, nothing alerts."""
-    return {w["id"] for w in watches
-            if w.get("alert_mode", "cap") == "collect"}
+    return {w["id"] for w in watches if budget.alert_mode(w) == "collect"}
 
 
 def _stalled(guard, collected) -> bool:

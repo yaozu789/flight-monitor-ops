@@ -95,8 +95,34 @@ class BudgetReleaseTests(unittest.TestCase):
         self.assertEqual(caps["sentinel"], budget.DAILY_CEILING)
         for cat in ("verify", "retry_reserve", "background", "burst"):
             self.assertEqual(caps[cat], 0)
-        self.assertEqual(budget.effective_category_caps([COLLECT, CAP]),
-                         budget.CATEGORY_CAPS)
+        self.assertEqual(budget.effective_category_caps([CAP]),
+                         budget.CATEGORY_CAPS)  # legacy config unchanged
+
+    def test_mixed_modes_fund_sentinels_and_keep_background_off(self):
+        """One alerting watch must not drop sentinels back to the legacy 54
+        (Stage A alone needs 71.3) or re-enable the background grid."""
+        windowed = dict(COLLECT, windows={"near": {}})
+        caps = budget.effective_category_caps(
+            [windowed, dict(CAP, windows={"near": {}})])
+        self.assertEqual(caps["sentinel"],
+                         budget.DAILY_CEILING - budget.VERIFY_RESERVE
+                         - budget.CATEGORY_CAPS["retry_reserve"])
+        self.assertGreater(caps["sentinel"], 71.3 / 0.9)
+        self.assertEqual(caps["background"], 0)
+        self.assertEqual(caps["verify"], budget.VERIFY_RESERVE)
+        self.assertEqual(budget.effective_category_caps([windowed, CAP])
+                         ["background"], 0)
+
+    def test_config_default_is_collect_and_unknown_mode_rejected(self):
+        """watches.yaml defaults alert_mode to collect, so a watch added
+        without one never alerts on the cap rule."""
+        defaults, _ = fm_run.load_config()
+        merged = {**defaults, "id": "new", "origins": ["SFO"],
+                  "destinations": ["LAX"], "absolute_cap_usd": 100}
+        self.assertEqual(budget.alert_mode(merged), "collect")
+        self.assertEqual(fm_run.collect_watch_ids([merged]), {"new"})
+        with self.assertRaises(ValueError):
+            budget.alert_mode(dict(COLLECT, alert_mode="relative-ish"))
 
     def test_collect_sentinels_can_spend_the_whole_ceiling(self):
         """Stage A needs 71.3 sentinel attempts/day; the old 54 cap and the
@@ -147,6 +173,10 @@ class EnterCollectModeTests(unittest.TestCase):
         counts = store.enter_collect_mode(db, {"w1"})
 
         self.assertEqual(counts["outbox"], 3)
+        logged = [r["detail"] for r in db.execute(
+            "SELECT detail FROM health WHERE check_name='outbox_retire'")]
+        self.assertEqual(sorted(logged), sorted(
+            f"{a}: mode_collect" for a in (pending, prepared, relayed)))
         for aid in (pending, prepared, relayed):
             self.assertEqual(_state(db, aid), "retired")
         self.assertEqual(_state(db, confirmed), "user_confirmed")

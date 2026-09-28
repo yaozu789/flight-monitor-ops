@@ -11,6 +11,7 @@ defaults:
   cooldown_hours: 24            # don't re-alert same itinerary within 24h
   currency: USD
   run_every_minutes: 30         # must match the Muse schedule; drives budget pacing
+  alert_mode: collect           # a new watch only collects until switched on
 
 # Named departure windows (redesign, docs: Redesign_spec.md). A watch with
 # `windows:` lists its exact trip lengths in `nights:` and ignores the

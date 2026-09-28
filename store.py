@@ -977,12 +977,18 @@ def enter_collect_mode(db: sqlite3.Connection, watch_ids) -> dict:
         return {"outbox": 0, "triggers": 0, "bursts": 0}
     marks = ",".join("?" * len(ids))
     now = utcnow_iso()
-    retired = [r["alert_id"] for r in db.execute(
-        f"""SELECT alert_id FROM outbox WHERE watch_id IN ({marks})
-            AND state IN ('pending', 'handoff_prepared',
-                          'relay_attempted_unconfirmed')""", ids)]
     try:
         db.execute("BEGIN IMMEDIATE")
+        # Read, retire and log inside the same transaction, so the health
+        # audit and the returned count match exactly what was retired.
+        retired = [r["alert_id"] for r in db.execute(
+            f"""SELECT alert_id FROM outbox WHERE watch_id IN ({marks})
+                AND state IN ('pending', 'handoff_prepared',
+                              'relay_attempted_unconfirmed')""", ids)]
+        db.executemany(
+            """INSERT INTO health (check_name, ok, detail, checked_at)
+               VALUES ('outbox_retire', 1, ?, ?)""",
+            [(f"{aid}: mode_collect", now) for aid in retired])
         db.execute(
             f"""UPDATE outbox SET state='retired', updated_at=?
                 WHERE watch_id IN ({marks})
@@ -1001,8 +1007,6 @@ def enter_collect_mode(db: sqlite3.Connection, watch_ids) -> dict:
     except BaseException:
         db.rollback()
         raise
-    for aid in retired:
-        add_health(db, "outbox_retire", True, f"{aid}: mode_collect")
     return {"outbox": len(retired), "triggers": trig, "bursts": bursts}
 
 

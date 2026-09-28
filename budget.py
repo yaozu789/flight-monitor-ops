@@ -53,10 +53,30 @@ CATEGORY_CAPS = {
 
 
 
+ALERT_MODES = ("collect", "cap")
+
+
+def alert_mode(w: dict) -> str:
+    """A watch's alert mode. watches.yaml defaults it to "collect"; a watch
+    dict without the key (legacy callers, tests) keeps the absolute-cap
+    rule it was written for."""
+    mode = w.get("alert_mode", "cap")
+    if mode not in ALERT_MODES:
+        raise ValueError(f"watch {w.get('id')!r}: unknown alert_mode {mode!r}")
+    return mode
+
+
+def is_legacy(watches) -> bool:
+    """Pre-redesign config: every watch on the cap rule, none with named
+    windows. Only then do the original CATEGORY_CAPS apply."""
+    return all(alert_mode(w) == "cap" and not w.get("windows")
+               for w in watches)
+
+
 def all_collect(watches) -> bool:
     """True when every watch is in collect-only mode (redesign A2): nothing
     scores, verifies, retries or bursts, so no budget is held for them."""
-    return bool(watches) and all(w.get("alert_mode", "cap") == "collect"
+    return bool(watches) and all(alert_mode(w) == "collect"
                                  for w in watches)
 
 
@@ -67,13 +87,27 @@ def effective_verify_reserve(watches) -> int:
 
 
 def effective_category_caps(watches, daily_ceiling=DAILY_CEILING) -> dict:
-    """Per-category daily caps. While every watch only collects, the whole
-    ceiling goes to sentinels and the alert-path categories get 0 (spec:
-    collect mode releases unused categories); otherwise CATEGORY_CAPS."""
-    if not all_collect(watches):
+    """Per-category daily caps (maxima; the daily ceiling bounds the sum).
+
+    - Legacy config (``is_legacy``): the original CATEGORY_CAPS.
+    - Every watch collect-only: the whole ceiling goes to sentinels; the
+      alert-path categories get 0 (spec: collect mode releases them).
+    - Redesign with any alerting watch (mixed): sentinels get everything
+      but the verify reserve and the retry cap, so the stage gate
+      ``demand <= 0.9 x (ceiling - verify - retry)`` is actually fundable;
+      bursts run from surplus up to their 60 cap.
+    Background is 0 in every redesign config (spec: exploration off).
+    """
+    if is_legacy(watches):
         return dict(CATEGORY_CAPS)
-    return {"sentinel": daily_ceiling, "verify": 0, "retry_reserve": 0,
-            "background": 0, "burst": 0, "manual": daily_ceiling}
+    if all_collect(watches):
+        return {"sentinel": daily_ceiling, "verify": 0, "retry_reserve": 0,
+                "background": 0, "burst": 0, "manual": daily_ceiling}
+    retry = CATEGORY_CAPS["retry_reserve"]
+    return {"sentinel": daily_ceiling - VERIFY_RESERVE - retry,
+            "verify": CATEGORY_CAPS["verify"], "retry_reserve": retry,
+            "background": 0, "burst": CATEGORY_CAPS["burst"],
+            "manual": daily_ceiling}
 
 
 class BudgetExhausted(BaseException):
