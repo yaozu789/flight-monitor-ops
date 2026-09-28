@@ -338,6 +338,63 @@ class BurstSurplusTests(unittest.TestCase):
             fm_sentinel.collect(db, guard, cfg, odd, store.utcnow_iso())
         self.assertEqual(len(bursts), 1)
 
+    def _setup(self, db):
+        cfg = {"g1": fm_run.group_cfg_for({
+            "id": "g1", "origins": ["SFO"], "destinations": ["JFK"],
+            "nights": [7],
+            "windows": {"near": {"days": [7, 42], "step_days": 2,
+                                 "refresh_hours": 48}}})}
+        fm_sentinel.mint_sentinels(db, cfg)
+        slot = store.slot_id() | 1
+        store.queue_trigger(
+            db, kind="drop", group_id="g1", depart_week="2026-W45",
+            depart_date="2026-11-02", duration=7, price_usd=300.0,
+            fingerprint=None, slot=slot)
+        return cfg, slot
+
+    def _collect(self, db, cfg, slot, allowance):
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={})
+        bursts = []
+
+        def fake_burst(db_, trig, guard_, group_cfg, slot_, **kw):
+            bursts.append(trig["id"])
+            return 0
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            store.record_cell_check(db_, cell["id"], slot, True, 500.0)
+            return (500.0, 2)
+
+        with mock.patch.object(fm_sentinel, "execute_burst", fake_burst), \
+                mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: allowance):
+            fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
+        return bursts
+
+    def test_orphan_cells_of_removed_watch_do_not_block_bursts(self):
+        db = fresh_db(self)
+        cfg, slot = self._setup(db)
+        db.execute("UPDATE cells SET last_checked_slot=?", (slot,))
+        store.ensure_cells(db, [{
+            "group_id": "gone", "depart_date": "2026-11-10", "duration": 7,
+            "role": "sentinel", "weekday": 1, "window": "near",
+            "refresh_hours": 48}])  # never checked, no config any more
+        db.commit()
+        self.assertEqual(len(self._collect(db, cfg, slot, 4)), 1)
+
+    def test_run_that_clears_due_cells_still_bursts(self):
+        """Odd run: bursts lead but 1 cell is due; the sentinel passes clear
+        it, and the trailing burst pass then runs the burst."""
+        db = fresh_db(self)
+        cfg, slot = self._setup(db)
+        db.execute("UPDATE cells SET last_checked_slot=?", (slot,))
+        db.execute("UPDATE cells SET last_checked_slot=NULL WHERE id = "
+                   "(SELECT MIN(id) FROM cells)")
+        db.commit()
+        self.assertEqual(len(self._collect(db, cfg, slot, 10)), 1)
+
 
 class StageAConfigTests(unittest.TestCase):
     def test_stage_a_config(self):

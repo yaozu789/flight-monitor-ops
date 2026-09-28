@@ -527,14 +527,15 @@ def _queue_drop_trigger(db, cell: dict, price: float, slot: int) -> bool:
 def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
                    top_n: int, category: str, result: dict, allowance: int,
                    count_key: str, deadline_fn=None, seen=None,
-                   collect_groups=frozenset()) -> None:
+                   collect_groups=frozenset(), overdue_only=False) -> None:
     remaining = allowance - result["attempts"]
     if remaining <= 0:
         return
     seen = seen if seen is not None else set()
     # Over-fetch so cells already checked this run (a second pass on
     # leftover allowance) can be skipped without starving the phase.
-    for cell in store.due_cells(db, role, remaining + len(seen), slot=slot):
+    for cell in store.due_cells(db, role, remaining + len(seen), slot=slot,
+                                overdue_only=overdue_only):
         if cell["id"] in seen:
             continue
         if deadline_fn is not None and deadline_fn():
@@ -617,17 +618,17 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
     sentinel_share = math.ceil(allowance / 2)
     checked: set = set()  # cells checked this run: never twice
 
-    def sentinels(limit):
+    def sentinels(limit, overdue_only=False):
         _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "sentinel", SENTINEL_TOP_N, "sentinel",
                        result, limit, "sentinels", deadline_fn, checked,
-                       collect_groups)
+                       collect_groups, overdue_only)
 
     def bursts():
         # Bursts spend only surplus: while any named-window sentinel is due,
         # its refresh comes first (a 60-attempt burst could otherwise eat
         # the budget the sentinel targets depend on).
-        if store.overdue_sentinels(db, slot):
+        if store.overdue_sentinels(db, slot, groups_cfg):
             return
         for trig in store.due_triggers(db, slot):
             if trig["group_id"] in collect_groups:
@@ -668,6 +669,13 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
         # 3 at a 30-minute cadence) still reaches bursts and background.
         order = [bursts, background, lambda: sentinels(sentinel_share),
                  lambda: sentinels(allowance)]
+    if any(c.get("windows") for c in groups_cfg.values()):
+        # Named windows (redesign): every overdue sentinel first, with the
+        # whole allowance; then bursts from what is left (they wait while
+        # any sentinel is still due); then the plain rotation. No slot
+        # parity: the refresh targets, not alternation, decide priority.
+        order = [lambda: sentinels(allowance, overdue_only=True), bursts,
+                 background, lambda: sentinels(allowance)]
     result["allowance"] = allowance
     for step in order:
         if not phase(step):
