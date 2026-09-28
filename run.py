@@ -933,8 +933,8 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
     # restored ceiling restarts the clock).
     first = db.execute(
         """SELECT MIN(at) AS a FROM query_log
-           WHERE ceiling = ? AND at > COALESCE(
-               (SELECT MAX(at) FROM query_log WHERE ceiling IS NOT ?), '')""",
+           WHERE ceiling = ? AND id > COALESCE(
+               (SELECT MAX(id) FROM query_log WHERE ceiling IS NOT ?), 0)""",
         (guard.daily_ceiling, guard.daily_ceiling)).fetchone()["a"]
     ratios = [r["p95_ratio"] for r in refresh]
     worst = (None if not ratios or None in ratios else max(ratios))
