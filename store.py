@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -240,6 +241,19 @@ CREATE TABLE IF NOT EXISTS weekly_reports (
     last_slot INTEGER,            -- slot whose relay batch carries it
     relayed_at TEXT               -- set by report-mark
 );
+-- One row per collection query (redesign A3): the outcome counters behind
+-- the budget-ramp gate. outcome: ok | empty | transport_fail |
+-- unparseable | error | budget_cancel | throttle.
+CREATE TABLE IF NOT EXISTS query_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    slot INTEGER,
+    group_id TEXT,
+    window_name TEXT,
+    category TEXT NOT NULL,
+    outcome TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log (at);
 """
 
 # Outbox lifecycle (v3): the SCHEDULER transition map is exactly
@@ -1298,6 +1312,86 @@ def due_cells(db: sqlite3.Connection, role: str, limit: int,
                          / (COALESCE(refresh_hours, 48) * 2.0) DESC,
                      last_checked_slot ASC, id ASC
             LIMIT ?""", [*params, slot, limit])]
+
+
+QUERY_OUTCOMES = ("ok", "empty", "transport_fail", "unparseable", "error",
+                  "budget_cancel", "throttle")
+# Completed queries that returned no usable price (the gate's unknown rate).
+UNKNOWN_OUTCOMES = ("empty", "transport_fail", "unparseable", "error")
+
+
+def log_query(db: sqlite3.Connection, *, slot: int | None, group_id: str,
+              window_name: str | None, category: str, outcome: str) -> None:
+    if outcome not in QUERY_OUTCOMES:
+        raise ValueError(f"unknown query outcome {outcome!r}")
+    db.execute(
+        """INSERT INTO query_log (at, slot, group_id, window_name, category,
+                                  outcome) VALUES (?, ?, ?, ?, ?, ?)""",
+        (utcnow_iso(), slot, group_id, window_name, category, outcome))
+    db.commit()
+
+
+def query_outcomes(db: sqlite3.Connection, since_iso: str) -> dict:
+    """Outcome counts since ``since_iso``: {outcome: n} plus
+    ``completed`` (ok + unknown) and ``unknown_rate`` (unknown / completed;
+    None with nothing completed). Budget/throttle cancellations are not
+    completed queries."""
+    counts = {o: 0 for o in QUERY_OUTCOMES}
+    for r in db.execute(
+            """SELECT outcome, COUNT(*) AS c FROM query_log WHERE at >= ?
+               GROUP BY outcome""", (since_iso,)):
+        counts[r["outcome"]] = r["c"]
+    unknown = sum(counts[o] for o in UNKNOWN_OUTCOMES)
+    completed = counts["ok"] + unknown
+    counts["completed"] = completed
+    counts["unknown_rate"] = (unknown / completed) if completed else None
+    return counts
+
+
+def _percentile(sorted_vals: list[float], p: float) -> float:
+    """Nearest-rank percentile of an ascending list (p in 0..100)."""
+    k = max(0, math.ceil(p / 100 * len(sorted_vals)) - 1)
+    return sorted_vals[k]
+
+
+def refresh_ages(db: sqlite3.Connection, group_ids, now_iso: str | None = None
+                 ) -> list[dict]:
+    """Refresh age per (group, window) of active named-window sentinels.
+
+    Age = hours since the last SUCCESSFUL check; a cell that never
+    succeeded counts from when it was minted (spec: never hidden). Returns
+    rows {group_id, window_name, refresh_hours, cells, p50_h, p95_h,
+    max_h, p95_ratio} where p95_ratio = p95 / refresh target.
+    """
+    ids = sorted(set(group_ids))
+    if not ids:
+        return []
+    now = datetime.fromisoformat(now_iso or utcnow_iso())
+    marks = ",".join("?" * len(ids))
+    buckets: dict = {}
+    for r in db.execute(
+            f"""SELECT group_id, window_name, refresh_hours, created_at,
+                       last_success_at FROM cells
+                WHERE role = 'sentinel' AND active = 1
+                  AND refresh_hours IS NOT NULL AND group_id IN ({marks})""",
+            ids):
+        ref = r["last_success_at"] or r["created_at"]
+        seen = datetime.fromisoformat(ref)
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        age_h = max(0.0, (now - seen).total_seconds() / 3600)
+        key = (r["group_id"], r["window_name"], r["refresh_hours"])
+        buckets.setdefault(key, []).append(age_h)
+    out = []
+    for (gid, win, refresh), ages in sorted(buckets.items()):
+        ages.sort()
+        p95 = _percentile(ages, 95)
+        out.append({"group_id": gid, "window_name": win,
+                    "refresh_hours": refresh, "cells": len(ages),
+                    "p50_h": round(_percentile(ages, 50), 1),
+                    "p95_h": round(p95, 1), "max_h": round(ages[-1], 1),
+                    "p95_ratio": round(p95 / refresh, 2)})
+    return out
 
 
 def overdue_sentinels(db: sqlite3.Connection, slot: int, group_ids) -> int:
