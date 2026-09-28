@@ -14,6 +14,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
+import budget
 import dashboard
 from outbox import CHART_BASE
 
@@ -93,6 +94,104 @@ def _watch_lines(db, w, now) -> list[str]:
     return lines
 
 
+def _window_label(win: dict) -> str:
+    lo, hi = win["lo"], win["hi"]
+    if hi <= 60:
+        return f"Next {max(1, lo // 7)}-{hi // 7} weeks"
+    return f"{lo // 30}-{hi // 30} months out"
+
+
+def _trip_label(cfg: dict) -> str:
+    if cfg["windows"] and all(x.get("return_weekday") is not None
+                              for x in cfg["windows"]):
+        return "weekend trips"
+    nights = cfg["nights"]
+    return ("about " if len(nights) == 1 else "") + (
+        " or ".join(str(n) for n in nights) + " nights")
+
+
+def _age(observed_at: str, now: datetime) -> str:
+    seen = datetime.fromisoformat(observed_at)
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    hours = (now - seen).total_seconds() / 3600
+    return f"{hours:.0f}h ago" if hours < 48 else f"{hours / 24:.0f}d ago"
+
+
+def _window_cheapest(db, watch_id, lo_date, hi_date, nights, since, until):
+    """Cheapest stored fare whose departure is inside the window NOW and
+    whose stay is one the watch tracks."""
+    marks = ",".join("?" * len(nights))
+    return db.execute(
+        f"""SELECT origin, destination, depart_date, return_date, airline,
+                   stops, price_usd, observed_at
+            FROM observations
+            WHERE watch_id = ? AND price_usd IS NOT NULL
+              AND observed_at >= ? AND observed_at < ?
+              AND depart_date >= ? AND depart_date <= ?
+              AND CAST(julianday(return_date) - julianday(depart_date)
+                       AS INTEGER) IN ({marks})
+            ORDER BY price_usd, observed_at LIMIT 1""",
+        (watch_id, since, until, lo_date, hi_date, *nights)).fetchone()
+
+
+def _windowed_lines(db, w, cfg, now) -> list[str]:
+    """Digest block for a named-window watch (redesign A4): per window, the
+    cheapest observed fare with its dates, stay, airline, stops and age,
+    last week's low, and how many departure dates are fresh."""
+    since = (now - timedelta(days=REPORT_DAYS)).isoformat()
+    prior = (now - timedelta(days=2 * REPORT_DAYS)).isoformat()
+    until = now.isoformat()
+    lines = [f"{w['id']} ({_trip_label(cfg)})"]
+    today = now.date()
+    for win in cfg["windows"]:
+        lo_date = (today + timedelta(days=win["lo"])).isoformat()
+        hi_date = (today + timedelta(days=win["hi"])).isoformat()
+        best = _window_cheapest(db, w["id"], lo_date, hi_date, cfg["nights"],
+                                since, until)
+        label = _window_label(win)
+        if best is None:
+            lines.append(f"  {label}: no fares stored this week")
+        else:
+            stops = ("nonstop" if best["stops"] == 0
+                     else f"{best['stops']} stop"
+                     + ("s" if (best["stops"] or 0) > 1 else ""))
+            stale = (" (stale)" if datetime.fromisoformat(best["observed_at"])
+                     .replace(tzinfo=timezone.utc) < now - timedelta(
+                         hours=win["refresh_hours"]) else "")
+            lines.append(
+                f"  {label}: ${best['price_usd']:,.0f} {best['origin']} -> "
+                f"{best['destination']} {best['depart_date']} -> "
+                f"{best['return_date']} ({_nights(best)} nights), "
+                f"{best['airline'] or 'unknown airline'} {stops}, seen "
+                f"{_age(best['observed_at'], now)}{stale}")
+            before = _window_cheapest(db, w["id"], lo_date, hi_date,
+                                      cfg["nights"], prior, since)
+            if before is not None:
+                diff = best["price_usd"] - before["price_usd"]
+                trend = ("same" if diff == 0 else
+                         f"{'down' if diff < 0 else 'up'} ${abs(diff):,.0f}")
+                lines.append(f"    prior week low ${before['price_usd']:,.0f}"
+                             f" ({trend})")
+        fresh_since = (now - timedelta(hours=win["refresh_hours"])
+                       ).isoformat()
+        cov = db.execute(
+            """SELECT COUNT(*) AS n,
+                      SUM(last_success_at IS NOT NULL
+                          AND last_success_at >= ?) AS fresh
+               FROM cells WHERE group_id = ? AND role = 'sentinel'
+                 AND active = 1 AND window_name = ?""",
+            (fresh_since, w["id"], win["name"])).fetchone()
+        n, fresh = cov["n"] or 0, cov["fresh"] or 0
+        if n == 0:
+            lines.append("    no departure dates set up yet")
+            continue
+        note = "" if fresh == n else f"; {n - fresh} not checked recently"
+        lines.append(f"    dates checked in the last "
+                     f"{win['refresh_hours']}h: {fresh}/{n}{note}")
+    return lines
+
+
 def chart_url(db, watches, now) -> str | None:
     """Daily low per watch over CHART_DAYS, caps dashed. The data is in the
     URL; nothing is sent anywhere until the link is opened."""
@@ -115,6 +214,8 @@ def chart_url(db, watches, now) -> str | None:
                          "data": [round(lows[d]) if d in lows else None
                                   for d in days],
                          "fill": False, "spanGaps": True})
+        if budget.alert_mode(w) != "cap":
+            continue  # caps are not an alert rule outside cap mode
         datasets.append({"label": f"{w['id']} cap",
                          # Two end points keep the URL short.
                          "data": ([round(w["absolute_cap_usd"])]
@@ -135,17 +236,27 @@ def chart_url(db, watches, now) -> str | None:
 
 
 def build_report(db, watches, now: datetime, week: str) -> str:
+    import run  # group_cfg_for parses the named windows (lazy: no cycle)
     since = now - timedelta(days=REPORT_DAYS)
+    windowed = any(w.get("windows") for w in watches)
     lines = [f"Weekly flight price report -- {since.date()} to {now.date()}",
-             "(stored fares, any dates and trip lengths in the window)"]
+             ("(cheapest fare stored this week per departure window; prices "
+              "are round trip, rechecked only when alerted)" if windowed else
+              "(stored fares, any dates and trip lengths in the window)")]
     for w in watches:
-        lines += _watch_lines(db, w, now)
-    alerts = db.execute(
-        """SELECT watch_id, COUNT(*) AS n FROM outbox
-           WHERE prepared_at >= ? GROUP BY watch_id ORDER BY watch_id""",
-        (since.isoformat(),)).fetchall()
-    lines.append("Deal alerts handed off this week: " + (", ".join(
-        f"{r['watch_id']} {r['n']}" for r in alerts) or "none"))
+        if w.get("windows"):
+            lines += _windowed_lines(db, w, run.group_cfg_for(w), now)
+        else:
+            lines += _watch_lines(db, w, now)
+    if budget.all_collect(watches):
+        lines.append("Deal alerts: off while price history builds up")
+    else:
+        alerts = db.execute(
+            """SELECT watch_id, COUNT(*) AS n FROM outbox
+               WHERE prepared_at >= ? GROUP BY watch_id ORDER BY watch_id""",
+            (since.isoformat(),)).fetchall()
+        lines.append("Deal alerts handed off this week: " + (", ".join(
+            f"{r['watch_id']} {r['n']}" for r in alerts) or "none"))
     used = db.execute(
         "SELECT COALESCE(SUM(attempts), 0) AS n FROM budget_ledger "
         "WHERE created_at >= ?",
@@ -153,8 +264,8 @@ def build_report(db, watches, now: datetime, week: str) -> str:
     throttles = db.execute(
         "SELECT COUNT(*) AS n FROM health WHERE check_name = 'throttle' "
         "AND ok = 0 AND checked_at >= ?", (since.isoformat(),)).fetchone()["n"]
-    lines.append(f"Google requests: {used:,} in 7 days (limit 150/day); "
-                 f"throttles: {throttles}")
+    lines.append(f"Google requests: {used:,} in 7 days (limit "
+                 f"{budget.DAILY_CEILING}/day); throttles: {throttles}")
     url = chart_url(db, watches, now)
     if url:
         lines.append(f"Chart (daily lows, last {CHART_DAYS} days): {url}")

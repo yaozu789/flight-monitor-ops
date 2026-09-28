@@ -100,6 +100,87 @@ class BuildReportTests(unittest.TestCase):
         self.assertNotIn("Chart", text)
 
 
+JAPAN_W = {"id": "japan", "origins": ["SFO", "OAK", "SJC"],
+           "destinations": ["NRT", "HND", "KIX"], "absolute_cap_usd": 500,
+           "alert_mode": "collect", "nights": [28],
+           "windows": {"near": {"days": [7, 42], "step_days": 2,
+                                "refresh_hours": 48},
+                       "far": {"months": [3, 9], "refresh_hours": 72}}}
+LA_W = {"id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+        "absolute_cap_usd": 120, "alert_mode": "collect",
+        "windows": {"near": {"days": [7, 42], "weekdays": [4, 5],
+                             "return_weekday": 6, "refresh_hours": 48}}}
+
+
+def _d(days, stay=28):
+    dep = (MON_DUE + timedelta(days=days)).date()
+    return dep.isoformat(), (dep + timedelta(days=stay)).isoformat()
+
+
+class DigestTests(unittest.TestCase):
+    """Redesign A4: per departure window, the cheapest stored fare whose
+    departure is inside the window now and whose stay the watch tracks."""
+
+    def _obs(self, db, days_out, price, *, stay=28, seen_h=24, dest="NRT",
+             watch="japan"):
+        dep, ret = _d(days_out, stay)
+        obs(db, MON_DUE - timedelta(hours=seen_h), price, depart=dep,
+            ret=ret, dest=dest, watch=watch)
+
+    def test_cheapest_per_window_only_in_window_and_stay(self):
+        db = fresh_db(self)
+        self._obs(db, 10, 812)
+        self._obs(db, 12, 300, stay=7)        # not a tracked stay
+        self._obs(db, 3, 250)                 # departs before the window
+        self._obs(db, 120, 700, dest="KIX")
+        self._obs(db, 120, 760, seen_h=24 * 9, dest="KIX")  # prior week
+        text = weekly.build_report(db, [JAPAN_W], MON_DUE, "2026-W40")
+        dep, ret = _d(10)
+        self.assertIn("japan (about 28 nights)", text)
+        self.assertIn(f"  Next 1-6 weeks: $812 SFO -> NRT {dep} -> {ret} "
+                      "(28 nights), ANA nonstop, seen 24h ago", text)
+        dep, ret = _d(120)
+        self.assertIn(f"  3-9 months out: $700 SFO -> KIX {dep} -> {ret}",
+                      text)
+        self.assertIn("    prior week low $760 (down $60)", text)
+        self.assertIn("Deal alerts: off while price history builds up",
+                      text)
+        self.assertNotIn("cap", text.split("Chart")[0])
+        self.assertNotIn("$300", text)
+        self.assertNotIn("$250", text)
+
+    def test_missing_and_stale_coverage_is_explicit(self):
+        db = fresh_db(self)
+        self._obs(db, 10, 812, seen_h=72)      # older than the 48 h target
+        import run
+        import sentinel
+        cfg = {"japan": run.group_cfg_for(JAPAN_W)}
+        sentinel.mint_sentinels(db, cfg, today=MON_DUE.date())
+        near = [r["id"] for r in db.execute(
+            "SELECT id FROM cells WHERE window_name='near' ORDER BY id")]
+        db.execute("UPDATE cells SET last_success_at=? WHERE id=?",
+                   ((MON_DUE - timedelta(hours=5)).isoformat(
+                       timespec="seconds"), near[0]))
+        db.commit()
+        text = weekly.build_report(db, [JAPAN_W], MON_DUE, "2026-W40")
+        self.assertIn("seen 3d ago (stale)", text)
+        self.assertIn("    dates checked in the last 48h: 1/18; 17 not "
+                      "checked recently", text)
+        self.assertIn("  3-9 months out: no fares stored this week", text)
+
+    def test_weekend_watch_and_no_cap_line_in_chart(self):
+        db = fresh_db(self)
+        self._obs(db, 11, 118, stay=2, dest="LAX", watch="la")  # Fri-Sun
+        text = weekly.build_report(db, [LA_W], MON_DUE, "2026-W40")
+        self.assertIn("la (weekend trips)", text)
+        self.assertIn("  Next 1-6 weeks: $118", text)
+        self.assertIn("    no departure dates set up yet", text)
+        url = next(l for l in text.splitlines() if l.startswith("Chart"))
+        labels = [d["label"] for d in json.loads(
+            unquote(url.split("?c=", 1)[1]))["data"]["datasets"]]
+        self.assertEqual(labels, ["la daily low"])
+
+
 class PrepareClaimTests(unittest.TestCase):
     def setUp(self):
         self.db = fresh_db(self)
