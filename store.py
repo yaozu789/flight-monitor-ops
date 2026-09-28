@@ -1279,6 +1279,19 @@ def due_cells(db: sqlite3.Connection, role: str, limit: int,
            LIMIT ?""", (role, slot, limit))]
 
 
+def overdue_sentinels(db: sqlite3.Connection, slot: int) -> int:
+    """Active named-window sentinels at or past their refresh target (or
+    never checked) at ``slot``. Legacy cells (no refresh target) never
+    count. Bursts wait while this is non-zero (spec: surplus only)."""
+    return db.execute(
+        """SELECT COUNT(*) AS c FROM cells
+           WHERE role = 'sentinel' AND active = 1
+             AND refresh_hours IS NOT NULL
+             AND (last_checked_slot IS NULL
+                  OR (? - last_checked_slot) >= refresh_hours * 2)""",
+        (slot,)).fetchone()["c"]
+
+
 def record_cell_check(db: sqlite3.Connection, cell_id: int, slot: int,
                       success: bool, price_usd: float | None = None) -> None:
     if success:

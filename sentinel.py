@@ -624,6 +624,11 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
                        collect_groups)
 
     def bursts():
+        # Bursts spend only surplus: while any named-window sentinel is due,
+        # its refresh comes first (a 60-attempt burst could otherwise eat
+        # the budget the sentinel targets depend on).
+        if store.overdue_sentinels(db, slot):
+            return
         for trig in store.due_triggers(db, slot):
             if trig["group_id"] in collect_groups:
                 continue  # expired on entering collect mode; never burst

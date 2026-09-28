@@ -297,6 +297,48 @@ class CollectGroupTests(unittest.TestCase):
             "AND active=1").fetchone()["c"], 0)
 
 
+class BurstSurplusTests(unittest.TestCase):
+    def test_bursts_wait_for_due_sentinels(self):
+        """A queued burst runs only once no named-window sentinel is due."""
+        db = fresh_db(self)
+        cfg = {"g1": fm_run.group_cfg_for({
+            "id": "g1", "origins": ["SFO"], "destinations": ["JFK"],
+            "nights": [7],
+            "windows": {"near": {"days": [7, 42], "step_days": 2,
+                                 "refresh_hours": 48}}})}
+        fm_sentinel.mint_sentinels(db, cfg)
+        slot = store.slot_id()
+        store.queue_trigger(
+            db, kind="drop", group_id="g1", depart_week="2026-W45",
+            depart_date="2026-11-02", duration=7, price_usd=300.0,
+            fingerprint=None, slot=slot)
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={})
+        bursts = []
+
+        def fake_burst(db_, trig, guard_, group_cfg, slot_, **kw):
+            bursts.append(trig["id"])
+            return 0
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            store.record_cell_check(db_, cell["id"], slot, True, 500.0)
+            return (500.0, 2)
+
+        with mock.patch.object(fm_sentinel, "execute_burst", fake_burst), \
+                mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: 4):
+            # Odd slot: bursts lead the phase order. 18 sentinels are due.
+            odd = slot | 1
+            fm_sentinel.collect(db, guard, cfg, odd, store.utcnow_iso())
+            self.assertEqual(bursts, [])
+            db.execute("UPDATE cells SET last_checked_slot=?", (odd,))
+            db.commit()
+            fm_sentinel.collect(db, guard, cfg, odd, store.utcnow_iso())
+        self.assertEqual(len(bursts), 1)
+
+
 class StageAConfigTests(unittest.TestCase):
     def test_stage_a_config(self):
         """The shipped watches.yaml: Japan + NYC, collect-only, 71.3
