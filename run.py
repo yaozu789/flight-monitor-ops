@@ -36,6 +36,7 @@ sys.path.insert(0, str(BASE))
 
 import yaml  # noqa: E402
 
+import budget  # noqa: E402
 import dashboard  # noqa: E402
 import heartbeat  # noqa: E402
 import sentinel  # noqa: E402
@@ -58,6 +59,7 @@ from poller import narrow_query  # noqa: E402
 from scorer import score_new_observations  # noqa: E402
 from store import (  # noqa: E402
     DeadlineExceeded,
+    enter_collect_mode,
     log_verify,
     verify_logged,
     acquire_lock,
@@ -257,6 +259,10 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
     try:
         reset_lock_loss(db)
         slot = slot_id()
+        # Collect-only watches retire their queued alerts and bursts BEFORE
+        # the drain, so an alert queued under the old cap rule is never
+        # relayed.
+        enter_collect_mode(db, collect_watch_ids(watches))
         # Drain FIRST (no network): must run before the backoff / slot
         # early-returns below so stranded handoffs are never stuck behind a
         # skipped collection.
@@ -636,6 +642,12 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 "cap": w["absolute_cap_usd"]})
 
 
+def collect_watch_ids(watches) -> set[str]:
+    """Watches in collect-only mode: prices are stored, nothing alerts."""
+    return {w["id"] for w in watches
+            if w.get("alert_mode", "cap") == "collect"}
+
+
 def _stalled(guard, collected) -> bool:
     """True when collection sent nothing although the run could afford a
     full sentinel or background check: its cost fits the allowance, the
@@ -648,9 +660,11 @@ def _stalled(guard, collected) -> bool:
     for category, top_n in (("sentinel", sentinel.SENTINEL_TOP_N),
                             ("background", sentinel.DETAIL_TOP_N)):
         cost = 1 + top_n
+        cap = guard.category_cap(category)
+        if cap is None:
+            cap = CATEGORY_CAPS[category]
         if (allowance >= cost
-                and CATEGORY_CAPS[category] - guard.spent_today(category)
-                >= cost):
+                and cap - guard.spent_today(category) >= cost):
             return True
     return False
 
@@ -680,6 +694,10 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
     summary: dict = {"slot_id": slot, "watches": {}}
     targets = [get_watch(watches, args.watch)] if args.watch else watches
     groups_cfg = {w["id"]: group_cfg_for(w) for w in targets}
+    # Collect-only watches skip every alert step: retries, verification,
+    # drop/burst triggers and handoffs (redesign A2).
+    collect_ids = collect_watch_ids(targets)
+    alert_targets = [w for w in targets if w["id"] not in collect_ids]
 
     # 1. Rolling sentinel anchors + background grid (idempotent).
     n_sentinels = sentinel.mint_sentinels(db, groups_cfg)
@@ -688,6 +706,7 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
     # 2. Hand off ready alerts BEFORE collecting. run_guarded already
     # drained (drain-first); direct callers drain here.
     if drained is None:
+        enter_collect_mode(db, collect_ids)
         drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 
@@ -707,8 +726,8 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         # 3. Retry pass (verify budget): recheck, re-render, retire.
         # retry_ids is filled in place, so a stop mid-pass keeps the
         # retries confirmed before it (re-prepared in the except below).
-        recheck_retries(db, watches, guard, slot, deadline_fn=deadline_fn,
-                        out=retries)
+        recheck_retries(db, [w for w in watches if w["id"] not in collect_ids],
+                        guard, slot, deadline_fn=deadline_fn, out=retries)
         if retry_ids:
             reprepare_retries(db, slot, retry_ids)
             reprepared = True
@@ -716,7 +735,8 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         # The backlog pass leaves BURST_VERIFY_RESERVE of the daily verify
         # cap for burst revalidations; the same-slot pass (fresh deals) is
         # not limited.
-        per_watch = _verify_candidates(db, targets, guard, prev_start_iso,
+        per_watch = _verify_candidates(db, alert_targets, guard,
+                                       prev_start_iso,
                                        new_ids, verified_deals,
                                        deadline_fn=deadline_fn,
                                        verify_reserve=BURST_VERIFY_RESERVE)
@@ -724,7 +744,8 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         # 5. Collect, paced: sentinels > bursts > background.
         collected = sentinel.collect(db, guard, groups_cfg, slot, run_start,
                                      deadline_fn=deadline_fn,
-                                     cadence_slots=cadence_slots(watches))
+                                     cadence_slots=cadence_slots(watches),
+                                     collect_groups=collect_ids)
         summary["collect"] = {
             "attempts": collected["attempts"],
             "bursts": collected["bursts"],
@@ -743,7 +764,7 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         # not paced (the daily ceiling and verify reserve still bound it), so
         # restore the default before verifying.
         guard.set_run_allowance(PER_RUN_MAX)
-        same_slot = _verify_candidates(db, targets, guard, run_start,
+        same_slot = _verify_candidates(db, alert_targets, guard, run_start,
                                        new_ids, verified_deals,
                                        deadline_fn=deadline_fn)
         for wid, ids in same_slot.items():
@@ -918,7 +939,11 @@ def main() -> int:
         # The transport guard counts ACTUAL HTTP attempts and refuses to send
         # when no guard is installed (fail closed). Installed for every
         # collecting command, so even manual runs count against the ceilings.
-        guard = BudgetGuard(db)
+        # While every watch only collects, the verify reserve and the
+        # alert-path category caps are released to sentinels (redesign A2).
+        guard = BudgetGuard(
+            db, verify_reserve=budget.effective_verify_reserve(watches),
+            category_caps=budget.effective_category_caps(watches))
         guard.reset_run()
         if args.cmd in ("broad", "narrow", "canary", "check"):
             transport.install_transport_guard(guard)

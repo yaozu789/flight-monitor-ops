@@ -961,6 +961,51 @@ def retire_outbox(db: sqlite3.Connection, alert_id: str, reason: str) -> bool:
     return True
 
 
+def enter_collect_mode(db: sqlite3.Connection, watch_ids) -> dict:
+    """Silence the alert path for collect-only watches (redesign A2).
+
+    In ONE transaction: retire every non-terminal outbox row of these
+    watches, and expire their queued/active burst triggers together with
+    the burst progress. Run before the drain, so the first collect-mode run
+    can never relay an alert queued under the old cap rule. Idempotent: a
+    watch already in collect mode has nothing left to change. Returns the
+    changed counts; each retired alert is logged to health as
+    "mode_collect".
+    """
+    ids = sorted(set(watch_ids))
+    if not ids:
+        return {"outbox": 0, "triggers": 0, "bursts": 0}
+    marks = ",".join("?" * len(ids))
+    now = utcnow_iso()
+    retired = [r["alert_id"] for r in db.execute(
+        f"""SELECT alert_id FROM outbox WHERE watch_id IN ({marks})
+            AND state IN ('pending', 'handoff_prepared',
+                          'relay_attempted_unconfirmed')""", ids)]
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            f"""UPDATE outbox SET state='retired', updated_at=?
+                WHERE watch_id IN ({marks})
+                  AND state IN ('pending', 'handoff_prepared',
+                                'relay_attempted_unconfirmed')""",
+            [now, *ids])
+        trig = db.execute(
+            f"""UPDATE triggers SET status='expired'
+                WHERE group_id IN ({marks})
+                  AND status IN ('queued', 'burst_active')""", ids).rowcount
+        bursts = db.execute(
+            f"""UPDATE burst_progress SET status='expired', updated_at=?
+                WHERE group_id IN ({marks}) AND status='active'""",
+            [now, *ids]).rowcount
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    for aid in retired:
+        add_health(db, "outbox_retire", True, f"{aid}: mode_collect")
+    return {"outbox": len(retired), "triggers": trig, "bursts": bursts}
+
+
 # ---------------------------------------------------------------- slots & lock
 
 def claim_slot(db: sqlite3.Connection, slot: int, command: str) -> bool:

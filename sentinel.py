@@ -323,6 +323,11 @@ def ensure_background_grid(db, groups_cfg, today=None) -> int:
 
     cells = []
     for group_id, group_cfg in groups_cfg.items():
+        if group_cfg.get("windows"):
+            # Named-window watches have no background grid (redesign: the
+            # 10-duration exploration is off); the retire pass below drops
+            # any cells an earlier config left.
+            continue
         lo_d, hi_d = _window_days(group_cfg)
         durations = _durations(group_cfg)
         # Weekly departures on the fixed lattice (Mondays from GRID_EPOCH).
@@ -441,9 +446,12 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
 
 def daily_headroom(guard) -> int:
     """Non-verify attempts still spendable today (the verify reserve is
-    held back for the verifier)."""
-    return (DAILY_CEILING - guard.spent_today()
-            - max(0, VERIFY_RESERVE - guard.spent_today("verify")))
+    held back for the verifier). Ceiling and reserve come from the guard,
+    so pacing matches what ``reserve()`` will actually allow."""
+    ceiling = getattr(guard, "daily_ceiling", DAILY_CEILING)
+    reserve = getattr(guard, "verify_reserve", VERIFY_RESERVE)
+    return (ceiling - guard.spent_today()
+            - max(0, reserve - guard.spent_today("verify")))
 
 
 def per_run_allowance(guard, slot, cadence_slots: int = 1) -> int:
@@ -518,7 +526,8 @@ def _queue_drop_trigger(db, cell: dict, price: float, slot: int) -> bool:
 
 def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
                    top_n: int, category: str, result: dict, allowance: int,
-                   count_key: str, deadline_fn=None, seen=None) -> None:
+                   count_key: str, deadline_fn=None, seen=None,
+                   collect_groups=frozenset()) -> None:
     remaining = allowance - result["attempts"]
     if remaining <= 0:
         return
@@ -546,13 +555,15 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
             top_n=top_n, category=category, slot=slot, run_start=run_start)
         result["attempts"] += used
         result[count_key] += 1
+        if cell["group_id"] in collect_groups:
+            continue  # collect-only: prices are stored, nothing triggers
         if _is_drop(prev_price, prev_ts, price):
             if _queue_drop_trigger(db, cell, price, slot):
                 result["drop_triggers"] += 1
 
 
 def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
-            cadence_slots: int = 1) -> dict:
+            cadence_slots: int = 1, collect_groups=frozenset()) -> dict:
     """One collection pass (v3 order).
 
     Priority: sentinels (due_sentinels, top_n=1, "sentinel") -> bursts
@@ -609,10 +620,13 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
     def sentinels(limit):
         _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "sentinel", SENTINEL_TOP_N, "sentinel",
-                       result, limit, "sentinels", deadline_fn, checked)
+                       result, limit, "sentinels", deadline_fn, checked,
+                       collect_groups)
 
     def bursts():
         for trig in store.due_triggers(db, slot):
+            if trig["group_id"] in collect_groups:
+                continue  # expired on entering collect mode; never burst
             if deadline_fn is not None and deadline_fn():
                 raise store.DeadlineExceeded("burst phase deadline exceeded")
             left = allowance - result["attempts"]
@@ -630,7 +644,8 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
     def background():
         _collect_phase(db, guard, groups_cfg, slot, run_start,
                        "background", DETAIL_TOP_N, "background",
-                       result, allowance, "background", deadline_fn, checked)
+                       result, allowance, "background", deadline_fn, checked,
+                       collect_groups)
 
     order = [lambda: sentinels(sentinel_share), bursts, background,
              lambda: sentinels(allowance)]
