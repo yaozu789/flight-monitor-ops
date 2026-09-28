@@ -105,6 +105,32 @@ class CheckCellOutcomeTests(unittest.TestCase):
         self.assertEqual({(g, w, c) for g, w, c, _ in self._logged()},
                          {("nyc", "near", "sentinel")})
 
+    def test_deadline_and_storage_crash_are_logged(self):
+        def deadline(*a, **kw):
+            raise store.DeadlineExceeded("run deadline")
+
+        with self.assertRaises(store.DeadlineExceeded):
+            self._check(deadline)
+
+        def returning(*a, **kw):
+            return [_row(400.0)]
+
+        with mock.patch.object(store, "save_observations",
+                               side_effect=RuntimeError("disk full")):
+            with self.assertRaises(RuntimeError):
+                self._check_with_start(returning)
+        self.assertEqual([o for *_, o in self._logged()],
+                         ["deadline_cancel", "error"])
+        ceilings = {r["ceiling"] for r in self.db.execute(
+            "SELECT ceiling FROM query_log")}
+        self.assertEqual(ceilings, {self.guard.daily_ceiling})
+
+    def _check_with_start(self, fake):
+        with mock.patch.object(sentinel, "narrow_query", fake):
+            return sentinel.check_cell(
+                self.db, self.cell, self.guard, "nyc", GROUP, top_n=1,
+                category="sentinel", slot=7, run_start=store.utcnow_iso())
+
     def test_stale_poller_outcome_never_leaks(self):
         """A fake (or failed) query that sets nothing reads as empty, not
         as the previous query's outcome."""
@@ -134,6 +160,18 @@ class PollerOutcomeTests(unittest.TestCase):
 
         self.assertEqual(self._query(Failing), [])
         self.assertEqual(poller.LAST_OUTCOME, "transport_fail")
+
+        class FailThenEmpty:
+            calls = 0
+
+            def search(self, *a, **kw):
+                FailThenEmpty.calls += 1
+                if FailThenEmpty.calls == 1:
+                    raise ConnectionError("reset")
+                return []
+
+        self.assertEqual(self._query(FailThenEmpty), [])
+        self.assertEqual(poller.LAST_OUTCOME, "empty")
         self.assertEqual(self._query(Empty), [])
         self.assertEqual(poller.LAST_OUTCOME, "empty")
 
@@ -172,7 +210,7 @@ class RefreshAgeTests(unittest.TestCase):
 class GateTests(unittest.TestCase):
     NOW = datetime(2026, 10, 10, 12, tzinfo=timezone.utc)
 
-    def _db(self, *, outcomes, fresh=True, old_history=True):
+    def _db(self, *, outcomes, fresh=True, old_history=True, ceiling=150):
         db = fresh_db(self)
         store.ensure_cells(db, [{
             "group_id": "nyc", "depart_date": "2026-11-01", "duration": 7,
@@ -185,16 +223,18 @@ class GateTests(unittest.TestCase):
         if old_history:  # one query before the window: 5 full days seen
             db.execute(
                 """INSERT INTO query_log (at, slot, group_id, window_name,
-                   category, outcome) VALUES (?, 1, 'nyc', 'near',
-                   'sentinel', 'ok')""",
-                ((self.NOW - timedelta(days=6)).isoformat(),))
+                   category, outcome, ceiling) VALUES (?, 1, 'nyc', 'near',
+                   'sentinel', 'ok', ?)""",
+                ((self.NOW - timedelta(days=6)).isoformat(timespec="seconds"),
+                 ceiling))
         at = self.NOW - timedelta(days=1)
         for outcome, n in outcomes.items():
             for _ in range(n):
                 db.execute(
                     """INSERT INTO query_log (at, slot, group_id, window_name,
-                       category, outcome) VALUES (?, 1, 'nyc', 'near',
-                       'sentinel', ?)""", (at.isoformat(), outcome))
+                       category, outcome, ceiling) VALUES (?, 1, 'nyc', 'near',
+                       'sentinel', ?, 150)""",
+                    (at.isoformat(timespec="seconds"), outcome))
                 at += timedelta(minutes=1)
         db.commit()
         return db
@@ -230,6 +270,33 @@ class GateTests(unittest.TestCase):
         gate = self._gate(db)
         self.assertFalse(gate["checks"]["no_deadline_stops"])
         self.assertFalse(gate["checks"]["no_throttles"])
+
+    def test_history_at_previous_stage_does_not_count(self):
+        """Raising the ceiling restarts the 5-day clock."""
+        db = self._db(outcomes={"ok": 100}, ceiling=100)
+        self.assertFalse(self._gate(db)["checks"]["history_days"])
+
+    def test_configured_window_without_cells_fails(self):
+        db = self._db(outcomes={"ok": 100})
+        watch = {"id": "nyc", "origins": ["SFO"], "destinations": ["JFK"],
+                 "nights": [7],
+                 "windows": {"near": {"days": [7, 42], "refresh_hours": 48},
+                             "far": {"months": [3, 9],
+                                     "refresh_hours": 72}}}
+        report = fm_run.coverage_report(db, [watch], BudgetGuard(db),
+                                        now=self.NOW)
+        self.assertFalse(report["gate"]["checks"]["refresh_p95"])
+        self.assertIn(("nyc", "far", 0), {(r["group_id"], r["window_name"],
+                                           r["cells"])
+                                          for r in report["refresh"]})
+
+    def test_ratio_just_over_limit_fails(self):
+        """72.2 h against a 48 h target is 1.504: rounding must not pass it."""
+        db = self._db(outcomes={"ok": 100})
+        db.execute("UPDATE cells SET last_success_at=?",
+                   ((self.NOW - timedelta(hours=72.2)).isoformat(),))
+        db.commit()
+        self.assertFalse(self._gate(db)["checks"]["refresh_p95"])
 
     def test_budget_cancels_are_not_unknowns(self):
         report = fm_run.coverage_report(

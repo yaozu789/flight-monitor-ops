@@ -175,6 +175,7 @@ def narrow_query(origin: str, dest: str, depart: str, ret: str, watch: dict, *,
                 last_err = e
                 time.sleep(2 ** attempt * 2)
                 continue
+            last_err = None  # this attempt answered: an empty answer is "empty"
             break
     global LAST_OUTCOME
     _polite()

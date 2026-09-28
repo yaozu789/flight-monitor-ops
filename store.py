@@ -243,7 +243,8 @@ CREATE TABLE IF NOT EXISTS weekly_reports (
 );
 -- One row per collection query (redesign A3): the outcome counters behind
 -- the budget-ramp gate. outcome: ok | empty | transport_fail |
--- unparseable | error | budget_cancel | throttle.
+-- unparseable | error | budget_cancel | deadline_cancel | throttle.
+-- ceiling = the daily ceiling (budget stage) the query ran under.
 CREATE TABLE IF NOT EXISTS query_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
@@ -251,7 +252,8 @@ CREATE TABLE IF NOT EXISTS query_log (
     group_id TEXT,
     window_name TEXT,
     category TEXT NOT NULL,
-    outcome TEXT NOT NULL
+    outcome TEXT NOT NULL,
+    ceiling INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log (at);
 """
@@ -1315,19 +1317,27 @@ def due_cells(db: sqlite3.Connection, role: str, limit: int,
 
 
 QUERY_OUTCOMES = ("ok", "empty", "transport_fail", "unparseable", "error",
-                  "budget_cancel", "throttle")
+                  "budget_cancel", "deadline_cancel", "throttle")
+QUERY_LOG_KEEP_DAYS = 120  # the gate needs 5 days; keep a season
 # Completed queries that returned no usable price (the gate's unknown rate).
 UNKNOWN_OUTCOMES = ("empty", "transport_fail", "unparseable", "error")
 
 
 def log_query(db: sqlite3.Connection, *, slot: int | None, group_id: str,
-              window_name: str | None, category: str, outcome: str) -> None:
+              window_name: str | None, category: str, outcome: str,
+              ceiling: int | None = None) -> None:
     if outcome not in QUERY_OUTCOMES:
         raise ValueError(f"unknown query outcome {outcome!r}")
+    now = datetime.now(timezone.utc)
     db.execute(
         """INSERT INTO query_log (at, slot, group_id, window_name, category,
-                                  outcome) VALUES (?, ?, ?, ?, ?, ?)""",
-        (utcnow_iso(), slot, group_id, window_name, category, outcome))
+                                  outcome, ceiling)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (now.isoformat(timespec="seconds"), slot, group_id, window_name,
+         category, outcome, ceiling))
+    db.execute("DELETE FROM query_log WHERE at < ?",
+               ((now - timedelta(days=QUERY_LOG_KEEP_DAYS))
+                .isoformat(timespec="seconds"),))
     db.commit()
 
 
@@ -1335,7 +1345,7 @@ def query_outcomes(db: sqlite3.Connection, since_iso: str) -> dict:
     """Outcome counts since ``since_iso``: {outcome: n} plus
     ``completed`` (ok + unknown) and ``unknown_rate`` (unknown / completed;
     None with nothing completed). Budget/throttle cancellations are not
-    completed queries."""
+    completed queries, nor are deadline cancels."""
     counts = {o: 0 for o in QUERY_OUTCOMES}
     for r in db.execute(
             """SELECT outcome, COUNT(*) AS c FROM query_log WHERE at >= ?
@@ -1361,7 +1371,8 @@ def refresh_ages(db: sqlite3.Connection, group_ids, now_iso: str | None = None
     Age = hours since the last SUCCESSFUL check; a cell that never
     succeeded counts from when it was minted (spec: never hidden). Returns
     rows {group_id, window_name, refresh_hours, cells, p50_h, p95_h,
-    max_h, p95_ratio} where p95_ratio = p95 / refresh target.
+    max_h, p95_ratio} where p95_ratio = p95 / refresh target, unrounded
+    (the gate compares it; the hour fields are rounded for display).
     """
     ids = sorted(set(group_ids))
     if not ids:
@@ -1390,7 +1401,7 @@ def refresh_ages(db: sqlite3.Connection, group_ids, now_iso: str | None = None
                     "refresh_hours": refresh, "cells": len(ages),
                     "p50_h": round(_percentile(ages, 50), 1),
                     "p95_h": round(p95, 1), "max_h": round(ages[-1], 1),
-                    "p95_ratio": round(p95 / refresh, 2)})
+                    "p95_ratio": p95 / refresh})
     return out
 
 

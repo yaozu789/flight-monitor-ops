@@ -891,8 +891,24 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
     """Refresh ages, query outcomes and the ramp-gate verdict (stored data
     only, no network)."""
     now = now or datetime.now(timezone.utc)
-    since = (now - timedelta(days=days)).isoformat()
-    refresh = refresh_ages(db, [w["id"] for w in watches], now.isoformat())
+    # Same text format as query_log.at / run_slots.claimed_at (whole
+    # seconds), so the string comparisons below are exact.
+    since = (now - timedelta(days=days)).isoformat(timespec="seconds")
+    refresh = refresh_ages(db, [w["id"] for w in watches],
+                           now.isoformat(timespec="seconds"))
+    # Every configured group x window must be measured: one with no cells
+    # at all fails the gate instead of silently dropping out of it.
+    have = {(r["group_id"], r["window_name"]) for r in refresh}
+    for w in watches:
+        if not w.get("windows"):
+            continue
+        for win in group_cfg_for(w)["windows"]:
+            if (w["id"], win["name"]) not in have:
+                refresh.append({"group_id": w["id"],
+                                "window_name": win["name"],
+                                "refresh_hours": win["refresh_hours"],
+                                "cells": 0, "p50_h": None, "p95_h": None,
+                                "max_h": None, "p95_ratio": None})
     queries = query_outcomes(db, since)
     stops = {r["status"]: r["c"] for r in db.execute(
         """SELECT status, COUNT(*) AS c FROM run_slots
@@ -902,8 +918,12 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
     # A throttle can hit outside a collection query (e.g. a recheck), so
     # throttled runs count too.
     throttles = queries["throttle"] + stops.get("throttled", 0)
-    first = db.execute("SELECT MIN(at) AS a FROM query_log").fetchone()["a"]
-    worst = max((r["p95_ratio"] for r in refresh), default=None)
+    # History counts only at the CURRENT budget stage: days spent at the
+    # previous ceiling say nothing about the one just raised.
+    first = db.execute("SELECT MIN(at) AS a FROM query_log WHERE ceiling = ?",
+                       (guard.daily_ceiling,)).fetchone()["a"]
+    ratios = [r["p95_ratio"] for r in refresh]
+    worst = (None if not ratios or None in ratios else max(ratios))
     checks = {
         "history_days": bool(first) and first <= since,
         "no_throttles": throttles == 0,
