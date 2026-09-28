@@ -149,9 +149,60 @@ def _window_days(group_cfg) -> tuple[int, int]:
 
 
 def _durations(group_cfg) -> list[int]:
-    """Trip lengths (days) explored for a group. Defaults to 5..14."""
+    """Trip lengths (days) explored for a group: the explicit ``nights``
+    list when configured (named windows), else the ``durations`` range
+    (default 5..14)."""
+    nights = (group_cfg or {}).get("nights")
+    if nights:
+        return sorted({int(n) for n in nights})
     lo, hi = (group_cfg or {}).get("durations", (5, 14))
     return list(range(int(lo), int(hi) + 1))
+
+
+def _window_dates(win: dict, start: date, end: date) -> list[date]:
+    """Departure anchors of one named window within [start, end].
+
+    - ``weekdays`` set: every date on those weekdays (e.g. Fridays for
+      weekend trips); no cap, so a window holding 6 Fridays keeps all 6.
+    - ``step_days`` set: every point of the GRID_EPOCH lattice with that
+      step; no weekday snap and no cap.
+    - neither: the legacy spread (about 27 anchors, snapped across
+      weekdays), used for the long-term window.
+    """
+    if win.get("weekdays"):
+        wanted = {int(w) for w in win["weekdays"]}
+        return [start + timedelta(days=i)
+                for i in range((end - start).days + 1)
+                if (start + timedelta(days=i)).weekday() in wanted]
+    if win.get("step_days"):
+        return [d for _, d in _lattice(start, end, int(win["step_days"]))]
+    span = (end - start).days
+    step = max(1, round(span / SENTINEL_ANCHORS_PER_GROUP))
+    out = []
+    for k, base in _lattice(start, end, step):
+        if len(out) >= SENTINEL_ANCHORS_PER_GROUP:
+            break
+        delta = ((k % 7) - base.weekday()) % 7
+        if delta > 3:
+            delta -= 7
+        d = base + timedelta(days=delta)
+        if start <= d <= end:
+            out.append(d)
+    return out
+
+
+def _fixed_return_nights(win: dict | None, d: date) -> int | None:
+    """Stay that returns on the window's ``return_weekday`` (e.g. leave Fri
+    -> 2 nights, Sat -> 1 night for a Sunday return), or None when the
+    window uses the watch's ``nights``."""
+    if not win or win.get("return_weekday") is None:
+        return None
+    return (int(win["return_weekday"]) - d.weekday()) % 7 or 7
+
+
+def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
+    return (today_d + timedelta(days=int(win["lo"])),
+            today_d + timedelta(days=int(win["hi"])))
 
 
 def _sentinel_duration(group_cfg) -> int:
@@ -194,6 +245,26 @@ def mint_sentinels(db, groups_cfg, today=None) -> int:
 
     cells = []
     for group_id, group_cfg in groups_cfg.items():
+        if group_cfg.get("windows"):
+            # Named windows: mint the union of every window x every
+            # configured trip length, so one retire pass below never drops
+            # another window's cells.
+            for win in group_cfg["windows"]:
+                start, end = _window_bounds(win, today_d)
+                for d in _window_dates(win, start, end):
+                    fixed = _fixed_return_nights(win, d)
+                    for duration in ([fixed] if fixed is not None
+                                     else _durations(group_cfg)):
+                        cells.append({
+                            "group_id": group_id,
+                            "depart_date": d.isoformat(),
+                            "duration": duration,
+                            "role": "sentinel",
+                            "weekday": d.weekday(),
+                            "window": win["name"],
+                            "refresh_hours": int(win["refresh_hours"]),
+                        })
+            continue
         lo_d, hi_d = _window_days(group_cfg)
         win_start = today_d + timedelta(days=lo_d)
         win_end = today_d + timedelta(days=hi_d)
@@ -454,7 +525,7 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
     seen = seen if seen is not None else set()
     # Over-fetch so cells already checked this run (a second pass on
     # leftover allowance) can be skipped without starving the phase.
-    for cell in store.due_cells(db, role, remaining + len(seen)):
+    for cell in store.due_cells(db, role, remaining + len(seen), slot=slot):
         if cell["id"] in seen:
             continue
         if deadline_fn is not None and deadline_fn():
@@ -622,7 +693,7 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
 
 # ---------------------------------------------------------------- bursts
 
-def _burst_steps(trigger, durations=None):
+def _burst_steps(trigger, durations=None, window=None):
     """Ordered burst steps as (step_index, kind, depart_date, duration).
 
     Step 0 revalidates the trigger (billed "verify"); steps 1..20 are the
@@ -630,21 +701,57 @@ def _burst_steps(trigger, durations=None):
     are the duration exploration (the group's trip lengths, default 5..14,
     excluding the trigger's own duration). 30 steps x 2 attempts = 60
     attempts max with the default range.
+
+    ``window`` (``{"start", "end", "weekdays"}``, from ``_trigger_window``)
+    clips neighbours to the trigger's departure window and weekdays, so a
+    near-term trigger never searches past dates or a weekend window a
+    Tuesday. A fixed-return window (``return_weekday``) gives each
+    neighbour its own stay (Fri 2 nights, Sat 1) and has no duration sweep.
+    Step indices stay consecutive over the kept steps.
     """
     yield 0, "revalidate", trigger["depart_date"], trigger["duration"]
     base = date.fromisoformat(trigger["depart_date"])
     idx = 1
     for delta in range(1, 11):
         for s in (-1, 1):
-            yield (idx, "neighbour",
-                   (base + timedelta(days=s * delta)).isoformat(),
-                   trigger["duration"])
+            d = base + timedelta(days=s * delta)
+            if window is not None:
+                if not (window["start"] <= d <= window["end"]):
+                    continue
+                if window["weekdays"] and d.weekday() not in window["weekdays"]:
+                    continue
+            fixed = _fixed_return_nights(window, d)
+            yield (idx, "neighbour", d.isoformat(),
+                   fixed if fixed is not None else trigger["duration"])
             idx += 1
+    if window is not None and window.get("return_weekday") is not None:
+        return
     for dur in (durations or range(5, 15)):
         if dur == trigger["duration"]:
             continue
         yield idx, "duration", trigger["depart_date"], dur
         idx += 1
+
+
+def _trigger_window(trigger, group_cfg):
+    """The named window holding the trigger's departure, as burst clipping
+    bounds, or None (legacy config, or no window contains it).
+
+    Bounds are computed from the day the trigger was queued, not today, so
+    a burst resumed on a later day keeps the same step list (its resume
+    index stays valid).
+    """
+    if not group_cfg.get("windows"):
+        return None
+    queued = _parse_ts(trigger["created_at"]).date()
+    dep = date.fromisoformat(trigger["depart_date"])
+    for win in group_cfg["windows"]:
+        start, end = _window_bounds(win, queued)
+        if start <= dep <= end:
+            return {"start": start, "end": end,
+                    "weekdays": {int(w) for w in win.get("weekdays") or []},
+                    "return_weekday": win.get("return_weekday")}
+    return None
 
 
 def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
@@ -714,7 +821,8 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                            depart_week=trigger["depart_week"],
                            attempts=total, status=status)
 
-    steps = list(_burst_steps(trigger, _durations(group_cfg)))
+    steps = list(_burst_steps(trigger, _durations(group_cfg),
+                              _trigger_window(trigger, group_cfg)))
     # Resuming on a later UTC day: recheck the trigger fare first, before
     # spending a new day's budget on a deal that may already be gone.
     revalidated = prog.get("revalidated_at") or ""

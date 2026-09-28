@@ -1177,5 +1177,235 @@ class TestTriggers(SentinelTestBase):
                                                slot=9), 0)
 
 
+
+# ---------------------------------------------------------------- named windows
+
+NEAR = {"name": "near", "lo": 7, "hi": 42, "step_days": 2,
+        "refresh_hours": 48, "weekdays": None}
+FAR = {"name": "far", "lo": 90, "hi": 270, "step_days": None,
+       "refresh_hours": 72, "weekdays": None}
+FRIDAYS = {"name": "near", "lo": 7, "hi": 42, "step_days": None,
+           "refresh_hours": 48, "weekdays": [4]}
+
+
+def _windowed(windows, nights):
+    return {"origins": ["SFO", "OAK", "SJC"],
+            "destinations": ["NRT", "HND", "KIX"],
+            "windows": windows, "nights": nights,
+            "window_days": (min(w["lo"] for w in windows),
+                            max(w["hi"] for w in windows)),
+            "durations": (min(nights), max(nights))}
+
+
+class TestNamedWindows(SentinelTestBase):
+    def _active(self, gid="g1"):
+        return self.db.execute(
+            "SELECT * FROM cells WHERE group_id=? AND role='sentinel' "
+            "AND active=1", (gid,)).fetchall()
+
+    def test_config_parses_named_windows(self):
+        import run
+        cfg = run.group_cfg_for({
+            "id": "japan", "origins": ["SFO"], "destinations": ["NRT"],
+            "nights": [28],
+            "windows": {"near": {"days": [7, 42], "step_days": 2,
+                                 "refresh_hours": 48},
+                        "far": {"months": [3, 9], "refresh_hours": 72}}})
+        wins = {w["name"]: w for w in cfg["windows"]}
+        self.assertEqual((wins["near"]["lo"], wins["near"]["hi"]), (7, 42))
+        self.assertEqual((wins["far"]["lo"], wins["far"]["hi"]), (90, 270))
+        self.assertEqual(cfg["nights"], [28])
+        with self.assertRaises(ValueError):
+            run.group_cfg_for({"id": "x", "origins": ["SFO"],
+                               "destinations": ["NRT"],
+                               "windows": {"near": {"days": [7, 42],
+                                                    "refresh_hours": 48}}})
+
+    def test_near_and_far_minted_with_exact_nights(self):
+        """A 28-night trip is minted as 28 (the legacy stay clamps to the
+        5..14 range), 18 near anchors every 2 days, ~26 far anchors."""
+        sentinel.mint_sentinels(self.db, {"g1": _windowed([NEAR, FAR], [28])},
+                                today=TODAY)
+        rows = self._active()
+        self.assertEqual({r["duration"] for r in rows}, {28})
+        near = sorted(r["depart_date"] for r in rows
+                      if r["window_name"] == "near")
+        far = [r for r in rows if r["window_name"] == "far"]
+        self.assertEqual(len(near), 18)
+        gaps = {(date.fromisoformat(b) - date.fromisoformat(a)).days
+                for a, b in zip(near, near[1:])}
+        self.assertEqual(gaps, {2})
+        self.assertTrue(24 <= len(far) <= 27, len(far))
+        self.assertEqual({r["refresh_hours"] for r in rows
+                          if r["window_name"] == "near"}, {48})
+        self.assertEqual({r["refresh_hours"] for r in far}, {72})
+
+    def test_two_lengths_mint_both(self):
+        sentinel.mint_sentinels(self.db, {"g1": _windowed([NEAR], [7, 14])},
+                                today=TODAY)
+        rows = self._active()
+        self.assertEqual(len(rows), 36)
+        self.assertEqual({r["duration"] for r in rows}, {7, 14})
+
+    def test_friday_window_keeps_every_friday(self):
+        """5 Fridays in D+7..D+42, or 6 when D+7 is itself a Friday."""
+        cfg = {"g1": _windowed([FRIDAYS], [2])}
+        sentinel.mint_sentinels(self.db, cfg, today="2026-09-24")  # Thu
+        rows = self._active()
+        self.assertEqual(len(rows), 5)
+        self.assertEqual({r["weekday"] for r in rows}, {4})
+        sentinel.mint_sentinels(self.db, cfg, today="2026-09-25")  # Fri
+        self.assertEqual(len(self._active()), 6)
+
+    def test_windows_do_not_retire_each_other(self):
+        """Near and far are minted as one union: re-minting keeps both, and
+        a removed trip length is retired."""
+        sentinel.mint_sentinels(self.db, {"g1": _windowed([NEAR, FAR], [7])},
+                                today=TODAY)
+        before = len(self._active())
+        self.assertEqual(sentinel.mint_sentinels(
+            self.db, {"g1": _windowed([NEAR, FAR], [7])}, today=TODAY), 0)
+        self.assertEqual(len(self._active()), before)
+        self.assertEqual({r["window_name"] for r in self._active()},
+                         {"near", "far"})
+        sentinel.mint_sentinels(self.db, {"g1": _windowed([NEAR, FAR], [14])},
+                                today=TODAY)
+        self.assertEqual({r["duration"] for r in self._active()}, {14})
+
+    def test_due_order_follows_refresh_target(self):
+        """Checked at the same slot, a 48 h near cell is more overdue than a
+        72 h far cell, so it comes first."""
+        sentinel.mint_sentinels(self.db, {"g1": _windowed([NEAR, FAR], [7])},
+                                today=TODAY)
+        for r in self._active():
+            store.record_cell_check(self.db, r["id"], slot=100, success=True,
+                                    price_usd=500.0)
+        due = store.due_cells(self.db, "sentinel", 100, slot=160)
+        names = [c["window_name"] for c in due]
+        self.assertEqual(set(names[:18]), {"near"})
+        self.assertEqual(set(names[18:]), {"far"})
+
+    def _near_trigger(self, days_out, duration, created_at):
+        depart = (date.fromisoformat(TODAY)
+                  + timedelta(days=days_out)).isoformat()
+        return {"depart_date": depart, "duration": duration,
+                "created_at": created_at}
+
+    def test_burst_clipped_to_window_and_nights(self):
+        """A near trigger at D+8 never searches before D+7 (past or
+        too-soon dates); durations come only from the watch's nights."""
+        cfg = _windowed([NEAR], [7, 14])
+        trig = self._near_trigger(8, 7, TODAY + "T12:00:00+00:00")
+        steps = list(sentinel._burst_steps(
+            trig, sentinel._durations(cfg),
+            sentinel._trigger_window(trig, cfg)))
+        lo = date.fromisoformat(TODAY) + timedelta(days=7)
+        neighbours = [date.fromisoformat(d) for _, k, d, _ in steps
+                      if k == "neighbour"]
+        self.assertTrue(neighbours)
+        self.assertTrue(all(d >= lo for d in neighbours))
+        self.assertEqual([d for _, k, _, d in steps if k == "duration"], [14])
+        self.assertEqual([i for i, *_ in steps], list(range(len(steps))))
+
+    def test_burst_on_friday_window_searches_fridays_only(self):
+        cfg = _windowed([FRIDAYS], [2])
+        trig = self._near_trigger(15, 2, TODAY + "T12:00:00+00:00")
+        trig["depart_date"] = "2026-10-09"  # a Friday inside D+7..D+42
+        steps = list(sentinel._burst_steps(
+            trig, sentinel._durations(cfg),
+            sentinel._trigger_window(trig, cfg)))
+        neighbours = [date.fromisoformat(d) for _, k, d, _ in steps
+                      if k == "neighbour"]
+        self.assertTrue(neighbours)
+        self.assertEqual({d.weekday() for d in neighbours}, {4})
+
+    def test_burst_window_fixed_at_trigger_day(self):
+        """Bounds come from the day the trigger was queued, so resuming the
+        next day yields the same step list (resume indices stay valid)."""
+        cfg = _windowed([NEAR], [7])
+        trig = self._near_trigger(9, 7, TODAY + "T23:00:00+00:00")
+        first = list(sentinel._burst_steps(
+            trig, [7], sentinel._trigger_window(trig, cfg)))
+        again = list(sentinel._burst_steps(
+            dict(trig), [7], sentinel._trigger_window(dict(trig), cfg)))
+        self.assertEqual(first, again)
+        lo = date.fromisoformat(TODAY) + timedelta(days=7)
+        self.assertEqual(min(date.fromisoformat(d) for _, k, d, _ in first
+                             if k == "neighbour"), lo)
+
+    def test_background_never_relabels_sentinels(self):
+        """The background grid shares (group, date, length) with some
+        sentinels; its upsert must not wipe their window or refresh target."""
+        cfg = {"g1": _windowed([NEAR, FAR], [7])}
+        sentinel.mint_sentinels(self.db, cfg, today=TODAY)
+        sentinel.ensure_background_grid(self.db, cfg, today=TODAY)
+        lost = self.db.execute(
+            "SELECT COUNT(*) AS c FROM cells WHERE role='sentinel' "
+            "AND (window_name IS NULL OR refresh_hours IS NULL)"
+        ).fetchone()["c"]
+        self.assertEqual(lost, 0)
+
+    def test_overlapping_windows_rejected(self):
+        import run
+        with self.assertRaises(ValueError):
+            run.group_cfg_for({
+                "id": "x", "origins": ["SFO"], "destinations": ["NRT"],
+                "nights": [7],
+                "windows": {"near": {"days": [7, 42], "refresh_hours": 48},
+                            "mid": {"days": [30, 90], "refresh_hours": 72}}})
+
+    def test_weekday_out_of_range_rejected(self):
+        import run
+        with self.assertRaises(ValueError):
+            run.group_cfg_for({
+                "id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+                "windows": {"near": {"days": [7, 42], "weekdays": [5, 7],
+                                     "return_weekday": 6,
+                                     "refresh_hours": 48}}})
+
+    def test_weekend_window_leaves_fri_or_sat_returns_sunday(self):
+        import run
+        cfg = run.group_cfg_for({
+            "id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+            "windows": {"near": {"days": [7, 42], "weekdays": [4, 5],
+                                 "return_weekday": 6, "refresh_hours": 48}}})
+        sentinel.mint_sentinels(self.db, {"la": cfg}, today=TODAY)
+        rows = self._active("la")
+        self.assertEqual(len(rows), 10)  # 5 Fridays + 5 Saturdays
+        for r in rows:
+            ret = (date.fromisoformat(r["depart_date"])
+                   + timedelta(days=r["duration"]))
+            self.assertEqual(ret.weekday(), 6)
+        self.assertEqual({(r["weekday"], r["duration"]) for r in rows},
+                         {(4, 2), (5, 1)})
+        trig = {"depart_date": rows[3]["depart_date"],
+                "duration": rows[3]["duration"],
+                "created_at": TODAY + "T12:00:00+00:00"}
+        steps = list(sentinel._burst_steps(
+            trig, sentinel._durations(cfg),
+            sentinel._trigger_window(trig, cfg)))
+        self.assertFalse([k for _, k, _, _ in steps if k == "duration"])
+        for _, k, d, n in steps:
+            ret = date.fromisoformat(d) + timedelta(days=n)
+            self.assertEqual(ret.weekday(), 6)
+
+    def test_migration_adds_window_columns(self):
+        path = os.path.join(self.tmpdir, "old.db")
+        old = store.get_db(path)
+        old.execute("""CREATE TABLE cells (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL,
+            depart_date TEXT NOT NULL, duration INTEGER NOT NULL,
+            role TEXT NOT NULL, weekday INTEGER NOT NULL,
+            last_checked_slot INTEGER, last_success_at TEXT,
+            last_price_usd REAL, active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, retired_at TEXT,
+            UNIQUE (group_id, depart_date, duration))""")
+        old.commit()
+        store.init_db(old)
+        cols = {r["name"] for r in old.execute("PRAGMA table_info(cells)")}
+        self.assertTrue({"window_name", "refresh_hours"} <= cols)
+        old.close()
+
+
 if __name__ == "__main__":
     unittest.main()

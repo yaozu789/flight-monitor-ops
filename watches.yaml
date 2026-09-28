@@ -12,6 +12,22 @@ defaults:
   currency: USD
   run_every_minutes: 30         # must match the Muse schedule; drives budget pacing
 
+# Named departure windows (redesign, docs: Redesign_spec.md). A watch with
+# `windows:` lists its exact trip lengths in `nights:` and ignores the
+# window_months / trip_length_days defaults above. Each window is
+# `days: [lo, hi]` or `months: [lo, hi]` from today, plus `refresh_hours`,
+# and `step_days` (every N days) or `weekdays` (0=Mon .. 4=Fri); with
+# neither, about 27 anchors are spread across the window.
+# `return_weekday` (with `weekdays`) fixes the return day instead of
+# `nights`. Stage A (switched on together with collect-only mode, PR A2):
+#   japan: nights: [28]
+#          windows: {near: {days: [7, 42], step_days: 2, refresh_hours: 48},
+#                    far: {months: [3, 9], refresh_hours: 72}}
+#   nyc:   nights: [7, 14]
+#          windows: {near: {days: [7, 42], step_days: 2, refresh_hours: 48}}
+# Phase 2 weekend groups (LA, SD): leave Fri or Sat, return Sun:
+#   windows: {near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
+#                    refresh_hours: 48}}
 watches:
   - id: japan
     destinations: [NRT, HND, KIX]

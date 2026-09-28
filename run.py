@@ -414,10 +414,66 @@ def cadence_slots(watches: list[dict]) -> int:
     return minutes // 30
 
 
+def _window_cfg(name: str, spec: dict) -> dict:
+    """One named window from watches.yaml: ``days: [lo, hi]`` or
+    ``months: [lo, hi]`` (30-day months), ``refresh_hours``, and optionally
+    ``step_days`` or ``weekdays`` (0 = Monday). ``return_weekday`` (with
+    ``weekdays``) fixes the return day instead of using ``nights``: leave
+    Fri or Sat, return Sun."""
+    if "days" in spec:
+        lo, hi = (int(x) for x in spec["days"])
+    elif "months" in spec:
+        lo, hi = (int(x) * 30 for x in spec["months"])
+    else:
+        raise ValueError(f"window {name!r} needs days: or months:")
+    if not 0 <= lo <= hi:
+        raise ValueError(f"window {name!r} has bad bounds {lo}..{hi}")
+    if "refresh_hours" not in spec:
+        raise ValueError(f"window {name!r} needs refresh_hours:")
+    if "return_weekday" in spec and not spec.get("weekdays"):
+        raise ValueError(f"window {name!r}: return_weekday needs weekdays:")
+    days = list(spec.get("weekdays") or [])
+    if "return_weekday" in spec:
+        days.append(spec["return_weekday"])
+    if any(not 0 <= int(d) <= 6 for d in days):
+        raise ValueError(f"window {name!r}: weekdays run 0 (Mon) .. 6 (Sun)")
+    return {"name": name, "lo": lo, "hi": hi,
+            "refresh_hours": int(spec["refresh_hours"]),
+            "step_days": spec.get("step_days"),
+            "weekdays": spec.get("weekdays"),
+            "return_weekday": spec.get("return_weekday")}
+
+
 def group_cfg_for(w: dict) -> dict:
-    """Collection config for one watch: airports plus the departure window
-    (``window_months``, 30-day months) and trip lengths
-    (``trip_length_days``) from watches.yaml."""
+    """Collection config for one watch: airports plus its departure windows
+    and trip lengths from watches.yaml.
+
+    With ``windows:`` (named, e.g. near/far) the watch must list its exact
+    trip lengths in ``nights:``; sentinels are minted for every window x
+    every length. Without it, the legacy single window (``window_months``,
+    30-day months) and ``trip_length_days`` range apply."""
+    if w.get("windows"):
+        windows = [_window_cfg(n, spec)
+                   for n, spec in sorted(w["windows"].items())]
+        if not w.get("nights") and not all(x["return_weekday"] is not None
+                                           for x in windows):
+            raise ValueError(f"watch {w['id']!r}: windows: requires nights:")
+        # Cells are keyed by (group, date, length), not window: overlapping
+        # windows would share rows and fight over their refresh target.
+        spans = sorted((x["lo"], x["hi"], x["name"]) for x in windows)
+        for (_, hi, a), (lo, _, b) in zip(spans, spans[1:]):
+            if lo <= hi:
+                raise ValueError(
+                    f"watch {w['id']!r}: windows {a!r} and {b!r} overlap")
+        nights = sorted({int(n) for n in w.get("nights") or []}
+                        | {(int(x["return_weekday"]) - int(d)) % 7 or 7
+                           for x in windows if x["return_weekday"] is not None
+                           for d in x["weekdays"]})
+        return {"origins": w["origins"], "destinations": w["destinations"],
+                "windows": windows, "nights": nights,
+                "window_days": (min(x["lo"] for x in windows),
+                                max(x["hi"] for x in windows)),
+                "durations": (nights[0], nights[-1])}
     lo_mo, hi_mo = w.get("window_months", [3, 9])
     lo_len, hi_len = w.get("trip_length_days", [5, 14])
     return {"origins": w["origins"], "destinations": w["destinations"],

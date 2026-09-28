@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS cells (
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     retired_at TEXT,
+    window_name TEXT,              -- named window (near|far); NULL = legacy
+    refresh_hours INTEGER,         -- refresh target; NULL = legacy rotation
     UNIQUE (group_id, depart_date, duration)
 );
 CREATE INDEX IF NOT EXISTS idx_cells_role_active ON cells (role, active, last_checked_slot);
@@ -308,6 +310,14 @@ _OBS_V3_COLUMNS = [
     ("depart_times", "TEXT"),
 ]
 
+# Named departure windows (redesign PR A1): which window minted a cell and
+# how often it should be refreshed. NULL for cells minted by the legacy
+# single-window config, which keep plain least-recently-checked rotation.
+_CELLS_WINDOW_COLUMNS = [
+    ("window_name", "TEXT"),
+    ("refresh_hours", "INTEGER"),
+]
+
 
 # ---------------------------------------------------------------- time utils
 
@@ -371,6 +381,11 @@ def migrate_db(db: sqlite3.Connection) -> None:
         for name, ddl in _OBS_V3_COLUMNS:
             if name not in obs_cols:
                 db.execute(f"ALTER TABLE observations ADD COLUMN {name} {ddl}")
+    cell_cols = {r["name"] for r in db.execute("PRAGMA table_info(cells)")}
+    if cell_cols:
+        for name, ddl in _CELLS_WINDOW_COLUMNS:
+            if name not in cell_cols:
+                db.execute(f"ALTER TABLE cells ADD COLUMN {name} {ddl}")
     bp_cols = {r["name"] for r in db.execute(
         "PRAGMA table_info(burst_progress)")}
     if bp_cols and "revalidated_at" not in bp_cols:
@@ -1154,31 +1169,65 @@ def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
     n = 0
     now = utcnow_iso()
     for c in cells:
+        # A sentinel takes its window's name and refresh target (a cell
+        # minted before windows existed is relabelled, not duplicated). A
+        # background upsert never changes an active sentinel's window.
         cur = db.execute(
             """INSERT INTO cells
-               (group_id, depart_date, duration, role, weekday, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)
+               (group_id, depart_date, duration, role, weekday, created_at,
+                window_name, refresh_hours)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (group_id, depart_date, duration) DO UPDATE SET
                  role = CASE WHEN excluded.role = 'sentinel'
                                OR cells.active = 0
                              THEN excluded.role ELSE cells.role END,
-                 active = 1, retired_at = NULL
+                 active = 1, retired_at = NULL,
+                 window_name = CASE WHEN excluded.role = 'sentinel'
+                                      OR cells.active = 0
+                                    THEN excluded.window_name
+                                    ELSE cells.window_name END,
+                 refresh_hours = CASE WHEN excluded.role = 'sentinel'
+                                        OR cells.active = 0
+                                      THEN excluded.refresh_hours
+                                      ELSE cells.refresh_hours END
                WHERE cells.active = 0
-                  OR (excluded.role = 'sentinel' AND cells.role <> 'sentinel')""",
+                  OR (excluded.role = 'sentinel' AND cells.role <> 'sentinel')
+                  OR (excluded.role = 'sentinel'
+                      AND (cells.window_name IS NOT excluded.window_name
+                           OR cells.refresh_hours IS NOT excluded.refresh_hours))""",
             (c["group_id"], c["depart_date"], c["duration"], c["role"],
-             c["weekday"], now))
+             c["weekday"], now, c.get("window"), c.get("refresh_hours")))
         n += cur.rowcount
     db.commit()
     return n
 
 
-def due_cells(db: sqlite3.Connection, role: str, limit: int) -> list[dict]:
-    """Least-recently-checked active cells first (rotation)."""
+def due_cells(db: sqlite3.Connection, role: str, limit: int,
+              slot: int | None = None) -> list[dict]:
+    """Most overdue active cells first.
+
+    Never-checked cells come first. With ``slot`` (the current 30-minute
+    slot), the rest are ordered by how far past their refresh target they
+    are: hours since the last check / ``refresh_hours``. That way a 48 h
+    near-term cell outranks a 72 h far-term cell of the same age. Legacy
+    cells (``refresh_hours`` NULL) and calls without ``slot`` fall back to
+    plain least-recently-checked rotation.
+    """
+    if slot is None:
+        return [dict(r) for r in db.execute(
+            """SELECT * FROM cells
+               WHERE role = ? AND active = 1
+               ORDER BY last_checked_slot IS NULL DESC, last_checked_slot ASC,
+                        id ASC
+               LIMIT ?""", (role, limit))]
     return [dict(r) for r in db.execute(
         """SELECT * FROM cells
            WHERE role = ? AND active = 1
-           ORDER BY last_checked_slot IS NULL DESC, last_checked_slot ASC, id ASC
-           LIMIT ?""", (role, limit))]
+           ORDER BY last_checked_slot IS NULL DESC,
+                    (? - last_checked_slot) / (COALESCE(refresh_hours, 48) * 2.0)
+                        DESC,
+                    last_checked_slot ASC, id ASC
+           LIMIT ?""", (role, slot, limit))]
 
 
 def record_cell_check(db: sqlite3.Connection, cell_id: int, slot: int,
