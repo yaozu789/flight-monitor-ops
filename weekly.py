@@ -110,29 +110,47 @@ def _trip_label(cfg: dict) -> str:
         " or ".join(str(n) for n in nights) + " nights")
 
 
+def _utc(ts: str) -> datetime:
+    """A stored timestamp in UTC: naive means UTC; an explicit offset is
+    converted, never overwritten."""
+    dt = datetime.fromisoformat(ts)
+    return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None
+            else dt.astimezone(timezone.utc))
+
+
 def _age(observed_at: str, now: datetime) -> str:
-    seen = datetime.fromisoformat(observed_at)
-    if seen.tzinfo is None:
-        seen = seen.replace(tzinfo=timezone.utc)
-    hours = (now - seen).total_seconds() / 3600
+    hours = (now - _utc(observed_at)).total_seconds() / 3600
     return f"{hours:.0f}h ago" if hours < 48 else f"{hours / 24:.0f}d ago"
 
 
-def _window_cheapest(db, watch_id, lo_date, hi_date, nights, since, until):
-    """Cheapest stored fare whose departure is inside the window NOW and
-    whose stay is one the watch tracks."""
-    marks = ",".join("?" * len(nights))
+def _sqlite_wd(python_weekday: int) -> str:
+    """Python weekday (0 = Mon) as SQLite strftime('%w') (0 = Sun)."""
+    return str((int(python_weekday) + 1) % 7)
+
+
+def _window_cheapest(db, watch_id, win, lo_date, hi_date, nights, since,
+                     until):
+    """Cheapest stored fare whose departure is inside the window NOW, on
+    one of its weekdays (if any), with a stay the watch tracks and, for a
+    fixed-return window, returning on that weekday."""
+    where = ["watch_id = ?", "price_usd IS NOT NULL", "observed_at >= ?",
+             "observed_at < ?", "depart_date >= ?", "depart_date <= ?",
+             "CAST(julianday(return_date) - julianday(depart_date) AS INTEGER)"
+             f" IN ({','.join('?' * len(nights))})"]
+    params = [watch_id, since, until, lo_date, hi_date, *nights]
+    if win.get("weekdays"):
+        days = [_sqlite_wd(d) for d in win["weekdays"]]
+        where.append("strftime('%w', depart_date) IN "
+                     f"({','.join('?' * len(days))})")
+        params += days
+    if win.get("return_weekday") is not None:
+        where.append("strftime('%w', return_date) = ?")
+        params.append(_sqlite_wd(win["return_weekday"]))
     return db.execute(
         f"""SELECT origin, destination, depart_date, return_date, airline,
                    stops, price_usd, observed_at
-            FROM observations
-            WHERE watch_id = ? AND price_usd IS NOT NULL
-              AND observed_at >= ? AND observed_at < ?
-              AND depart_date >= ? AND depart_date <= ?
-              AND CAST(julianday(return_date) - julianday(depart_date)
-                       AS INTEGER) IN ({marks})
-            ORDER BY price_usd, observed_at LIMIT 1""",
-        (watch_id, since, until, lo_date, hi_date, *nights)).fetchone()
+            FROM observations WHERE {' AND '.join(where)}
+            ORDER BY price_usd, observed_at LIMIT 1""", params).fetchone()
 
 
 def _windowed_lines(db, w, cfg, now) -> list[str]:
@@ -147,26 +165,28 @@ def _windowed_lines(db, w, cfg, now) -> list[str]:
     for win in cfg["windows"]:
         lo_date = (today + timedelta(days=win["lo"])).isoformat()
         hi_date = (today + timedelta(days=win["hi"])).isoformat()
-        best = _window_cheapest(db, w["id"], lo_date, hi_date, cfg["nights"],
-                                since, until)
+        best = _window_cheapest(db, w["id"], win, lo_date, hi_date,
+                                cfg["nights"], since, until)
+        before = _window_cheapest(db, w["id"], win, lo_date, hi_date,
+                                  cfg["nights"], prior, since)
         label = _window_label(win)
         if best is None:
             lines.append(f"  {label}: no fares stored this week")
+            if before is not None:
+                lines.append(f"    prior week low "
+                             f"${before['price_usd']:,.0f}")
         else:
             stops = ("nonstop" if best["stops"] == 0
                      else f"{best['stops']} stop"
                      + ("s" if (best["stops"] or 0) > 1 else ""))
-            stale = (" (stale)" if datetime.fromisoformat(best["observed_at"])
-                     .replace(tzinfo=timezone.utc) < now - timedelta(
-                         hours=win["refresh_hours"]) else "")
+            stale = (" (stale)" if _utc(best["observed_at"]) < now - timedelta(
+                hours=win["refresh_hours"]) else "")
             lines.append(
                 f"  {label}: ${best['price_usd']:,.0f} {best['origin']} -> "
                 f"{best['destination']} {best['depart_date']} -> "
                 f"{best['return_date']} ({_nights(best)} nights), "
                 f"{best['airline'] or 'unknown airline'} {stops}, seen "
                 f"{_age(best['observed_at'], now)}{stale}")
-            before = _window_cheapest(db, w["id"], lo_date, hi_date,
-                                      cfg["nights"], prior, since)
             if before is not None:
                 diff = best["price_usd"] - before["price_usd"]
                 trend = ("same" if diff == 0 else
@@ -174,14 +194,20 @@ def _windowed_lines(db, w, cfg, now) -> list[str]:
                 lines.append(f"    prior week low ${before['price_usd']:,.0f}"
                              f" ({trend})")
         fresh_since = (now - timedelta(hours=win["refresh_hours"])
-                       ).isoformat()
+                       ).isoformat(timespec="seconds")
+        # Departure DATES inside the window now (a date with 7- and
+        # 14-night cells is one date), fresh only when every trip length
+        # on it was checked within the target.
         cov = db.execute(
-            """SELECT COUNT(*) AS n,
-                      SUM(last_success_at IS NOT NULL
-                          AND last_success_at >= ?) AS fresh
-               FROM cells WHERE group_id = ? AND role = 'sentinel'
-                 AND active = 1 AND window_name = ?""",
-            (fresh_since, w["id"], win["name"])).fetchone()
+            """SELECT COUNT(*) AS n, COALESCE(SUM(fresh), 0) AS fresh
+               FROM (SELECT depart_date,
+                            MIN(last_success_at IS NOT NULL
+                                AND last_success_at >= ?) AS fresh
+                     FROM cells WHERE group_id = ? AND role = 'sentinel'
+                       AND active = 1 AND window_name = ?
+                       AND depart_date >= ? AND depart_date <= ?
+                     GROUP BY depart_date)""",
+            (fresh_since, w["id"], win["name"], lo_date, hi_date)).fetchone()
         n, fresh = cov["n"] or 0, cov["fresh"] or 0
         if n == 0:
             lines.append("    no departure dates set up yet")
@@ -236,7 +262,6 @@ def chart_url(db, watches, now) -> str | None:
 
 
 def build_report(db, watches, now: datetime, week: str) -> str:
-    import run  # group_cfg_for parses the named windows (lazy: no cycle)
     since = now - timedelta(days=REPORT_DAYS)
     windowed = any(w.get("windows") for w in watches)
     lines = [f"Weekly flight price report -- {since.date()} to {now.date()}",
@@ -245,6 +270,7 @@ def build_report(db, watches, now: datetime, week: str) -> str:
               "(stored fares, any dates and trip lengths in the window)")]
     for w in watches:
         if w.get("windows"):
+            import run  # group_cfg_for parses the windows (lazy: no cycle)
             lines += _windowed_lines(db, w, run.group_cfg_for(w), now)
         else:
             lines += _watch_lines(db, w, now)
