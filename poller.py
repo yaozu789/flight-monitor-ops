@@ -132,6 +132,13 @@ def _flatten(result, client: SearchFlights, seat, pax, cabin: str,
             "flight_numbers": flight_numbers, "depart_times": depart_times}
 
 
+# Why the last narrow_query came back as it did (redesign A3 counters):
+# "ok", "empty" (Google answered, nothing usable), "transport_fail" (every
+# attempt raised) or "unparseable" (results, but none flattened). Read by
+# sentinel.check_cell right after the call; concurrency is 1.
+LAST_OUTCOME: str | None = None
+
+
 def narrow_query(origin: str, dest: str, depart: str, ret: str, watch: dict, *,
                  attempt_category: str = "sentinel", top_n: int = 3,
                  require_guard: bool = True) -> list[dict]:
@@ -168,9 +175,12 @@ def narrow_query(origin: str, dest: str, depart: str, ret: str, watch: dict, *,
                 last_err = e
                 time.sleep(2 ** attempt * 2)
                 continue
+            last_err = None  # this attempt answered: an empty answer is "empty"
             break
+    global LAST_OUTCOME
     _polite()
     if not results:
+        LAST_OUTCOME = "transport_fail" if last_err is not None else "empty"
         return []  # unknown, not "no deals"
     out = []
     for r in results:
@@ -178,6 +188,7 @@ def narrow_query(origin: str, dest: str, depart: str, ret: str, watch: dict, *,
         if flat:
             out.append(flat)
     out.sort(key=lambda x: x["price_usd"])
+    LAST_OUTCOME = "ok" if out else "unparseable"
     return out
 
 

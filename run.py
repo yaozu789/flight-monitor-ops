@@ -60,6 +60,8 @@ from scorer import score_new_observations  # noqa: E402
 from store import (  # noqa: E402
     DeadlineExceeded,
     enter_collect_mode,
+    query_outcomes,
+    refresh_ages,
     log_verify,
     verify_logged,
     acquire_lock,
@@ -875,6 +877,89 @@ def cmd_weekly_report(args, db, watches, guard):
     return 0
 
 
+# Budget-ramp gate (spec): advance 150 -> 225 -> 300 only when the last
+# GATE_DAYS show no throttles, an unknown rate under GATE_MAX_UNKNOWN, no
+# deadline stops, and every group x window p95 refresh age within
+# GATE_MAX_P95_RATIO of its target.
+GATE_DAYS = 5
+GATE_MAX_UNKNOWN = 0.05
+GATE_MAX_P95_RATIO = 1.5
+
+
+def coverage_report(db, watches, guard, days: int = GATE_DAYS,
+                    now: datetime | None = None) -> dict:
+    """Refresh ages, query outcomes and the ramp-gate verdict (stored data
+    only, no network)."""
+    now = now or datetime.now(timezone.utc)
+    # The gate needs GATE_DAYS: a longer window may be asked for, never a
+    # shorter one (a short window would let a stage pass early).
+    days = max(int(days), GATE_DAYS)
+    # Same text format as query_log.at / run_slots.claimed_at (whole
+    # seconds), so the string comparisons below are exact.
+    since = (now - timedelta(days=days)).isoformat(timespec="seconds")
+    refresh = refresh_ages(db, [w["id"] for w in watches],
+                           now.isoformat(timespec="seconds"))
+    # Every configured group x window must be measured: one with no cells
+    # at all fails the gate instead of silently dropping out of it.
+    have = {(r["group_id"], r["window_name"]) for r in refresh}
+    for w in watches:
+        if not w.get("windows"):
+            continue
+        for win in group_cfg_for(w)["windows"]:
+            if (w["id"], win["name"]) not in have:
+                refresh.append({"group_id": w["id"],
+                                "window_name": win["name"],
+                                "refresh_hours": win["refresh_hours"],
+                                "cells": 0, "p50_h": None, "p95_h": None,
+                                "max_h": None, "p95_ratio": None})
+    queries = query_outcomes(db, since)
+    stops = {r["status"]: r["c"] for r in db.execute(
+        """SELECT status, COUNT(*) AS c FROM run_slots
+           WHERE status IN ('deadline', 'throttled')
+             AND COALESCE(finished_at, claimed_at) >= ?
+           GROUP BY status""", (since,))}
+    deadline_stops = stops.get("deadline", 0)
+    # Every throttle the transport sees is logged to health (store.
+    # set_backoff), including manual narrow/canary searches that write no
+    # query_log or run_slots row; throttled runs and query rows count too.
+    health_throttles = db.execute(
+        """SELECT COUNT(*) AS c FROM health
+           WHERE check_name = 'throttle' AND ok = 0 AND checked_at >= ?""",
+        (since,)).fetchone()["c"]
+    throttles = max(health_throttles,
+                    queries["throttle"] + stops.get("throttled", 0))
+    # History counts only since the CURRENT stage began: the first query at
+    # this ceiling after the last query at any other ceiling (a lowered and
+    # restored ceiling restarts the clock).
+    first = db.execute(
+        """SELECT MIN(at) AS a FROM query_log
+           WHERE ceiling = ? AND id > COALESCE(
+               (SELECT MAX(id) FROM query_log WHERE ceiling IS NOT ?), 0)""",
+        (guard.daily_ceiling, guard.daily_ceiling)).fetchone()["a"]
+    ratios = [r["p95_ratio"] for r in refresh]
+    worst = (None if not ratios or None in ratios else max(ratios))
+    checks = {
+        "history_days": bool(first) and first <= since,
+        "no_throttles": throttles == 0,
+        "unknown_rate": (queries["unknown_rate"] is not None
+                         and queries["unknown_rate"] < GATE_MAX_UNKNOWN),
+        "no_deadline_stops": deadline_stops == 0,
+        "refresh_p95": worst is not None and worst <= GATE_MAX_P95_RATIO,
+    }
+    return {"days": days, "daily_ceiling": guard.daily_ceiling,
+            "refresh": refresh, "queries": queries,
+            "throttle_records": throttles, "deadline_stops": deadline_stops,
+            "worst_p95_ratio": worst,
+            "gate": {"pass": all(checks.values()), "checks": checks}}
+
+
+def cmd_coverage(args, db, watches, guard):
+    """Print refresh ages, query outcomes and the ramp-gate verdict."""
+    print(json.dumps(coverage_report(db, watches, guard, days=args.days),
+                     indent=2))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cheap Flight Monitor (v2)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -927,6 +1012,11 @@ def main() -> int:
 
     sub.add_parser("weekly-report",
                    help="preview the weekly report (stored data only)")
+    p = sub.add_parser("coverage",
+                       help="refresh ages, query outcomes, budget-ramp gate "
+                            "(stored data only)")
+    p.add_argument("--days", type=int, default=GATE_DAYS,
+                   help=f"look-back window, at least {GATE_DAYS}")
 
     args = ap.parse_args()
     db = None
@@ -969,6 +1059,8 @@ def main() -> int:
             return cmd_dashboard_link(args, db, watches, guard)
         if args.cmd == "weekly-report":
             return cmd_weekly_report(args, db, watches, guard)
+        if args.cmd == "coverage":
+            return cmd_coverage(args, db, watches, guard)
         if args.cmd == "check":
             return run_guarded("check", args, db, watches, guard, cmd_check)
     except SystemExit:

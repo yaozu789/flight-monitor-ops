@@ -75,8 +75,10 @@ from __future__ import annotations
 import math
 from datetime import date, datetime, timedelta, timezone
 
+import poller
 import store
 from poller import narrow_query
+from transport import ThrottleDetected
 
 try:
     from budget import BudgetExhausted as _ImportedBudgetExhausted
@@ -418,23 +420,54 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
     cfg = {"origins": list(group_cfg["origins"]),
            "destinations": list(group_cfg["destinations"]),
            "stops": [0, 1], "seat": "economy", "pax": {"adults": 1}}
+    window_name = cell.get("window_name") if cell is not None else None
+
+    def _log(outcome):
+        store.log_query(db, slot=slot, group_id=group_id,
+                        window_name=window_name, category=category,
+                        outcome=outcome,
+                        ceiling=getattr(guard, "daily_ceiling", None))
+
+    poller.LAST_OUTCOME = None
+    outcome = None
     try:
         rows = narrow_query(origin, destination, depart_date, return_date,
                             cfg, top_n=top_n, attempt_category=category)
     except BudgetExhausted:
+        _log("budget_cancel")
+        raise
+    except store.DeadlineExceeded:
+        _log("deadline_cancel")
+        raise
+    except ThrottleDetected:
+        _log("throttle")
         raise
     except Exception:
         rows = None  # unknown, never "no deals"
+        outcome = "error"
     attempts_used = guard.spent_run() - spent_before
 
     cheapest = None
-    if rows:
-        normed = [_normalize_row(r, depart_date, return_date) for r in rows]
-        normed = [r for r in normed if r["price_usd"] is not None]
-        if normed and run_start is not None:
-            store.save_observations(db, group_id, normed, run_start)
-        prices = [r["price_usd"] for r in normed]
-        cheapest = min(prices) if prices else None
+    try:
+        if rows:
+            normed = [_normalize_row(r, depart_date, return_date)
+                      for r in rows]
+            normed = [r for r in normed if r["price_usd"] is not None]
+            if normed and run_start is not None:
+                store.save_observations(db, group_id, normed, run_start)
+            prices = [r["price_usd"] for r in normed]
+            cheapest = min(prices) if prices else None
+    except BaseException:
+        _log("error")  # the query happened; its result could not be stored
+        raise
+    if outcome is None:
+        if cheapest is not None:
+            outcome = "ok"
+        elif rows:
+            outcome = "unparseable"
+        else:
+            outcome = poller.LAST_OUTCOME or "empty"
+    _log(outcome)
 
     if cell_id is not None:
         store.record_cell_check(db, cell_id, slot, cheapest is not None,
