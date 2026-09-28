@@ -535,7 +535,8 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
     # Over-fetch so cells already checked this run (a second pass on
     # leftover allowance) can be skipped without starving the phase.
     for cell in store.due_cells(db, role, remaining + len(seen), slot=slot,
-                                overdue_only=overdue_only):
+                                overdue_only=overdue_only,
+                                group_ids=groups_cfg):
         if cell["id"] in seen:
             continue
         if deadline_fn is not None and deadline_fn():
@@ -655,7 +656,8 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
 
     order = [lambda: sentinels(sentinel_share), bursts, background,
              lambda: sentinels(allowance)]
-    if (slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N
+    windowed = any(c.get("windows") for c in groups_cfg.values())
+    if (not windowed and slot % 2 == 1 and 0 < allowance < 1 + DETAIL_TOP_N
             and daily_headroom(guard) >= 1 + DETAIL_TOP_N):
         # A background check needs 1 + DETAIL_TOP_N sends; the ~3-attempt
         # share of a 30-minute run never fits one. Odd runs borrow up to a
@@ -669,7 +671,7 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
         # 3 at a 30-minute cadence) still reaches bursts and background.
         order = [bursts, background, lambda: sentinels(sentinel_share),
                  lambda: sentinels(allowance)]
-    if any(c.get("windows") for c in groups_cfg.values()):
+    if windowed:
         # Named windows (redesign): every overdue sentinel first, with the
         # whole allowance; then bursts from what is left (they wait while
         # any sentinel is still due); then the plain rotation. No slot

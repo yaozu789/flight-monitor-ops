@@ -384,6 +384,28 @@ class BurstSurplusTests(unittest.TestCase):
         db.commit()
         self.assertEqual(len(self._collect(db, cfg, slot, 4)), 1)
 
+    def test_orphan_cells_never_fill_the_batch(self):
+        """Four never-checked cells of a removed watch must not fill the
+        batch ahead of this run's one due cell."""
+        db = fresh_db(self)
+        # Orphans first: lower ids sort ahead of the live cell on ties.
+        store.ensure_cells(db, [{
+            "group_id": "gone", "depart_date": f"2026-11-1{i}", "duration": 7,
+            "role": "sentinel", "weekday": 1, "window": "near",
+            "refresh_hours": 48} for i in range(4)])
+        cfg, slot = self._setup(db)
+        db.execute("UPDATE cells SET last_checked_slot=? WHERE group_id='g1'",
+                   (slot,))
+        live = db.execute("SELECT MIN(id) AS i FROM cells "
+                          "WHERE group_id='g1'").fetchone()["i"]
+        db.execute("UPDATE cells SET last_checked_slot=NULL WHERE id=?",
+                   (live,))
+        db.commit()
+        self.assertEqual(len(self._collect(db, cfg, slot, 4)), 1)
+        self.assertIsNotNone(db.execute(
+            "SELECT last_checked_slot FROM cells WHERE id=?",
+            (live,)).fetchone()["last_checked_slot"])
+
     def test_run_that_clears_due_cells_still_bursts(self):
         """Odd run: bursts lead but 1 cell is due; the sentinel passes clear
         it, and the trailing burst pass then runs the burst."""

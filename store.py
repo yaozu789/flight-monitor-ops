@@ -1252,8 +1252,8 @@ def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
 
 
 def due_cells(db: sqlite3.Connection, role: str, limit: int,
-              slot: int | None = None, overdue_only: bool = False
-              ) -> list[dict]:
+              slot: int | None = None, overdue_only: bool = False,
+              group_ids=None) -> list[dict]:
     """Most overdue active cells first.
 
     Never-checked cells come first. With ``slot`` (the current 30-minute
@@ -1263,32 +1263,41 @@ def due_cells(db: sqlite3.Connection, role: str, limit: int,
     cells (``refresh_hours`` NULL) and calls without ``slot`` fall back to
     plain least-recently-checked rotation. ``overdue_only`` (needs
     ``slot``) keeps only named-window cells at or past their target.
+    ``group_ids`` restricts to those groups BEFORE the limit, so cells of a
+    watch that is no longer configured never fill a run's batch.
     """
+    where, params = "role = ? AND active = 1", [role]
+    if group_ids is not None:
+        ids = sorted(set(group_ids))
+        if not ids:
+            return []
+        where += f" AND group_id IN ({','.join('?' * len(ids))})"
+        params += ids
     if overdue_only:
         return [dict(r) for r in db.execute(
-            """SELECT * FROM cells
-               WHERE role = ? AND active = 1 AND refresh_hours IS NOT NULL
-                 AND (last_checked_slot IS NULL
-                      OR (? - last_checked_slot) >= refresh_hours * 2)
-               ORDER BY last_checked_slot IS NULL DESC,
-                        (? - last_checked_slot) / (refresh_hours * 2.0) DESC,
-                        id ASC
-               LIMIT ?""", (role, slot, slot, limit))]
+            f"""SELECT * FROM cells
+                WHERE {where} AND refresh_hours IS NOT NULL
+                  AND (last_checked_slot IS NULL
+                       OR (? - last_checked_slot) >= refresh_hours * 2)
+                ORDER BY last_checked_slot IS NULL DESC,
+                         (? - last_checked_slot) / (refresh_hours * 2.0) DESC,
+                         id ASC
+                LIMIT ?""", [*params, slot, slot, limit])]
     if slot is None:
         return [dict(r) for r in db.execute(
-            """SELECT * FROM cells
-               WHERE role = ? AND active = 1
-               ORDER BY last_checked_slot IS NULL DESC, last_checked_slot ASC,
-                        id ASC
-               LIMIT ?""", (role, limit))]
+            f"""SELECT * FROM cells
+                WHERE {where}
+                ORDER BY last_checked_slot IS NULL DESC,
+                         last_checked_slot ASC, id ASC
+                LIMIT ?""", [*params, limit])]
     return [dict(r) for r in db.execute(
-        """SELECT * FROM cells
-           WHERE role = ? AND active = 1
-           ORDER BY last_checked_slot IS NULL DESC,
-                    (? - last_checked_slot) / (COALESCE(refresh_hours, 48) * 2.0)
-                        DESC,
-                    last_checked_slot ASC, id ASC
-           LIMIT ?""", (role, slot, limit))]
+        f"""SELECT * FROM cells
+            WHERE {where}
+            ORDER BY last_checked_slot IS NULL DESC,
+                     (? - last_checked_slot)
+                         / (COALESCE(refresh_hours, 48) * 2.0) DESC,
+                     last_checked_slot ASC, id ASC
+            LIMIT ?""", [*params, slot, limit])]
 
 
 def overdue_sentinels(db: sqlite3.Connection, slot: int, group_ids) -> int:
