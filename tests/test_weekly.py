@@ -100,6 +100,152 @@ class BuildReportTests(unittest.TestCase):
         self.assertNotIn("Chart", text)
 
 
+JAPAN_W = {"id": "japan", "origins": ["SFO", "OAK", "SJC"],
+           "destinations": ["NRT", "HND", "KIX"], "absolute_cap_usd": 500,
+           "alert_mode": "collect", "nights": [28],
+           "windows": {"near": {"days": [7, 42], "step_days": 2,
+                                "refresh_hours": 48},
+                       "far": {"months": [3, 9], "refresh_hours": 72}}}
+LA_W = {"id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+        "absolute_cap_usd": 120, "alert_mode": "collect",
+        "windows": {"near": {"days": [7, 42], "weekdays": [4, 5],
+                             "return_weekday": 6, "refresh_hours": 48}}}
+
+
+def _d(days, stay=28):
+    dep = (MON_DUE + timedelta(days=days)).date()
+    return dep.isoformat(), (dep + timedelta(days=stay)).isoformat()
+
+
+class _ObsMixin:
+    def _obs(self, db, days_out, price, *, stay=28, seen_h=24, dest="NRT",
+             watch="japan"):
+        dep, ret = _d(days_out, stay)
+        obs(db, MON_DUE - timedelta(hours=seen_h), price, depart=dep,
+            ret=ret, dest=dest, watch=watch)
+
+
+class DigestTests(_ObsMixin, unittest.TestCase):
+    """Redesign A4: per departure window, the cheapest stored fare whose
+    departure is inside the window now and whose stay the watch tracks."""
+
+    def test_cheapest_per_window_only_in_window_and_stay(self):
+        db = fresh_db(self)
+        self._obs(db, 10, 812)
+        self._obs(db, 12, 300, stay=7)        # not a tracked stay
+        self._obs(db, 3, 250)                 # departs before the window
+        self._obs(db, 120, 700, dest="KIX")
+        self._obs(db, 120, 760, seen_h=24 * 9, dest="KIX")  # prior week
+        text = weekly.build_report(db, [JAPAN_W], MON_DUE, "2026-W40")
+        dep, ret = _d(10)
+        self.assertIn("japan (about 28 nights)", text)
+        self.assertIn(f"  Next 1-6 weeks: $812 SFO -> NRT {dep} -> {ret} "
+                      "(28 nights), ANA nonstop, seen 24h ago", text)
+        dep, ret = _d(120)
+        self.assertIn(f"  3-9 months out: $700 SFO -> KIX {dep} -> {ret}",
+                      text)
+        self.assertIn("    prior week low $760 (down $60)", text)
+        self.assertIn("Deal alerts: off while price history builds up",
+                      text)
+        self.assertNotIn("cap", text.split("Chart")[0])
+        self.assertNotIn("$300", text)
+        self.assertNotIn("$250", text)
+
+    def test_missing_and_stale_coverage_is_explicit(self):
+        db = fresh_db(self)
+        self._obs(db, 10, 812, seen_h=72)      # older than the 48 h target
+        import run
+        import sentinel
+        cfg = {"japan": run.group_cfg_for(JAPAN_W)}
+        sentinel.mint_sentinels(db, cfg, today=MON_DUE.date())
+        near = [r["id"] for r in db.execute(
+            "SELECT id FROM cells WHERE window_name='near' ORDER BY id")]
+        db.execute("UPDATE cells SET last_success_at=? WHERE id=?",
+                   ((MON_DUE - timedelta(hours=5)).isoformat(
+                       timespec="seconds"), near[0]))
+        db.commit()
+        text = weekly.build_report(db, [JAPAN_W], MON_DUE, "2026-W40")
+        self.assertIn("seen 3d ago (stale)", text)
+        self.assertIn("    dates checked in the last 48h: 1/18; 17 not "
+                      "checked recently", text)
+        self.assertIn("  3-9 months out: no fares stored this week", text)
+
+    def test_weekend_watch_and_no_cap_line_in_chart(self):
+        db = fresh_db(self)
+        self._obs(db, 11, 118, stay=2, dest="LAX", watch="la")  # Fri-Sun
+        text = weekly.build_report(db, [LA_W], MON_DUE, "2026-W40")
+        self.assertIn("la (weekend trips)", text)
+        self.assertIn("  Next 1-6 weeks: $118", text)
+        self.assertIn("    dates checked in the last 48h: 0/10; 10 not "
+                      "checked recently", text)  # 5 Fri + 5 Sat, none yet
+        url = next(l for l in text.splitlines() if l.startswith("Chart"))
+        labels = [d["label"] for d in json.loads(
+            unquote(url.split("?c=", 1)[1]))["data"]["datasets"]]
+        self.assertEqual(labels, ["la daily low"])
+
+
+NYC_W = {"id": "nyc", "origins": ["SFO"], "destinations": ["JFK"],
+         "absolute_cap_usd": 250, "alert_mode": "collect", "nights": [7, 14],
+         "windows": {"near": {"days": [7, 42], "step_days": 2,
+                              "refresh_hours": 48}}}
+
+
+class DigestReviewTests(_ObsMixin, unittest.TestCase):
+    """Codex review of PR #36: weekday/return filters, dates not cells,
+    bounds at report time, offset-aware ages, prior week without this week."""
+
+    def test_weekend_window_ignores_midweek_fares(self):
+        db = fresh_db(self)
+        self._obs(db, 8, 60, stay=2, dest="LAX", watch="la")    # Tue-Thu
+        self._obs(db, 12, 95, stay=1, dest="LAX", watch="la")   # Sat-Sun
+        text = weekly.build_report(db, [LA_W], MON_DUE, "2026-W40")
+        self.assertNotIn("$60", text)
+        dep, ret = _d(12, 1)
+        self.assertIn(f"  Next 1-6 weeks: $95 SFO -> LAX {dep} -> {ret} "
+                      "(1 nights)", text)
+
+    def test_coverage_counts_dates_inside_window_now(self):
+        db = fresh_db(self)
+        import run
+        import sentinel
+        sentinel.mint_sentinels(db, {"nyc": run.group_cfg_for(NYC_W)},
+                                today=MON_DUE.date() - timedelta(days=1))
+        # 7- and 14-night cells: 18 dates, not 36. Minted yesterday, so the
+        # date that fell out of the window today must not count.
+        db.execute("UPDATE cells SET last_success_at=?",
+                   ((MON_DUE - timedelta(hours=1)).isoformat(
+                       timespec="seconds"),))
+        db.commit()
+        text = weekly.build_report(db, [NYC_W], MON_DUE, "2026-W40")
+        line = next(l for l in text.splitlines() if "dates checked" in l)
+        # Today's window has 18 dates on the 2-day lattice. Cells minted
+        # yesterday cover 17 of them: the new one is unchecked, the one that
+        # left the window is not counted.
+        self.assertEqual(line, "    dates checked in the last 48h: 17/18; "
+                               "1 not checked recently")
+
+    def test_offset_timestamps_are_converted_not_overwritten(self):
+        db = fresh_db(self)
+        dep, ret = _d(10)
+        seen = (MON_DUE - timedelta(hours=42)).astimezone(
+            timezone(timedelta(hours=-7)))
+        store.add_observation(
+            db, watch_id="japan", origin="SFO", destination="NRT",
+            depart_date=dep, return_date=ret, airline="ANA", stops=0,
+            cabin="economy", price_usd=812, booking_url="",
+            observed_at=seen.isoformat(timespec="seconds"))
+        text = weekly.build_report(db, [JAPAN_W], MON_DUE, "2026-W40")
+        self.assertIn("seen 42h ago", text)
+        self.assertNotIn("(stale)", text)
+
+    def test_prior_week_low_shown_without_this_week(self):
+        db = fresh_db(self)
+        self._obs(db, 10, 830, seen_h=24 * 9)
+        text = weekly.build_report(db, [JAPAN_W], MON_DUE, "2026-W40")
+        self.assertIn("  Next 1-6 weeks: no fares stored this week\n"
+                      "    prior week low $830", text)
+
+
 class PrepareClaimTests(unittest.TestCase):
     def setUp(self):
         self.db = fresh_db(self)
