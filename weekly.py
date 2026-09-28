@@ -195,22 +195,27 @@ def _windowed_lines(db, w, cfg, now) -> list[str]:
                              f" ({trend})")
         fresh_since = (now - timedelta(hours=win["refresh_hours"])
                        ).isoformat(timespec="seconds")
-        # Departure DATES inside the window now (a date with 7- and
-        # 14-night cells is one date), fresh only when every trip length
-        # on it was checked within the target.
-        cov = db.execute(
-            """SELECT COUNT(*) AS n, COALESCE(SUM(fresh), 0) AS fresh
-               FROM (SELECT depart_date,
-                            MIN(last_success_at IS NOT NULL
-                                AND last_success_at >= ?) AS fresh
-                     FROM cells WHERE group_id = ? AND role = 'sentinel'
-                       AND active = 1 AND window_name = ?
-                       AND depart_date >= ? AND depart_date <= ?
-                     GROUP BY depart_date)""",
-            (fresh_since, w["id"], win["name"], lo_date, hi_date)).fetchone()
-        n, fresh = cov["n"] or 0, cov["fresh"] or 0
+        # Expected departure DATES come from the window itself, not from
+        # the cells minted so far: the report can run before today's
+        # minting, and a date with no cells yet is unchecked, not absent.
+        # A date is fresh only when every trip length on it was checked
+        # within the target.
+        import sentinel  # lazy: only named-window reports need it
+        start, end = sentinel._window_bounds(win, today)
+        expected = {d.isoformat()
+                    for d in sentinel._window_dates(win, start, end)}
+        per_date = (1 if win.get("return_weekday") is not None
+                    else len(cfg["nights"]))
+        fresh_dates = {r["depart_date"] for r in db.execute(
+            """SELECT depart_date FROM cells
+               WHERE group_id = ? AND role = 'sentinel' AND active = 1
+                 AND window_name = ? AND depart_date >= ? AND depart_date <= ?
+                 AND last_success_at IS NOT NULL AND last_success_at >= ?
+               GROUP BY depart_date HAVING COUNT(*) >= ?""",
+            (w["id"], win["name"], lo_date, hi_date, fresh_since, per_date))}
+        n, fresh = len(expected), len(expected & fresh_dates)
         if n == 0:
-            lines.append("    no departure dates set up yet")
+            lines.append("    no departure dates in this window")
             continue
         note = "" if fresh == n else f"; {n - fresh} not checked recently"
         lines.append(f"    dates checked in the last "

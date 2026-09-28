@@ -176,7 +176,8 @@ class DigestTests(_ObsMixin, unittest.TestCase):
         text = weekly.build_report(db, [LA_W], MON_DUE, "2026-W40")
         self.assertIn("la (weekend trips)", text)
         self.assertIn("  Next 1-6 weeks: $118", text)
-        self.assertIn("    no departure dates set up yet", text)
+        self.assertIn("    dates checked in the last 48h: 0/10; 10 not "
+                      "checked recently", text)  # 5 Fri + 5 Sat, none yet
         url = next(l for l in text.splitlines() if l.startswith("Chart"))
         labels = [d["label"] for d in json.loads(
             unquote(url.split("?c=", 1)[1]))["data"]["datasets"]]
@@ -211,15 +212,17 @@ class DigestReviewTests(_ObsMixin, unittest.TestCase):
                                 today=MON_DUE.date() - timedelta(days=1))
         # 7- and 14-night cells: 18 dates, not 36. Minted yesterday, so the
         # date that fell out of the window today must not count.
+        db.execute("UPDATE cells SET last_success_at=?",
+                   ((MON_DUE - timedelta(hours=1)).isoformat(
+                       timespec="seconds"),))
+        db.commit()
         text = weekly.build_report(db, [NYC_W], MON_DUE, "2026-W40")
         line = next(l for l in text.splitlines() if "dates checked" in l)
-        n = int(line.split("/")[1].split(";")[0])
-        self.assertLessEqual(n, 18)
-        lo = (MON_DUE.date() + timedelta(days=7)).isoformat()
-        inside = db.execute(
-            "SELECT COUNT(DISTINCT depart_date) AS c FROM cells "
-            "WHERE depart_date >= ?", (lo,)).fetchone()["c"]
-        self.assertEqual(n, inside)
+        # Today's window has 18 dates on the 2-day lattice. Cells minted
+        # yesterday cover 17 of them: the new one is unchecked, the one that
+        # left the window is not counted.
+        self.assertEqual(line, "    dates checked in the last 48h: 17/18; "
+                               "1 not checked recently")
 
     def test_offset_timestamps_are_converted_not_overwritten(self):
         db = fresh_db(self)
