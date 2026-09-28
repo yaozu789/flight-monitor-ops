@@ -306,6 +306,21 @@ class GateTests(unittest.TestCase):
         db = self._db(outcomes={"ok": 100}, ceiling=100)
         self.assertFalse(self._gate(db)["checks"]["history_days"])
 
+    def test_restored_ceiling_restarts_the_stage_clock(self):
+        db = self._db(outcomes={"ok": 100})  # 150 since 6 days ago
+        db.execute(
+            """INSERT INTO query_log (at, slot, group_id, window_name,
+               category, outcome, ceiling) VALUES (?, 1, 'nyc', 'near',
+               'sentinel', 'ok', 100)""",
+            ((self.NOW - timedelta(days=3)).isoformat(timespec="seconds"),))
+        db.execute(
+            """INSERT INTO query_log (at, slot, group_id, window_name,
+               category, outcome, ceiling) VALUES (?, 1, 'nyc', 'near',
+               'sentinel', 'ok', 150)""",
+            ((self.NOW - timedelta(hours=2)).isoformat(timespec="seconds"),))
+        db.commit()
+        self.assertFalse(self._gate(db)["checks"]["history_days"])
+
     def test_configured_window_without_cells_fails(self):
         db = self._db(outcomes={"ok": 100})
         watch = {"id": "nyc", "origins": ["SFO"], "destinations": ["JFK"],

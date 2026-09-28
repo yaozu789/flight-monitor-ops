@@ -928,10 +928,14 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
         (since,)).fetchone()["c"]
     throttles = max(health_throttles,
                     queries["throttle"] + stops.get("throttled", 0))
-    # History counts only at the CURRENT budget stage: days spent at the
-    # previous ceiling say nothing about the one just raised.
-    first = db.execute("SELECT MIN(at) AS a FROM query_log WHERE ceiling = ?",
-                       (guard.daily_ceiling,)).fetchone()["a"]
+    # History counts only since the CURRENT stage began: the first query at
+    # this ceiling after the last query at any other ceiling (a lowered and
+    # restored ceiling restarts the clock).
+    first = db.execute(
+        """SELECT MIN(at) AS a FROM query_log
+           WHERE ceiling = ? AND at > COALESCE(
+               (SELECT MAX(at) FROM query_log WHERE ceiling IS NOT ?), '')""",
+        (guard.daily_ceiling, guard.daily_ceiling)).fetchone()["a"]
     ratios = [r["p95_ratio"] for r in refresh]
     worst = (None if not ratios or None in ratios else max(ratios))
     checks = {
@@ -944,7 +948,7 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
     }
     return {"days": days, "daily_ceiling": guard.daily_ceiling,
             "refresh": refresh, "queries": queries,
-            "throttles": throttles, "deadline_stops": deadline_stops,
+            "throttle_records": throttles, "deadline_stops": deadline_stops,
             "worst_p95_ratio": worst,
             "gate": {"pass": all(checks.values()), "checks": checks}}
 
