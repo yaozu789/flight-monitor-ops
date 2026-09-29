@@ -256,6 +256,18 @@ CREATE TABLE IF NOT EXISTS query_log (
     ceiling INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log (at);
+-- Route baselines for relative alerts (baseline.py): one row per route
+-- bucket per UTC day, so every step that day uses the same median.
+CREATE TABLE IF NOT EXISTS baselines (
+    bucket TEXT NOT NULL,          -- watch|origin|destination|window|nights
+    day TEXT NOT NULL,
+    median REAL,
+    samples INTEGER NOT NULL,
+    days INTEGER NOT NULL,
+    armed INTEGER NOT NULL,
+    computed_at TEXT NOT NULL,
+    PRIMARY KEY (bucket, day)
+);
 """
 
 # Outbox lifecycle (v3): the SCHEDULER transition map is exactly
@@ -317,6 +329,10 @@ _OUTBOX_V2_COLUMNS = [
 # (a Friday or a Saturday neighbour) gets its own weekday's limit from it.
 _TRIGGER_COLUMNS = [
     ("window_name", "TEXT"),
+    # The triggering fare's route, so a relative burst revalidates against
+    # that route's current threshold.
+    ("origin", "TEXT"),
+    ("destination", "TEXT"),
 ]
 
 # Per-run collection stats on run_slots (NULL for runs before they existed):
@@ -493,7 +509,10 @@ def sync_watches(db: sqlite3.Connection, watches_cfg: list[dict], defaults: dict
                  absolute_cap_usd=excluded.absolute_cap_usd,
                  relative_threshold=excluded.relative_threshold,
                  config_json=excluded.config_json""",
-            (w["id"], json.dumps(w["destinations"]), w["absolute_cap_usd"],
+            # The cap is only an alert rule in cap mode; other modes may omit
+            # it (stored as 0 for the legacy NOT NULL column).
+            (w["id"], json.dumps(w["destinations"]),
+             w.get("absolute_cap_usd") or 0,
              defaults.get("relative_threshold", 0.35), json.dumps({**defaults, **w})),
         )
     db.commit()
@@ -709,6 +728,18 @@ def first_seen(db: sqlite3.Connection, fingerprint: str) -> str | None:
         "SELECT MIN(observed_at) AS m FROM observations WHERE fingerprint = ?",
         (fingerprint,)).fetchone()
     return row["m"] if row else None
+
+
+def burst_queued_since(db: sqlite3.Connection, fingerprint: str,
+                       since_iso: str) -> bool:
+    """True if an under-threshold burst was already queued for this fare
+    since *since_iso* (relative mode: the threshold moves day to day, so
+    "first time qualifying" means no recent burst, not "no cheaper price
+    ever stored")."""
+    return db.execute(
+        """SELECT 1 FROM triggers WHERE kind = 'under_cap' AND fingerprint = ?
+           AND created_at >= ? LIMIT 1""", (fingerprint, since_iso)
+    ).fetchone() is not None
 
 
 def has_under_cap_before(db: sqlite3.Connection, fingerprint: str, cap: float,
@@ -1477,16 +1508,21 @@ def retire_cell(db: sqlite3.Connection, cell_id: int) -> None:
 def queue_trigger(db: sqlite3.Connection, *, kind: str, group_id: str,
                   depart_week: str, depart_date: str, duration: int,
                   price_usd: float, fingerprint: str | None,
-                  slot: int, window_name: str | None = None) -> int | None:
+                  slot: int, window_name: str | None = None,
+                  origin: str | None = None,
+                  destination: str | None = None) -> int | None:
     """Queue a burst trigger. Deduped per (kind, group, week) per UTC day.
-    ``window_name`` is the window the triggering fare came from."""
+    ``window_name`` is the window the triggering fare came from; ``origin``
+    and ``destination`` its route."""
     cur = db.execute(
         """INSERT OR IGNORE INTO triggers
            (kind, group_id, depart_week, depart_date, duration, price_usd,
-            fingerprint, day, created_slot, created_at, status, window_name)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+            fingerprint, day, created_slot, created_at, status, window_name,
+            origin, destination)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
         (kind, group_id, depart_week, depart_date, duration, price_usd,
-         fingerprint, today_str(), slot, utcnow_iso(), window_name))
+         fingerprint, today_str(), slot, utcnow_iso(), window_name, origin,
+         destination))
     db.commit()
     return cur.lastrowid or None
 

@@ -613,6 +613,8 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
         result[count_key] += 1
         if cell["group_id"] in collect_groups:
             continue  # collect-only: prices are stored, nothing triggers
+        if group_cfg.get("alert_mode") == "relative":
+            continue  # relative watches burst only on a verified deal
         if _is_drop(prev_price, prev_ts, price):
             if _queue_drop_trigger(db, cell, price, slot):
                 result["drop_triggers"] += 1
@@ -776,12 +778,18 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             duration = deal["duration"]
             cap = deal.get("cap")
             window_name = deal.get("window_name")
+            relative = deal.get("relative", False)
+            origin, destination = deal.get("origin"), deal.get("destination")
         else:
             watch_id, fingerprint, price_usd, depart_date, duration, cap = deal
-            window_name = None
+            window_name, relative, origin, destination = None, False, None, None
         if cap is None:
             continue
-        if store.has_under_cap_before(db, fingerprint, cap, run_start):
+        if relative:
+            since = (_parse_ts(run_start) - timedelta(days=7)).isoformat()
+            if store.burst_queued_since(db, fingerprint, since):
+                continue
+        elif store.has_under_cap_before(db, fingerprint, cap, run_start):
             continue
         before = db.total_changes
         store.queue_trigger(
@@ -789,7 +797,7 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             depart_week=store.depart_week(depart_date),
             depart_date=depart_date, duration=duration,
             price_usd=price_usd, fingerprint=fingerprint, slot=slot,
-            window_name=window_name)
+            window_name=window_name, origin=origin, destination=destination)
         if db.total_changes > before:
             queued += 1
     return queued
@@ -863,6 +871,25 @@ def _trigger_window(trigger, group_cfg):
     return None
 
 
+def _still_eligible(db, trigger, group_cfg, price) -> bool:
+    """Burst revalidation. Cap mode (legacy): the fare is still at or under
+    the trigger price. Relative mode: the fare is still at or under TODAY's
+    threshold for the trigger's route (unarmed or no threshold -> drop)."""
+    if price is None:
+        return False
+    if group_cfg.get("alert_mode") != "relative":
+        return price <= trigger["price_usd"]
+    import baseline
+    ret = (date.fromisoformat(trigger["depart_date"])
+           + timedelta(days=int(trigger["duration"]))).isoformat()
+    limit, _ = baseline.threshold(
+        db, {"id": trigger["group_id"], "alert_mode": "relative",
+             "max_alert_usd": group_cfg.get("max_alert_usd")},
+        group_cfg, trigger.get("origin"), trigger.get("destination"),
+        trigger["depart_date"], ret)
+    return limit is not None and price <= limit
+
+
 def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                   deadline_fn=None, allowance=None) -> int:
     """Expand one due trigger (dict from ``store.due_triggers``).
@@ -916,12 +943,20 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
 
     trig_win = _trigger_window(trigger, group_cfg)
 
-    def _one_off(d_date: str, dur: int, category: str):
+    # A relative burst's revalidation searches ONLY the trigger's own route,
+    # so a cheaper fare on another airport pair cannot keep it alive.
+    route_cfg = group_cfg
+    if (group_cfg.get("alert_mode") == "relative" and trigger.get("origin")
+            and trigger.get("destination")):
+        route_cfg = dict(group_cfg, origins=[trigger["origin"]],
+                         destinations=[trigger["destination"]])
+
+    def _one_off(d_date: str, dur: int, category: str, cfg=None):
         # The trigger's window (bounds frozen when it was queued) names the
         # window for every step, so its departure-time limit carries over.
         cell = {"id": None, "depart_date": d_date, "duration": dur,
                 "window_name": trig_win["name"] if trig_win else None}
-        return check_cell(db, cell, guard, group_id, group_cfg,
+        return check_cell(db, cell, guard, group_id, cfg or group_cfg,
                           top_n=SENTINEL_TOP_N, category=category,
                           slot=slot, run_start=run_start)
 
@@ -953,15 +988,17 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
             if deadline_fn is not None and deadline_fn():
                 raise store.DeadlineExceeded("burst phase deadline exceeded")
             category = "verify" if kind == "revalidate" else "burst"
-            price, used = _one_off(d_date, dur, category)
+            price, used = _one_off(
+                d_date, dur, category,
+                route_cfg if kind == "revalidate" else None)
             total += used
             cumulative += used
             if redo:
                 revalidate_again = False  # resume point stays where it was
             else:
                 next_step = step_idx + 1
-            if kind == "revalidate" and (price is None
-                                        or price > trigger["price_usd"]):
+            if kind == "revalidate" and not _still_eligible(
+                    db, trigger, group_cfg, price):
                 store.mark_trigger(db, trigger["id"], "dropped")
                 store.save_burst_progress(db, trigger["id"], status="dropped",
                                           next_step=next_step,

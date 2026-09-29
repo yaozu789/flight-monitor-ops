@@ -54,7 +54,7 @@ Source: the Claude × Codex redesign debate (6 rounds, 2026-09-28; kept in Yaozu
 ## Alert modes (per watch)
 - **`collect`** (default): no scoring, verification, retries, bursts or drain. Entering it retires non-terminal outbox rows (`mode_collect`) and expires queued or partial bursts in one transaction. Test: first run after a cap-based pending row exists.
 - **`relative`:**
-  - **Bucket:** (actual origin–destination pair, window, nights). Collection context (airport set, window bounds) is persisted per observation, so config changes start a new bucket.
+  - **Bucket:** (actual origin–destination pair, window, nights). *As built (PR C):* the window is derived from depart date − observation day instead of being stored per observation; a change to a window's bounds re-reads old fares under the new bounds (acceptable for a personal monitor).
   - **Samples:** one minimum per cell per day, over a 28-day lookback, excluding the candidate's day.
   - **Arming:** ≥ 50 samples and ≥ 14 eligible days. Until then the bucket shows "insufficient history" and stays silent.
   - **Trigger:** price ≤ 0.70 × bucket median. The verify recheck must also pass (same fingerprint).

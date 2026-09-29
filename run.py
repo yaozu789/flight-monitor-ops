@@ -36,6 +36,7 @@ sys.path.insert(0, str(BASE))
 
 import yaml  # noqa: E402
 
+import baseline  # noqa: E402
 import budget  # noqa: E402
 import dashboard  # noqa: E402
 import heartbeat  # noqa: E402
@@ -50,6 +51,7 @@ from budget import (  # noqa: E402
 )
 from canary import run_canary  # noqa: E402
 from outbox import (  # noqa: E402
+    retire_ineligible_pending,
     RELAYABLE_ACTIONS,
     drain_pending,
     enqueue_from_confirmation,
@@ -266,6 +268,7 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         # relayed.
         enter_collect_mode(db, collect_watch_ids(watches)
                            | disabled_watch_ids())
+        retire_ineligible_pending(db, watches)
         # Drain FIRST (no network): must run before the backoff / slot
         # early-returns below so stranded handoffs are never stuck behind a
         # skipped collection.
@@ -408,6 +411,11 @@ def load_config() -> tuple[dict, list[dict]]:
         # not loaded, so nothing mints, collects, reports or budgets for it.
         if merged.get("enabled", True) is False:
             continue
+        # The cap is only an alert rule in cap mode; other modes may omit it.
+        if (budget.alert_mode(merged) == "cap"
+                and merged.get("absolute_cap_usd") is None):
+            raise ValueError(f"watch {merged['id']!r}: cap mode needs "
+                             "absolute_cap_usd")
         watches.append(merged)
     return defaults, watches
 
@@ -515,6 +523,9 @@ def group_cfg_for(w: dict) -> dict:
                            for x in windows if x["return_weekday"] is not None
                            for d in x["weekdays"]})
         return {"origins": w["origins"], "destinations": w["destinations"],
+                "id": w["id"], "alert_mode": budget.alert_mode(w),
+                "absolute_cap_usd": w.get("absolute_cap_usd"),
+                "max_alert_usd": w.get("max_alert_usd"),
                 "windows": windows, "nights": nights,
                 "window_days": (min(x["lo"] for x in windows),
                                 max(x["hi"] for x in windows)),
@@ -649,6 +660,16 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 return  # leave the rest of the verify cap for bursts
             _check_deadline(deadline_fn)
             ok, conf = verify(db, w, c, guard)
+            if ok and c.get("reason") == "relative":
+                # Scored against the day it was seen; handed off only if the
+                # confirmed fare also passes TODAY's threshold for its route
+                # (a backlog candidate whose route has since become unarmed,
+                # or whose threshold fell, is not news any more).
+                today_limit, _ = baseline.threshold(
+                    db, w, group_cfg_for(w), c["origin"], c["destination"],
+                    c["depart_date"], c["return_date"])
+                ok = (today_limit is not None
+                      and conf["price_usd"] <= today_limit)
             if not ok:
                 log_verify(db, w["id"], c["fingerprint"], c["observed_at"],
                            "not_confirmed")
@@ -659,7 +680,8 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
             aid, action = enqueue_from_confirmation(db, w, c, conf)
             # The alerts table stays the scoring-history record (the scorer's
             # cooldown reads it); delivery state lives in the outbox.
-            add_alert(db, fingerprint=c["fingerprint"], reason="absolute",
+            add_alert(db, fingerprint=c["fingerprint"],
+                      reason=c.get("reason", "absolute"),
                       verified_at=utcnow_iso())
             log_verify(db, w["id"], c["fingerprint"], c["observed_at"],
                        "confirmed")
@@ -678,7 +700,10 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 "watch_id": w["id"], "fingerprint": c["fingerprint"],
                 "price_usd": conf["price_usd"],
                 "depart_date": conf["depart_date"], "duration": duration,
-                "cap": w["absolute_cap_usd"],
+                # the alert threshold this deal passed (cap or relative)
+                "cap": c.get("threshold", w.get("absolute_cap_usd")),
+                "relative": c.get("reason") == "relative",
+                "origin": c.get("origin"), "destination": c.get("destination"),
                 # the window whose check found the fare (stored with the
                 # observation; burst steps get its limits)
                 "window_name": c.get("window_name")})
@@ -753,6 +778,7 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
     # drained (drain-first); direct callers drain here.
     if drained is None:
         enter_collect_mode(db, collect_ids | disabled_watch_ids())
+        retire_ineligible_pending(db, targets)
         drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 
@@ -993,7 +1019,17 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
         "no_deadline_stops": deadline_stops == 0,
         "refresh_p95": worst is not None and worst <= GATE_MAX_P95_RATIO,
     }
+    # Relative-alert readiness: route buckets armed out of those with fares
+    # in the lookback (a watch can switch to alert_mode: relative once its
+    # main routes are armed).
+    routes = {}
+    for w in watches:
+        if w.get("windows"):
+            status = baseline.bucket_status(db, w, group_cfg_for(w), now)
+            routes[w["id"]] = {"armed": sum(s["armed"] for s in status),
+                               "routes": len(status)}
     return {"days": days, "daily_ceiling": guard.daily_ceiling,
+            "relative_routes": routes,
             "refresh": refresh, "queries": queries,
             "throttle_records": throttles, "deadline_stops": deadline_stops,
             "worst_p95_ratio": worst,

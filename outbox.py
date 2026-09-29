@@ -160,10 +160,17 @@ def render_alert_message(watch, confirmation, fingerprint, first_seen_at,
         f"{_stops_text(confirmation.get('stops'))}",
         f"First seen {first_seen_at}; rechecked at {confirmation['observed_at']}.",
     ]
+    typical = confirmation.get("typical_usd")
+    if typical:
+        pct = round(100 * (1 - confirmation["price_usd"] / typical))
+        lines.append(f"Typical for this route: ${typical:,.0f} (28-day "
+                     f"median of stored fares); this fare is {pct}% below.")
     lines.extend(_history_lines(history, confirmation["price_usd"]))
     try:
-        chart = history_chart_url(history, confirmation["price_usd"],
-                                  watch.get("absolute_cap_usd"))
+        chart = history_chart_url(
+            history, confirmation["price_usd"],
+            (watch.get("absolute_cap_usd")
+             if watch.get("alert_mode", "cap") == "cap" else None))
     except Exception:  # noqa: BLE001 - a chart must never block an alert
         chart = None
     if chart:
@@ -212,6 +219,31 @@ def enqueue_from_confirmation(db, watch, candidate, confirmation) -> tuple[str, 
         destination=(confirmation.get("destination")
                      or candidate.get("destination")),
     )
+
+
+def retire_ineligible_pending(db, watches) -> list[str]:
+    """Relative watches: a pending alert is handed off only while its fare
+    still passes TODAY's threshold for its route. One confirmed before
+    midnight whose route became unarmed, or whose threshold fell below the
+    fare (or under a lowered max_alert_usd), is retired instead. No
+    search: uses the stored price and today's stored baseline."""
+    import baseline
+    import run
+    by_id = {w["id"]: w for w in watches}
+    retired = []
+    for row in db.execute(
+            "SELECT * FROM outbox WHERE state = 'pending'").fetchall():
+        w = by_id.get(row["watch_id"])
+        if not w or w.get("alert_mode") != "relative":
+            continue
+        limit, _ = baseline.threshold(
+            db, w, run.group_cfg_for(w), row["origin"], row["destination"],
+            row["depart_date"], row["return_date"])
+        if limit is None or row["price_usd"] > limit:
+            if store.retire_outbox(db, row["alert_id"],
+                                   "relative_no_longer_eligible"):
+                retired.append(row["alert_id"])
+    return retired
 
 
 def drain_pending(db, slot) -> list[dict]:

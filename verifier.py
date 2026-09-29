@@ -95,7 +95,11 @@ def verify(db, watch, candidate, guard, *, top_n=3) -> tuple[bool, dict | None]:
     watch["absolute_cap_usd"]; (False, None) on unknown (no results / no
     match) -- the caller must NOT alert.
     """
-    cap = watch["absolute_cap_usd"]
+    if watch.get("alert_mode", "cap") == "collect":
+        return False, None  # collect-only watches never confirm a deal
+    # The threshold the scorer used for this candidate (cap or relative);
+    # the recheck must pass the same number.
+    cap = candidate.get("threshold", watch.get("absolute_cap_usd"))
     depart = candidate["depart_date"]
     return_ = candidate["return_date"]
     q_from, q_to = _grouped_endpoints(watch, candidate["origin"],
@@ -111,9 +115,12 @@ def verify(db, watch, candidate, guard, *, top_n=3) -> tuple[bool, dict | None]:
     if match is None:
         return False, None  # unknown -- do NOT alert
     price = _price(match)
-    if price is None or price > cap:
+    if cap is None or price is None or price > cap:
         return False, None
-    return True, _confirmation(match, depart, return_)
+    conf = _confirmation(match, depart, return_)
+    if candidate.get("median") is not None:
+        conf["typical_usd"] = candidate["median"]
+    return True, conf
 
 
 def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | None]:
@@ -127,9 +134,16 @@ def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | Non
                                      do NOT retire).
     Never synthesizes reason "new_low".
     """
-    cap = watch["absolute_cap_usd"]
+    import baseline
+    import run
     depart = alert_row["depart_date"]
     return_ = alert_row["return_date"]
+    gcfg = (run.group_cfg_for(watch) if watch.get("alert_mode") == "relative"
+            else {})
+    cap, base = baseline.threshold(db, watch, gcfg, alert_row["origin"],
+                                   alert_row["destination"], depart, return_)
+    if cap is None:
+        return "unknown", None  # no threshold today: never re-alert
     q_from, q_to = _grouped_endpoints(watch, alert_row["origin"],
                                       alert_row["destination"])
     rows = poller.narrow_query(
@@ -146,7 +160,10 @@ def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | Non
     if price is None:
         return "unknown", None
     if price <= cap:
-        return "confirmed", _confirmation(match, depart, return_)
+        conf = _confirmation(match, depart, return_)
+        if base and base.get("median") is not None:
+            conf["typical_usd"] = base["median"]
+        return "confirmed", conf
     if price > cap * 1.10:
         return "gone", None
     return "unknown", None
