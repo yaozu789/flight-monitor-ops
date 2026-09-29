@@ -12,6 +12,7 @@ defaults:
   currency: USD
   run_every_minutes: 30         # must match the Muse schedule; drives budget pacing
   alert_mode: collect           # a new watch only collects until switched on
+  daily_ceiling: 150            # Google requests/day; the budget step (150 -> 225 -> 300)
 
 # Named departure windows (redesign, docs: Redesign_spec.md). A watch with
 # `windows:` lists its exact trip lengths in `nights:` and ignores the
@@ -44,7 +45,7 @@ watches:
   - id: japan
     destinations: [NRT, HND, KIX]
     absolute_cap_usd: 500
-    alert_mode: collect
+    alert_mode: relative         # alerts start by themselves as routes arm
     nights: [28]                 # about a month
     windows:
       near: {days: [7, 42], step_days: 2, refresh_hours: 48}
@@ -52,7 +53,7 @@ watches:
   - id: nyc
     destinations: [EWR, JFK, LGA]
     absolute_cap_usd: 250
-    alert_mode: collect
+    alert_mode: relative         # alerts start by themselves as routes arm
     nights: [7, 14]              # one or two weeks
     windows:
       near: {days: [7, 42], step_days: 2, refresh_hours: 48}

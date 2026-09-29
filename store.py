@@ -257,6 +257,16 @@ CREATE TABLE IF NOT EXISTS query_log (
     attempts INTEGER               -- actual HTTP attempts (guard-counted)
 );
 CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log (at);
+-- One-time milestone notices (notices.py), relayed like the weekly report
+-- until the agent records them with notice-mark.
+CREATE TABLE IF NOT EXISTS notices (
+    key TEXT PRIMARY KEY,
+    message_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    emits INTEGER NOT NULL DEFAULT 0,
+    last_slot INTEGER,
+    relayed_at TEXT
+);
 -- Route baselines for relative alerts (baseline.py): one row per route
 -- bucket per UTC day, so every step that day uses the same median.
 CREATE TABLE IF NOT EXISTS baselines (

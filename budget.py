@@ -86,6 +86,20 @@ def effective_verify_reserve(watches) -> int:
     return 0 if all_collect(watches) else VERIFY_RESERVE
 
 
+def daily_ceiling(watches) -> int:
+    """The daily request ceiling (budget stage) from watches.yaml's
+    ``daily_ceiling`` (a default merged into every watch), else
+    DAILY_CEILING. Raising it is the budget step (150 -> 225 -> 300)."""
+    values = {int(w["daily_ceiling"]) for w in watches
+              if w.get("daily_ceiling") is not None}
+    if len(values) > 1:
+        raise ValueError(f"daily_ceiling must be one value, got {values}")
+    value = values.pop() if values else DAILY_CEILING
+    if not 1 <= value <= 1000:
+        raise ValueError(f"daily_ceiling {value} out of range 1..1000")
+    return value
+
+
 def effective_category_caps(watches, daily_ceiling=DAILY_CEILING) -> dict:
     """Per-category daily caps (maxima; the daily ceiling bounds the sum).
 
