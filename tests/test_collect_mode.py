@@ -520,5 +520,39 @@ class StageAConfigTests(unittest.TestCase):
         self.assertLess(demand, 0.9 * budget.DAILY_CEILING)
 
 
+class Phase2ConfigTests(unittest.TestCase):
+    """The Phase 2 destinations are written in watches.yaml but switched
+    off; switched on, all seven fit the spec's budget."""
+
+    def _all(self):
+        import yaml
+        with open(_PROJECT_ROOT / "watches.yaml") as f:
+            cfg = yaml.safe_load(f)
+        d = cfg.get("defaults", {})
+        return [{**d, **w} for w in cfg["watches"]]
+
+    def test_disabled_watches_are_not_loaded(self):
+        _, watches = fm_run.load_config()
+        self.assertEqual({w["id"] for w in watches}, {"japan", "nyc"})
+        off = {w["id"] for w in self._all() if w.get("enabled") is False}
+        self.assertEqual(off, {"la", "sd", "hkg", "shanghai", "beijing"})
+
+    def test_all_seven_parse_and_fit_the_300_stage(self):
+        from datetime import date
+        db = fresh_db(self)
+        watches = self._all()
+        cfg = {w["id"]: fm_run.group_cfg_for(w) for w in watches}
+        fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 10, 1))
+        demand = sum(2 * 24 / r["refresh_hours"] for r in db.execute(
+            "SELECT refresh_hours FROM cells WHERE active = 1"))
+        # Spec: 197.3-201.3 attempts/day for all seven groups.
+        self.assertTrue(197 <= demand <= 202, demand)
+        self.assertLess(demand, 0.9 * (300 - 24 - 12))
+        weekend = {r["weekday"] for r in db.execute(
+            "SELECT weekday FROM cells WHERE group_id IN ('la', 'sd')")}
+        self.assertEqual(weekend, {4, 5})
+        self.assertEqual(cfg["la"]["windows"][0]["depart_hours"], {5: "5-12"})
+
+
 if __name__ == "__main__":
     unittest.main()
