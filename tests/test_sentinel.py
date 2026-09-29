@@ -1469,9 +1469,10 @@ class TestNamedWindows(SentinelTestBase):
                             self.guard(), "la", gcfg, top_n=1,
                             category="sentinel", slot=1,
                             run_start=store.utcnow_iso())
-        row = self.db.execute("SELECT fingerprint, outbound_hours FROM "
-                              "observations").fetchone()
+        row = self.db.execute("SELECT fingerprint, outbound_hours, window_name "
+                              "FROM observations").fetchone()
         self.assertEqual(row["outbound_hours"], "5-11")
+        self.assertEqual(row["window_name"], "near")
         self.assertEqual(verifier._cfg_for(watch, "SFO", "LAX", "5-11")
                          .get("outbound_hours"), "5-11")
         # The alert keeps the limit its fare was found with, and a retry

@@ -337,6 +337,8 @@ _OBS_V3_COLUMNS = [
     # The outbound departure-time limit the fare was searched with ("5-11"),
     # so verify and retry rechecks repeat exactly the same search.
     ("outbound_hours", "TEXT"),
+    # The named window whose check found the fare (bursts inherit it).
+    ("window_name", "TEXT"),
 ]
 
 # Named departure windows (redesign PR A1): which window minted a cell and
@@ -504,7 +506,8 @@ def add_observation(db: sqlite3.Connection, *, watch_id: str, origin: str,
                     observed_at: str | None = None,
                     flight_numbers: list[str] | None = None,
                     depart_times: list[str] | None = None,
-                    outbound_hours: str | None = None) -> int:
+                    outbound_hours: str | None = None,
+                    window_name: str | None = None) -> int:
     # v3: every new fli result populates the leg fields; old callers omit
     # them and get the Phase-1 fingerprint verbatim (compat).
     fp = make_fingerprint(origin, destination, depart_date, return_date,
@@ -513,13 +516,13 @@ def add_observation(db: sqlite3.Connection, *, watch_id: str, origin: str,
         """INSERT INTO observations
            (watch_id, fingerprint, origin, destination, depart_date, return_date,
             airline, stops, cabin, price_usd, booking_url, observed_at,
-            flight_numbers, depart_times, outbound_hours)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            flight_numbers, depart_times, outbound_hours, window_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (watch_id, fp, origin, destination, depart_date, return_date, airline,
          stops, cabin, price_usd, booking_url, observed_at or utcnow_iso(),
          json.dumps(flight_numbers) if flight_numbers else None,
          json.dumps(depart_times) if depart_times else None,
-         outbound_hours),
+         outbound_hours, window_name),
     )
     db.commit()
     return cur.lastrowid
@@ -541,7 +544,8 @@ def save_observations(db: sqlite3.Connection, watch_id: str,
             observed_at=run_start,
             flight_numbers=o.get("flight_numbers"),
             depart_times=o.get("depart_times"),
-            outbound_hours=o.get("outbound_hours"))
+            outbound_hours=o.get("outbound_hours"),
+            window_name=o.get("window_name"))
         n += 1
     return n
 

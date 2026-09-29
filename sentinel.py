@@ -217,16 +217,6 @@ def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
 
 
 
-def window_on(group_cfg, depart_date: str, day: date) -> str | None:
-    """Name of the window that held *depart_date* on *day* (the day a fare
-    was seen), or None."""
-    offset = (date.fromisoformat(depart_date) - day).days
-    for win in (group_cfg or {}).get("windows") or []:
-        if win["lo"] <= offset <= win["hi"]:
-            return win["name"]
-    return None
-
-
 def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
     return (today_d + timedelta(days=int(win["lo"])),
             today_d + timedelta(days=int(win["hi"])))
@@ -481,8 +471,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
         if rows:
             normed = [_normalize_row(r, depart_date, return_date)
                       for r in rows]
-            normed = [dict(r, outbound_hours=hours) for r in normed
-                      if r["price_usd"] is not None]
+            normed = [dict(r, outbound_hours=hours, window_name=window_name)
+                      for r in normed if r["price_usd"] is not None]
             if normed and run_start is not None:
                 store.save_observations(db, group_id, normed, run_start)
             prices = [r["price_usd"] for r in normed]
