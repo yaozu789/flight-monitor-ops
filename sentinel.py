@@ -341,9 +341,28 @@ def ensure_background_grid(db, groups_cfg, today=None) -> int:
     cells = []
     for group_id, group_cfg in groups_cfg.items():
         if group_cfg.get("windows"):
-            # Named-window watches have no background grid (redesign: the
-            # 10-duration exploration is off); the retire pass below drops
-            # any cells an earlier config left.
+            # Named windows: the background grid is trip-length EXPLORATION
+            # -- the window's own departure dates x the watch's
+            # explore_nights (lengths the sentinels do not check), refreshed
+            # 3x slower. None configured = no grid; the retire pass below
+            # drops any cells an earlier config left.
+            if not group_cfg.get("explore_per_day"):
+                continue
+            for win in group_cfg["windows"]:
+                if win.get("return_weekday") is not None:
+                    continue  # fixed-return (weekend) windows: one stay only
+                start, end = _window_bounds(win, today_d)
+                for d in _window_dates(win, start, end):
+                    for duration in group_cfg.get("explore_nights") or []:
+                        cells.append({
+                            "group_id": group_id,
+                            "depart_date": d.isoformat(),
+                            "duration": duration,
+                            "role": "background",
+                            "weekday": d.weekday(),
+                            "window": win["name"],
+                            "refresh_hours": 3 * int(win["refresh_hours"]),
+                        })
             continue
         lo_d, hi_d = _window_days(group_cfg)
         durations = _durations(group_cfg)
@@ -445,7 +464,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
         store.log_query(db, slot=slot, group_id=group_id,
                         window_name=window_name, category=category,
                         outcome=outcome,
-                        ceiling=getattr(guard, "daily_ceiling", None))
+                        ceiling=getattr(guard, "daily_ceiling", None),
+                        attempts=guard.spent_run() - spent_before)
 
     poller.LAST_OUTCOME = None
     outcome = None
@@ -749,8 +769,35 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
                            "sentinels", deadline_fn, checked,
                            collect_groups)
 
-        order = [lambda: sentinels(allowance, overdue_only=True), bursts,
-                 background] + ([legacy_rotation] if legacy else [])
+        def explore():
+            # Trip-length exploration: only when no sentinel is due (same
+            # gate as bursts), cheap checks (top_n=1), capped per day by the
+            # background category (sum of explore_per_day; 0 = off).
+            if store.overdue_sentinels(db, slot, groups_cfg):
+                return
+            # Only watches that enabled exploration, and only their DUE
+            # exploration cells (3x-slower target): a legacy grid or a
+            # fresh cell never takes the explore budget.
+            explorers = {g: c for g, c in groups_cfg.items()
+                         if c.get("windows") and c.get("explore_per_day")}
+            # Each watch spends only its OWN explore_per_day (today's
+            # exploration attempts per watch come from the query log): one
+            # pass per watch, its allowance capped at what it has left.
+            for g, c in sorted(explorers.items()):
+                left = int(c["explore_per_day"]) - store.explore_spent_today(
+                    db, g)
+                if left < 1 + SENTINEL_TOP_N:
+                    continue
+                _collect_phase(db, guard, {g: c}, slot, run_start,
+                               "background", SENTINEL_TOP_N, "background",
+                               result, min(allowance, result["attempts"] + left),
+                               "background", deadline_fn, checked,
+                               collect_groups, overdue_only=True)
+
+        # Legacy sentinels (mixed config) rotate BEFORE exploration, so
+        # exploration only ever gets what is left after priority work.
+        order = [lambda: sentinels(allowance, overdue_only=True), bursts] + (
+            [legacy_rotation] if legacy else []) + [explore]
     result["allowance"] = allowance
     for step in order:
         if not phase(step):

@@ -520,6 +520,201 @@ class StageAConfigTests(unittest.TestCase):
         self.assertLess(demand, 0.9 * budget.DAILY_CEILING)
 
 
+class ExploreTests(unittest.TestCase):
+    """Trip-length exploration: extra stays on the window's dates, only from
+    leftover budget (no sentinel due), cheap checks, capped per day; off
+    unless a watch sets explore_nights and explore_per_day."""
+
+    WATCH = {"id": "japan", "origins": ["SFO"], "destinations": ["NRT"],
+             "absolute_cap_usd": 500, "alert_mode": "collect", "nights": [28],
+             "explore_nights": [14, 21, 28], "explore_per_day": 10,
+             "windows": {"near": {"days": [7, 42], "step_days": 2,
+                                  "refresh_hours": 48},
+                         "far": {"months": [3, 9], "refresh_hours": 72}}}
+
+    def test_grid_caps_and_off_by_default(self):
+        db = fresh_db(self)
+        cfg = {"japan": fm_run.group_cfg_for(self.WATCH)}
+        self.assertEqual(cfg["japan"]["explore_nights"], [14, 21])  # 28 is main
+        fm_sentinel.ensure_background_grid(db, cfg)
+        rows = db.execute(
+            "SELECT window_name, duration, refresh_hours, COUNT(*) AS n "
+            "FROM cells WHERE role = 'background' AND active = 1 "
+            "GROUP BY 1, 2, 3").fetchall()
+        got = {(r["window_name"], r["duration"], r["refresh_hours"]): r["n"]
+               for r in rows}
+        self.assertEqual(got[("near", 14, 144)], 18)
+        self.assertEqual(got[("near", 21, 144)], 18)
+        self.assertTrue(24 <= got[("far", 14, 216)] <= 27)
+        self.assertEqual(budget.effective_category_caps([self.WATCH])
+                         ["background"], 10)
+        off = dict(self.WATCH, explore_per_day=0)
+        fm_sentinel.ensure_background_grid(
+            db, {"japan": fm_run.group_cfg_for(off)})
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) AS c FROM cells WHERE role = 'background' AND "
+            "active = 1").fetchone()["c"], 0)
+        self.assertEqual(budget.effective_category_caps([off])["background"], 0)
+
+    def test_explores_only_when_nothing_is_due_within_its_cap(self):
+        db = fresh_db(self)
+        cfg = {"japan": fm_run.group_cfg_for(self.WATCH)}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps=budget.effective_category_caps(
+                                [self.WATCH]))
+        calls = []
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append((cell["role"], category, top_n))
+            guard_.reserve(category)
+            guard_.reserve(category)
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 2)
+
+        def run_once(allowance):
+            calls.clear()
+            with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                    mock.patch.object(fm_sentinel, "per_run_allowance",
+                                      lambda *a, **k: allowance):
+                fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
+            return list(calls)
+
+        # Sentinels are due: the run spends everything on them.
+        first = run_once(6)
+        self.assertEqual({c[0] for c in first}, {"sentinel"})
+        # Nothing due: leftover goes to cheap exploration checks...
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'sentinel'", (slot,))
+        db.commit()
+        second = run_once(40)
+        self.assertEqual(set(second), {("background", "background", 1)})
+        # ...but never past the daily explore cap (10 attempts = 5 checks).
+        self.assertEqual(guard.spent_today("background"), 10)
+
+
+class ExploreReviewTests(unittest.TestCase):
+    """Codex review of PR #43."""
+
+    def test_only_due_cells_of_exploring_watches_and_metadata_updates(self):
+        db = fresh_db(self)
+        w = ExploreTests.WATCH
+        cfg = {"japan": fm_run.group_cfg_for(w),
+               "old": {"origins": ["SFO"], "destinations": ["JFK"]}}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'sentinel'", (slot,))
+        # Explore cells fresh (checked 1 h ago) except exactly one.
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'background'", (slot - 2,))
+        one = db.execute("SELECT MIN(id) AS i FROM cells WHERE role = "
+                         "'background' AND group_id = 'japan'").fetchone()["i"]
+        db.execute("UPDATE cells SET last_checked_slot=NULL WHERE id=?", (one,))
+        db.commit()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={"background": 100})
+        seen = []
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            seen.append((cell["group_id"], cell["role"], cell["id"]))
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 2)
+
+        with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: 40):
+            fm_sentinel.collect(db, guard, {"japan": cfg["japan"]}, slot,
+                                store.utcnow_iso())
+        self.assertEqual([s for s in seen if s[1] == "background"],
+                         [("japan", "background", one)])
+        # A changed refresh target reaches existing exploration cells.
+        w2 = dict(w, windows={"near": {"days": [7, 42], "step_days": 2,
+                                       "refresh_hours": 24},
+                              "far": w["windows"]["far"]})
+        fm_sentinel.ensure_background_grid(
+            db, {"japan": fm_run.group_cfg_for(w2)})
+        self.assertEqual({r["refresh_hours"] for r in db.execute(
+            "SELECT refresh_hours FROM cells WHERE role = 'background' AND "
+            "active = 1 AND window_name = 'near'")}, {72})
+
+    def test_each_watch_spends_only_its_own_explore_allowance(self):
+        db = fresh_db(self)
+        w1 = ExploreTests.WATCH
+        w2 = dict(w1, id="hkg", destinations=["HKG"], explore_per_day=4)
+        cfg = {"japan": fm_run.group_cfg_for(w1),
+               "hkg": fm_run.group_cfg_for(w2)}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'sentinel'", (slot,))
+        db.commit()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={"background": 14})
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            # A retry/redirect: this check really cost 3 attempts.
+            store.log_query(db_, slot=slot, group_id=group_id,
+                            window_name=cell.get("window_name"),
+                            category=category, outcome="ok", attempts=3)
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 3)
+
+        with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: 80):
+            for _ in range(3):
+                fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
+        # Spend stops at or just under each watch's allowance counted in
+        # REAL attempts (a check starts only if 2 attempts still fit).
+        real = {r["group_id"]: r["n"] for r in db.execute(
+            "SELECT group_id, SUM(attempts) AS n FROM query_log "
+            "WHERE category = 'background' GROUP BY group_id")}
+        # At most one check's retry overrun past the allowance.
+        self.assertTrue(3 <= real["hkg"] <= 4 + 1, real)
+        self.assertTrue(9 <= real["japan"] <= 10 + 1, real)
+
+    def test_legacy_sentinels_before_exploration_in_mixed_config(self):
+        db = fresh_db(self)
+        cfg = {"japan": fm_run.group_cfg_for(ExploreTests.WATCH),
+               "old": {"origins": ["SFO"], "destinations": ["JFK"]}}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        db.execute("UPDATE cells SET last_checked_slot=? WHERE role = "
+                   "'sentinel' AND group_id = 'japan'", (slot,))
+        db.commit()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={})
+        roles = []
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            roles.append((group_id, category))
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 2)
+
+        with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: 4):
+            fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
+        self.assertEqual(roles, [("old", "sentinel"), ("old", "sentinel")])
+
+    def test_explore_budget_never_makes_a_stall(self):
+        guard = BudgetGuard(fresh_db(self), verify_reserve=0,
+                            category_caps={"sentinel": 0, "background": 20})
+        # A sentinel is due but its category is spent; exploration waits.
+        self.assertFalse(fm_run._stalled(
+            guard, {"attempts": 0, "allowance": 6, "overdue_at_start": 2}))
+
+
 class Phase2ConfigTests(unittest.TestCase):
     """The Phase 2 destinations are written in watches.yaml but switched
     off; switched on, all seven fit the spec's budget."""

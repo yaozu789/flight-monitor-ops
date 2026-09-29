@@ -253,7 +253,8 @@ CREATE TABLE IF NOT EXISTS query_log (
     window_name TEXT,
     category TEXT NOT NULL,
     outcome TEXT NOT NULL,
-    ceiling INTEGER
+    ceiling INTEGER,
+    attempts INTEGER               -- actual HTTP attempts (guard-counted)
 );
 CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log (at);
 -- Route baselines for relative alerts (baseline.py): one row per route
@@ -360,6 +361,12 @@ _OBS_V3_COLUMNS = [
 # Named departure windows (redesign PR A1): which window minted a cell and
 # how often it should be refreshed. NULL for cells minted by the legacy
 # single-window config, which keep plain least-recently-checked rotation.
+# Actual HTTP attempts one logged query made (retries and redirects
+# included), as counted by the budget guard.
+_QUERY_LOG_COLUMNS = [
+    ("attempts", "INTEGER"),
+]
+
 _CELLS_WINDOW_COLUMNS = [
     ("window_name", "TEXT"),
     ("refresh_hours", "INTEGER"),
@@ -433,6 +440,11 @@ def migrate_db(db: sqlite3.Connection) -> None:
         for name, ddl in _TRIGGER_COLUMNS:
             if name not in trig_cols:
                 db.execute(f"ALTER TABLE triggers ADD COLUMN {name} {ddl}")
+    ql_cols = {r["name"] for r in db.execute("PRAGMA table_info(query_log)")}
+    if ql_cols:
+        for name, ddl in _QUERY_LOG_COLUMNS:
+            if name not in ql_cols:
+                db.execute(f"ALTER TABLE query_log ADD COLUMN {name} {ddl}")
     cell_cols = {r["name"] for r in db.execute("PRAGMA table_info(cells)")}
     if cell_cols:
         for name, ddl in _CELLS_WINDOW_COLUMNS:
@@ -1310,15 +1322,19 @@ def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
                  active = 1, retired_at = NULL,
                  window_name = CASE WHEN excluded.role = 'sentinel'
                                       OR cells.active = 0
+                                      OR cells.role = 'background'
                                     THEN excluded.window_name
                                     ELSE cells.window_name END,
                  refresh_hours = CASE WHEN excluded.role = 'sentinel'
                                         OR cells.active = 0
+                                        OR cells.role = 'background'
                                       THEN excluded.refresh_hours
                                       ELSE cells.refresh_hours END
                WHERE cells.active = 0
                   OR (excluded.role = 'sentinel' AND cells.role <> 'sentinel')
-                  OR (excluded.role = 'sentinel'
+                  OR ((excluded.role = 'sentinel'
+                       OR (excluded.role = 'background'
+                           AND cells.role = 'background'))
                       AND (cells.window_name IS NOT excluded.window_name
                            OR cells.refresh_hours IS NOT excluded.refresh_hours))""",
             (c["group_id"], c["depart_date"], c["duration"], c["role"],
@@ -1386,16 +1402,16 @@ UNKNOWN_OUTCOMES = ("empty", "transport_fail", "unparseable", "error")
 
 def log_query(db: sqlite3.Connection, *, slot: int | None, group_id: str,
               window_name: str | None, category: str, outcome: str,
-              ceiling: int | None = None) -> None:
+              ceiling: int | None = None, attempts: int | None = None) -> None:
     if outcome not in QUERY_OUTCOMES:
         raise ValueError(f"unknown query outcome {outcome!r}")
     now = datetime.now(timezone.utc)
     db.execute(
         """INSERT INTO query_log (at, slot, group_id, window_name, category,
-                                  outcome, ceiling)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                  outcome, ceiling, attempts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (now.isoformat(timespec="seconds"), slot, group_id, window_name,
-         category, outcome, ceiling))
+         category, outcome, ceiling, attempts))
     db.execute("DELETE FROM query_log WHERE at < ?",
                ((now - timedelta(days=QUERY_LOG_KEEP_DAYS))
                 .isoformat(timespec="seconds"),))
@@ -1464,6 +1480,16 @@ def refresh_ages(db: sqlite3.Connection, group_ids, now_iso: str | None = None
                     "p95_h": round(p95, 1), "max_h": round(ages[-1], 1),
                     "p95_ratio": p95 / refresh})
     return out
+
+
+def explore_spent_today(db: sqlite3.Connection, group_id: str) -> int:
+    """ACTUAL HTTP attempts spent on trip-length exploration (background
+    checks) by one watch today (UTC), as the budget guard counted them per
+    logged query (retries and redirects included)."""
+    return db.execute(
+        """SELECT COALESCE(SUM(attempts), 0) AS n FROM query_log
+           WHERE group_id = ? AND category = 'background' AND at >= ?""",
+        (group_id, today_str())).fetchone()["n"]
 
 
 def overdue_sentinels(db: sqlite3.Connection, slot: int, group_ids) -> int:

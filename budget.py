@@ -100,13 +100,17 @@ def effective_category_caps(watches, daily_ceiling=DAILY_CEILING) -> dict:
     """
     if is_legacy(watches):
         return dict(CATEGORY_CAPS)
+    # Trip-length exploration spends at most the watches' explore_per_day
+    # (default 0 = off), and only when no sentinel is due.
+    explore = sum(int(w.get("explore_per_day", 0) or 0) for w in watches
+                  if w.get("windows") and w.get("explore_nights"))
     if all_collect(watches):
         return {"sentinel": daily_ceiling, "verify": 0, "retry_reserve": 0,
-                "background": 0, "burst": 0, "manual": daily_ceiling}
+                "background": explore, "burst": 0, "manual": daily_ceiling}
     retry = CATEGORY_CAPS["retry_reserve"]
     return {"sentinel": daily_ceiling - VERIFY_RESERVE - retry,
             "verify": CATEGORY_CAPS["verify"], "retry_reserve": retry,
-            "background": 0, "burst": CATEGORY_CAPS["burst"],
+            "background": explore, "burst": CATEGORY_CAPS["burst"],
             "manual": daily_ceiling}
 
 
