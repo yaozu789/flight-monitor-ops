@@ -403,6 +403,10 @@ def load_config() -> tuple[dict, list[dict]]:
     watches = []
     for w in cfg.get("watches", []):
         merged = {**defaults, **w}
+        # enabled: false keeps a watch written down but switched off: it is
+        # not loaded, so nothing mints, collects, reports or budgets for it.
+        if merged.get("enabled", True) is False:
+            continue
         watches.append(merged)
     return defaults, watches
 
