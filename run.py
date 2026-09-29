@@ -735,8 +735,13 @@ def _stalled(guard, collected) -> bool:
         return False
     allowance = min(collected.get("allowance", 0),
                     sentinel.daily_headroom(guard))
-    for category, top_n in (("sentinel", sentinel.SENTINEL_TOP_N),
-                            ("background", sentinel.DETAIL_TOP_N)):
+    categories = (("sentinel", sentinel.SENTINEL_TOP_N),
+                  ("background", sentinel.DETAIL_TOP_N))
+    if "overdue_at_start" in collected:
+        # Named windows: exploration (background) waits while sentinels are
+        # due, so its budget cannot make a 0-request run a stall.
+        categories = categories[:1]
+    for category, top_n in categories:
         cost = 1 + top_n
         cap = guard.category_cap(category)
         if cap is None:

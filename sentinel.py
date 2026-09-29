@@ -774,10 +774,16 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
             # background category (sum of explore_per_day; 0 = off).
             if store.overdue_sentinels(db, slot, groups_cfg):
                 return
-            _collect_phase(db, guard, groups_cfg, slot, run_start,
-                           "background", SENTINEL_TOP_N, "background",
-                           result, allowance, "background", deadline_fn,
-                           checked, collect_groups)
+            # Only watches that enabled exploration, and only their DUE
+            # exploration cells (3x-slower target): a legacy grid or a
+            # fresh cell never takes the explore budget.
+            explorers = {g: c for g, c in groups_cfg.items()
+                         if c.get("windows") and c.get("explore_per_day")}
+            if explorers:
+                _collect_phase(db, guard, explorers, slot, run_start,
+                               "background", SENTINEL_TOP_N, "background",
+                               result, allowance, "background", deadline_fn,
+                               checked, collect_groups, overdue_only=True)
 
         order = [lambda: sentinels(allowance, overdue_only=True), bursts,
                  explore] + ([legacy_rotation] if legacy else [])

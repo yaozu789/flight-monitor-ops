@@ -1310,15 +1310,19 @@ def ensure_cells(db: sqlite3.Connection, cells: list[dict]) -> int:
                  active = 1, retired_at = NULL,
                  window_name = CASE WHEN excluded.role = 'sentinel'
                                       OR cells.active = 0
+                                      OR cells.role = 'background'
                                     THEN excluded.window_name
                                     ELSE cells.window_name END,
                  refresh_hours = CASE WHEN excluded.role = 'sentinel'
                                         OR cells.active = 0
+                                        OR cells.role = 'background'
                                       THEN excluded.refresh_hours
                                       ELSE cells.refresh_hours END
                WHERE cells.active = 0
                   OR (excluded.role = 'sentinel' AND cells.role <> 'sentinel')
-                  OR (excluded.role = 'sentinel'
+                  OR ((excluded.role = 'sentinel'
+                       OR (excluded.role = 'background'
+                           AND cells.role = 'background'))
                       AND (cells.window_name IS NOT excluded.window_name
                            OR cells.refresh_hours IS NOT excluded.refresh_hours))""",
             (c["group_id"], c["depart_date"], c["duration"], c["role"],

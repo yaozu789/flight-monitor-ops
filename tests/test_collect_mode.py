@@ -596,6 +596,61 @@ class ExploreTests(unittest.TestCase):
         self.assertEqual(guard.spent_today("background"), 10)
 
 
+class ExploreReviewTests(unittest.TestCase):
+    """Codex review of PR #43."""
+
+    def test_only_due_cells_of_exploring_watches_and_metadata_updates(self):
+        db = fresh_db(self)
+        w = ExploreTests.WATCH
+        cfg = {"japan": fm_run.group_cfg_for(w),
+               "old": {"origins": ["SFO"], "destinations": ["JFK"]}}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'sentinel'", (slot,))
+        # Explore cells fresh (checked 1 h ago) except exactly one.
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'background'", (slot - 2,))
+        one = db.execute("SELECT MIN(id) AS i FROM cells WHERE role = "
+                         "'background' AND group_id = 'japan'").fetchone()["i"]
+        db.execute("UPDATE cells SET last_checked_slot=NULL WHERE id=?", (one,))
+        db.commit()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={"background": 100})
+        seen = []
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            seen.append((cell["group_id"], cell["role"], cell["id"]))
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 2)
+
+        with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: 40):
+            fm_sentinel.collect(db, guard, {"japan": cfg["japan"]}, slot,
+                                store.utcnow_iso())
+        self.assertEqual([s for s in seen if s[1] == "background"],
+                         [("japan", "background", one)])
+        # A changed refresh target reaches existing exploration cells.
+        w2 = dict(w, windows={"near": {"days": [7, 42], "step_days": 2,
+                                       "refresh_hours": 24},
+                              "far": w["windows"]["far"]})
+        fm_sentinel.ensure_background_grid(
+            db, {"japan": fm_run.group_cfg_for(w2)})
+        self.assertEqual({r["refresh_hours"] for r in db.execute(
+            "SELECT refresh_hours FROM cells WHERE role = 'background' AND "
+            "active = 1 AND window_name = 'near'")}, {72})
+
+    def test_explore_budget_never_makes_a_stall(self):
+        guard = BudgetGuard(fresh_db(self), verify_reserve=0,
+                            category_caps={"sentinel": 0, "background": 20})
+        # A sentinel is due but its category is spent; exploration waits.
+        self.assertFalse(fm_run._stalled(
+            guard, {"attempts": 0, "allowance": 6, "overdue_at_start": 2}))
+
+
 class Phase2ConfigTests(unittest.TestCase):
     """The Phase 2 destinations are written in watches.yaml but switched
     off; switched on, all seven fit the spec's budget."""
