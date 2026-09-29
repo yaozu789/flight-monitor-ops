@@ -613,6 +613,8 @@ def _collect_phase(db, guard, groups_cfg, slot, run_start, role: str,
         result[count_key] += 1
         if cell["group_id"] in collect_groups:
             continue  # collect-only: prices are stored, nothing triggers
+        if group_cfg.get("alert_mode") == "relative":
+            continue  # relative watches burst only on a verified deal
         if _is_drop(prev_price, prev_ts, price):
             if _queue_drop_trigger(db, cell, price, slot):
                 result["drop_triggers"] += 1

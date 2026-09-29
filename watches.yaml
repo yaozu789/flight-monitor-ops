@@ -25,8 +25,11 @@ defaults:
 # alert_mode: `collect` stores prices only -- no scoring, verification,
 # bursts or alerts, and queued alerts/bursts are retired on entry. While
 # every watch collects, the verify reserve and alert-path budget caps are
-# released to sentinels. (`cap` is the legacy absolute-cap rule; relative
-# alerts come later.) Caps below are kept for the schema but unused.
+# released to sentinels. `relative` alerts on a fare <= 70% of its route's
+# 28-day median once that route is armed (50 daily lows on 14 days; see
+# `run.py coverage` -> relative_routes); unarmed routes stay silent. `cap` is
+# the legacy absolute-cap rule. Caps are kept for the schema but unused
+# outside cap mode; `max_alert_usd` optionally caps a relative threshold.
 #
 # Phase 2 weekend groups (LA, SD): leave Fri (any time) or Sat morning,
 # return Sun. depart_hours limits only the OUTBOUND flight on that weekday

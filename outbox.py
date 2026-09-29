@@ -160,10 +160,17 @@ def render_alert_message(watch, confirmation, fingerprint, first_seen_at,
         f"{_stops_text(confirmation.get('stops'))}",
         f"First seen {first_seen_at}; rechecked at {confirmation['observed_at']}.",
     ]
+    typical = confirmation.get("typical_usd")
+    if typical:
+        pct = round(100 * (1 - confirmation["price_usd"] / typical))
+        lines.append(f"Typical for this route: ${typical:,.0f} (28-day "
+                     f"median of stored fares); this fare is {pct}% below.")
     lines.extend(_history_lines(history, confirmation["price_usd"]))
     try:
-        chart = history_chart_url(history, confirmation["price_usd"],
-                                  watch.get("absolute_cap_usd"))
+        chart = history_chart_url(
+            history, confirmation["price_usd"],
+            (watch.get("absolute_cap_usd")
+             if watch.get("alert_mode", "cap") == "cap" else None))
     except Exception:  # noqa: BLE001 - a chart must never block an alert
         chart = None
     if chart:

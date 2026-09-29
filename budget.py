@@ -53,7 +53,7 @@ CATEGORY_CAPS = {
 
 
 
-ALERT_MODES = ("collect", "cap")
+ALERT_MODES = ("collect", "cap", "relative")
 
 
 def alert_mode(w: dict) -> str:

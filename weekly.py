@@ -14,6 +14,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
+import baseline
 import budget
 import dashboard
 from outbox import CHART_BASE
@@ -196,6 +197,18 @@ def _windowed_lines(db, w, cfg, now) -> list[str]:
                 f"{best['return_date']} ({_nights(best)} nights), "
                 f"{best['airline'] or 'unknown airline'} {stops}, seen "
                 f"{_age(best['observed_at'], now)}{stale}")
+            base = baseline.baseline(db, w["id"], cfg, best["origin"],
+                                     best["destination"], best["depart_date"],
+                                     best["return_date"], now)
+            if base and base["armed"] and base["median"] is not None:
+                lines.append(f"    typical ${base['median']:,.0f} for "
+                             f"{best['origin']} -> {best['destination']} "
+                             f"(median of {base['samples']} daily lows)")
+            elif base:
+                lines.append(f"    typical price: building history "
+                             f"({base['samples']}/{baseline.MIN_SAMPLES} "
+                             f"samples, {base['days']}/{baseline.MIN_DAYS} "
+                             f"days)")
             if before is not None:
                 diff = best["price_usd"] - before["price_usd"]
                 trend = ("same" if diff == 0 else

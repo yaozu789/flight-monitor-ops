@@ -256,6 +256,18 @@ CREATE TABLE IF NOT EXISTS query_log (
     ceiling INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log (at);
+-- Route baselines for relative alerts (baseline.py): one row per route
+-- bucket per UTC day, so every step that day uses the same median.
+CREATE TABLE IF NOT EXISTS baselines (
+    bucket TEXT NOT NULL,          -- watch|origin|destination|window|nights
+    day TEXT NOT NULL,
+    median REAL,
+    samples INTEGER NOT NULL,
+    days INTEGER NOT NULL,
+    armed INTEGER NOT NULL,
+    computed_at TEXT NOT NULL,
+    PRIMARY KEY (bucket, day)
+);
 """
 
 # Outbox lifecycle (v3): the SCHEDULER transition map is exactly
