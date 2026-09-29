@@ -33,14 +33,26 @@ def _grouped_endpoints(watch: dict, origin, destination) -> tuple[str, str]:
     return ",".join(origins), ",".join(destinations)
 
 
-def _cfg_for(watch: dict, origin: str | None, destination: str | None) -> dict:
-    return {
+def _cfg_for(watch: dict, origin: str | None, destination: str | None,
+             depart_date: str | None = None) -> dict:
+    cfg = {
         "origins": [origin],
         "destinations": [destination],
         "stops": watch.get("stops", [0, 1]),
         "seat": watch.get("cabin", "economy"),
         "pax": {"adults": 1},
     }
+    # A recheck searches with the same outbound departure-time limit as the
+    # sentinel that found the fare (e.g. Saturday morning), or fli could
+    # expand a different set of outbound flights and miss the candidate.
+    if depart_date and watch.get("windows"):
+        import run
+        import sentinel
+        hours = sentinel._outbound_hours(run.group_cfg_for(watch), None,
+                                         depart_date)
+        if hours:
+            cfg["outbound_hours"] = hours
+    return cfg
 
 
 def _match(row: dict, depart_date: str, return_date: str) -> str:
@@ -95,7 +107,8 @@ def verify(db, watch, candidate, guard, *, top_n=3) -> tuple[bool, dict | None]:
                                       candidate["destination"])
     rows = poller.narrow_query(
         q_from, q_to, depart, return_,
-        _cfg_for(watch, candidate["origin"], candidate["destination"]),
+        _cfg_for(watch, candidate["origin"], candidate["destination"],
+                 depart),
         top_n=top_n, attempt_category="verify")
     if not rows:
         return False, None  # unknown -- do NOT alert
@@ -126,7 +139,8 @@ def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | Non
                                       alert_row["destination"])
     rows = poller.narrow_query(
         q_from, q_to, depart, return_,
-        _cfg_for(watch, alert_row["origin"], alert_row["destination"]),
+        _cfg_for(watch, alert_row["origin"], alert_row["destination"],
+                 depart),
         top_n=3, attempt_category="retry_reserve")
     if not rows:
         return "unknown", None

@@ -1443,9 +1443,29 @@ class TestNamedWindows(SentinelTestBase):
                           out.time_restrictions.latest_departure), (5, 12))
         self.assertIsNone(back.time_restrictions)
 
+    def test_rechecks_and_off_window_bursts_keep_the_morning_limit(self):
+        """The verify/retry recheck and a burst neighbour outside today's
+        window bounds search with the same Saturday limit."""
+        import run
+        import verifier
+        watch = {"id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+                 "windows": {"near": {"days": [7, 42], "weekdays": [4, 5],
+                                      "return_weekday": 6,
+                                      "refresh_hours": 48,
+                                      "depart_hours": {5: "5-11"}}}}
+        sat = date.fromisoformat(TODAY) + timedelta(days=60)  # off-window
+        sat += timedelta(days=(5 - sat.weekday()) % 7)
+        cfg = verifier._cfg_for(watch, "SFO", "LAX", sat.isoformat())
+        self.assertEqual(cfg.get("outbound_hours"), "5-11")
+        self.assertIsNone(verifier._cfg_for(
+            watch, "SFO", "LAX", (sat - timedelta(days=1)).isoformat()
+        ).get("outbound_hours"))
+        self.assertEqual(sentinel._outbound_hours(
+            run.group_cfg_for(watch), None, sat.isoformat()), "5-11")
+
     def test_bad_depart_hours_rejected(self):
         import run
-        for hours in ({5: "25-3"}, {2: "5-12"}):
+        for hours in ({5: "25-3"}, {2: "5-12"}, {5: "12-5"}, {5: "5-5"}):
             with self.assertRaises(Exception):
                 run.group_cfg_for({
                     "id": "la", "origins": ["SFO"], "destinations": ["LAX"],

@@ -29,9 +29,10 @@ defaults:
 # alerts come later.) Caps below are kept for the schema but unused.
 #
 # Phase 2 weekend groups (LA, SD): leave Fri (any time) or Sat morning,
-# return Sun. depart_hours limits only the OUTBOUND flight on that weekday:
+# return Sun. depart_hours limits only the OUTBOUND flight on that weekday
+# (hours inclusive: "5-11" = 05:00-11:59, i.e. before noon):
 #   windows: {near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
-#                    depart_hours: {5: "5-12"}, refresh_hours: 48}}
+#                    depart_hours: {5: "5-11"}, refresh_hours: 48}}
 watches:
   - id: japan
     destinations: [NRT, HND, KIX]

@@ -203,20 +203,19 @@ def _fixed_return_nights(win: dict | None, d: date) -> int | None:
 
 
 def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
-    """The outbound departure-time limit ("HH-HH") for this departure, from
-    its window's ``depart_hours`` for that weekday, or None. A burst's
-    one-off check has no window name, so its window is found by date."""
+    """The outbound departure-time limit ("HH-HH") for this departure's
+    weekday, or None. Its own window's ``depart_hours`` wins; otherwise any
+    window of the watch that sets hours for that weekday. This never
+    depends on today's window bounds, so burst neighbours, resumed bursts
+    and verify/retry rechecks all get the same limit as the sentinel."""
     wins = (group_cfg or {}).get("windows") or []
-    dep = date.fromisoformat(depart_date)
-    win = next((w for w in wins if w["name"] == window_name), None)
-    if win is None:
-        today_d = _coerce_today(None)
-        win = next((w for w in wins
-                    if _window_bounds(w, today_d)[0] <= dep
-                    <= _window_bounds(w, today_d)[1]), None)
-    if win is None:
-        return None
-    return (win.get("depart_hours") or {}).get(dep.weekday())
+    wd = date.fromisoformat(depart_date).weekday()
+    own = next((w for w in wins if w["name"] == window_name), None)
+    for win in ([own] if own else []) + wins:
+        hours = (win.get("depart_hours") or {}).get(wd)
+        if hours:
+            return hours
+    return None
 
 
 def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
