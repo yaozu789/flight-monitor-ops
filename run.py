@@ -51,6 +51,7 @@ from budget import (  # noqa: E402
 )
 from canary import run_canary  # noqa: E402
 from outbox import (  # noqa: E402
+    retire_ineligible_pending,
     RELAYABLE_ACTIONS,
     drain_pending,
     enqueue_from_confirmation,
@@ -267,6 +268,7 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         # relayed.
         enter_collect_mode(db, collect_watch_ids(watches)
                            | disabled_watch_ids())
+        retire_ineligible_pending(db, watches)
         # Drain FIRST (no network): must run before the backoff / slot
         # early-returns below so stranded handoffs are never stuck behind a
         # skipped collection.
@@ -409,6 +411,11 @@ def load_config() -> tuple[dict, list[dict]]:
         # not loaded, so nothing mints, collects, reports or budgets for it.
         if merged.get("enabled", True) is False:
             continue
+        # The cap is only an alert rule in cap mode; other modes may omit it.
+        if (budget.alert_mode(merged) == "cap"
+                and merged.get("absolute_cap_usd") is None):
+            raise ValueError(f"watch {merged['id']!r}: cap mode needs "
+                             "absolute_cap_usd")
         watches.append(merged)
     return defaults, watches
 
@@ -516,7 +523,9 @@ def group_cfg_for(w: dict) -> dict:
                            for x in windows if x["return_weekday"] is not None
                            for d in x["weekdays"]})
         return {"origins": w["origins"], "destinations": w["destinations"],
-                "alert_mode": budget.alert_mode(w),
+                "id": w["id"], "alert_mode": budget.alert_mode(w),
+                "absolute_cap_usd": w.get("absolute_cap_usd"),
+                "max_alert_usd": w.get("max_alert_usd"),
                 "windows": windows, "nights": nights,
                 "window_days": (min(x["lo"] for x in windows),
                                 max(x["hi"] for x in windows)),
@@ -683,6 +692,8 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 "depart_date": conf["depart_date"], "duration": duration,
                 # the alert threshold this deal passed (cap or relative)
                 "cap": c.get("threshold", w.get("absolute_cap_usd")),
+                "relative": c.get("reason") == "relative",
+                "origin": c.get("origin"), "destination": c.get("destination"),
                 # the window whose check found the fare (stored with the
                 # observation; burst steps get its limits)
                 "window_name": c.get("window_name")})
@@ -757,6 +768,7 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
     # drained (drain-first); direct callers drain here.
     if drained is None:
         enter_collect_mode(db, collect_ids | disabled_watch_ids())
+        retire_ineligible_pending(db, targets)
         drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 

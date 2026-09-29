@@ -220,5 +220,132 @@ class ReportTests(unittest.TestCase):
                          {"armed": 1, "routes": 1})
 
 
+class ReviewFixTests(unittest.TestCase):
+    """Codex review of PR #42: the relative rule holds on every path."""
+
+    def setUp(self):
+        self.db = fresh_db(self)
+        self.cfg = fm_run.group_cfg_for(WATCH)
+
+    def _trigger(self, origin="SFO", price=260.0):
+        dep = TODAY + timedelta(days=16)
+        return {"id": 1, "group_id": "nyc", "depart_date": dep.isoformat(),
+                "duration": 7, "price_usd": price, "origin": origin,
+                "destination": "JFK"}
+
+    def test_burst_revalidation_uses_todays_relative_threshold(self):
+        # Unarmed route: a burst never continues, whatever the price.
+        self.assertFalse(sentinel._still_eligible(
+            fresh_db(self), self._trigger(), self.cfg, 100.0))
+        seed_history(self.db)                          # limit 280 today
+        self.assertTrue(sentinel._still_eligible(
+            self.db, self._trigger(price=250.0), self.cfg, 270.0))
+        self.assertFalse(sentinel._still_eligible(
+            self.db, self._trigger(), self.cfg, 290.0))
+        capped = dict(self.cfg, max_alert_usd=200)
+        self.assertFalse(sentinel._still_eligible(
+            self.db, self._trigger(), capped, 260.0))
+        # Cap mode keeps the old rule (still at or under the trigger price).
+        cap = dict(self.cfg, alert_mode="cap")
+        self.assertTrue(sentinel._still_eligible(self.db, self._trigger(),
+                                                 cap, 260.0))
+        self.assertFalse(sentinel._still_eligible(self.db, self._trigger(),
+                                                  cap, 261.0))
+
+    def test_relative_first_time_is_by_recent_burst_not_old_prices(self):
+        seed_history(self.db)
+        dep = TODAY + timedelta(days=16)
+        # An old stored price below today's threshold must not suppress it.
+        obs(self.db, NOW - timedelta(days=3), dep, 250.0)
+        fp = self.db.execute("SELECT fingerprint FROM observations "
+                             "WHERE price_usd = 250").fetchone()["fingerprint"]
+        deal = {"watch_id": "nyc", "fingerprint": fp, "price_usd": 270.0,
+                "depart_date": dep.isoformat(), "duration": 7, "cap": 280.0,
+                "relative": True, "origin": "SFO", "destination": "JFK",
+                "window_name": "near"}
+        run_start = store.utcnow_iso()
+        self.assertEqual(sentinel.detect_under_cap_triggers(
+            self.db, [deal], run_start, 5), 1)
+        row = self.db.execute("SELECT origin, destination, window_name FROM "
+                              "triggers").fetchone()
+        self.assertEqual(tuple(row), ("SFO", "JFK", "near"))
+        # The same fare again within a week: no second burst.
+        self.assertEqual(sentinel.detect_under_cap_triggers(
+            self.db, [dict(deal, depart_date=(dep + timedelta(days=7))
+                           .isoformat())], store.utcnow_iso(), 6), 0)
+
+    def test_backlog_candidate_judged_on_its_own_day(self):
+        """History of 13 days before yesterday is unarmed for yesterday's
+        fare; only today's baseline (which includes yesterday) has 14."""
+        for d in range(2, 15):                      # 13 days: D-2 .. D-14
+            seen = NOW - timedelta(days=d)
+            for k in range(5):
+                obs(self.db, seen, seen.date() + timedelta(days=10 + 2 * k),
+                    400.0)
+        yesterday = NOW - timedelta(days=1)
+        obs(self.db, yesterday, yesterday.date() + timedelta(days=12), 200.0)
+        cands = scorer.score_new_observations(
+            self.db, WATCH, (yesterday - timedelta(minutes=1)).isoformat())
+        self.assertEqual(cands, [])
+
+    def test_pending_alert_retired_when_route_stops_qualifying(self):
+        seed_history(self.db)
+        dep = TODAY + timedelta(days=16)
+
+        def pending(aid, price, origin="SFO"):
+            store.enqueue_alert(
+                self.db, alert_id=aid, watch_id="nyc", fingerprint=aid,
+                price_usd=price, depart_date=dep.isoformat(),
+                return_date=(dep + timedelta(days=7)).isoformat(),
+                airline="UA", stops=0, booking_url="", message_text="m",
+                origin=origin, destination="JFK")
+
+        pending("ok", 270.0)
+        pending("over", 290.0)
+        pending("unarmed", 100.0, origin="OAK")
+        retired = outbox.retire_ineligible_pending(self.db, [WATCH])
+        self.assertEqual(sorted(retired), ["over", "unarmed"])
+        self.assertEqual(store.outbox_get(self.db, "ok")["state"], "pending")
+        self.assertEqual(outbox.retire_ineligible_pending(
+            self.db, [dict(WATCH, max_alert_usd=200)]), ["ok"])
+
+    def test_cap_optional_outside_cap_mode(self):
+        store.sync_watches(self.db, [{k: v for k, v in WATCH.items()
+                                      if k != "absolute_cap_usd"}], {})
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, True))
+        Path(tmp, "watches.yaml").write_text(
+            "watches:\n  - id: x\n    origins: [SFO]\n"
+            "    destinations: [JFK]\n    alert_mode: cap\n")
+        with mock.patch.object(fm_run, "BASE", Path(tmp)):
+            with self.assertRaises(ValueError):
+                fm_run.load_config()
+
+    def test_collect_verify_never_confirms(self):
+        with mock.patch.object(verifier.poller, "narrow_query",
+                               side_effect=AssertionError("searched")):
+            self.assertEqual(verifier.verify(
+                self.db, dict(WATCH, alert_mode="collect"),
+                {"depart_date": "2026-11-01", "return_date": "2026-11-08",
+                 "origin": "SFO", "destination": "JFK", "fingerprint": "x"},
+                None), (False, None))
+
+    def test_bounds_change_starts_a_fresh_baseline_and_coverage_lists_all(self):
+        seed_history(self.db)
+        dep = TODAY + timedelta(days=16)
+        args = ("nyc", self.cfg, "SFO", "JFK", dep.isoformat(),
+                (dep + timedelta(days=7)).isoformat(), NOW)
+        self.assertTrue(baseline.baseline(self.db, *args)["armed"])
+        narrow = fm_run.group_cfg_for(dict(WATCH, windows={"near": {
+            "days": [15, 42], "step_days": 2, "refresh_hours": 48}}))
+        b = baseline.baseline(self.db, "nyc", narrow, *args[2:])
+        self.assertFalse(b["armed"])  # history 10-14 days out no longer fits
+        two = dict(WATCH, origins=["SFO", "OAK"])
+        status = baseline.bucket_status(self.db, two, fm_run.group_cfg_for(two),
+                                        NOW)
+        self.assertEqual({(r["origin"], r["armed"]) for r in status},
+                         {("SFO", True), ("OAK", False)})
+
+
 if __name__ == "__main__":
     unittest.main()

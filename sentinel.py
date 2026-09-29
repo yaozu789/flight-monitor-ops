@@ -778,12 +778,18 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             duration = deal["duration"]
             cap = deal.get("cap")
             window_name = deal.get("window_name")
+            relative = deal.get("relative", False)
+            origin, destination = deal.get("origin"), deal.get("destination")
         else:
             watch_id, fingerprint, price_usd, depart_date, duration, cap = deal
-            window_name = None
+            window_name, relative, origin, destination = None, False, None, None
         if cap is None:
             continue
-        if store.has_under_cap_before(db, fingerprint, cap, run_start):
+        if relative:
+            since = (_parse_ts(run_start) - timedelta(days=7)).isoformat()
+            if store.burst_queued_since(db, fingerprint, since):
+                continue
+        elif store.has_under_cap_before(db, fingerprint, cap, run_start):
             continue
         before = db.total_changes
         store.queue_trigger(
@@ -791,7 +797,7 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             depart_week=store.depart_week(depart_date),
             depart_date=depart_date, duration=duration,
             price_usd=price_usd, fingerprint=fingerprint, slot=slot,
-            window_name=window_name)
+            window_name=window_name, origin=origin, destination=destination)
         if db.total_changes > before:
             queued += 1
     return queued
@@ -863,6 +869,25 @@ def _trigger_window(trigger, group_cfg):
                     "weekdays": {int(w) for w in win.get("weekdays") or []},
                     "return_weekday": win.get("return_weekday")}
     return None
+
+
+def _still_eligible(db, trigger, group_cfg, price) -> bool:
+    """Burst revalidation. Cap mode (legacy): the fare is still at or under
+    the trigger price. Relative mode: the fare is still at or under TODAY's
+    threshold for the trigger's route (unarmed or no threshold -> drop)."""
+    if price is None:
+        return False
+    if group_cfg.get("alert_mode") != "relative":
+        return price <= trigger["price_usd"]
+    import baseline
+    ret = (date.fromisoformat(trigger["depart_date"])
+           + timedelta(days=int(trigger["duration"]))).isoformat()
+    limit, _ = baseline.threshold(
+        db, {"id": trigger["group_id"], "alert_mode": "relative",
+             "max_alert_usd": group_cfg.get("max_alert_usd")},
+        group_cfg, trigger.get("origin"), trigger.get("destination"),
+        trigger["depart_date"], ret)
+    return limit is not None and price <= limit
 
 
 def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
@@ -962,8 +987,8 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                 revalidate_again = False  # resume point stays where it was
             else:
                 next_step = step_idx + 1
-            if kind == "revalidate" and (price is None
-                                        or price > trigger["price_usd"]):
+            if kind == "revalidate" and not _still_eligible(
+                    db, trigger, group_cfg, price):
                 store.mark_trigger(db, trigger["id"], "dropped")
                 store.save_burst_progress(db, trigger["id"], status="dropped",
                                           next_step=next_step,

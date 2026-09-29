@@ -95,6 +95,8 @@ def verify(db, watch, candidate, guard, *, top_n=3) -> tuple[bool, dict | None]:
     watch["absolute_cap_usd"]; (False, None) on unknown (no results / no
     match) -- the caller must NOT alert.
     """
+    if watch.get("alert_mode", "cap") == "collect":
+        return False, None  # collect-only watches never confirm a deal
     # The threshold the scorer used for this candidate (cap or relative);
     # the recheck must pass the same number.
     cap = candidate.get("threshold", watch.get("absolute_cap_usd"))

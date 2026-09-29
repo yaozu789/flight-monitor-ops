@@ -42,8 +42,11 @@ def window_for(group_cfg: dict, depart_date: str, seen_day: date):
     return None
 
 
-def bucket_key(watch_id, origin, destination, window_name, nights) -> str:
-    return f"{watch_id}|{origin}|{destination}|{window_name}|{int(nights)}"
+def bucket_key(watch_id, origin, destination, win, nights) -> str:
+    # The window's bounds are part of the key, so changing them starts a
+    # fresh baseline the same day instead of reusing a cached one.
+    return (f"{watch_id}|{origin}|{destination}|{win['name']}"
+            f"[{win['lo']}-{win['hi']}]|{int(nights)}")
 
 
 def _samples(db, watch_id, origin, destination, win, nights, today: date):
@@ -51,14 +54,15 @@ def _samples(db, watch_id, origin, destination, win, nights, today: date):
     window before *today*, for fares whose departure sat in *win* on the day
     they were seen."""
     since = (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    # Raw timestamp bounds (not substr) so the observed_at index applies:
+    # "YYYY-MM-DD" <= "YYYY-MM-DDThh..." < the next day's "YYYY-MM-DD".
     return db.execute(
         """SELECT substr(observed_at, 1, 10) AS day, depart_date,
                   MIN(price_usd) AS low
            FROM observations
            WHERE watch_id = ? AND origin = ? AND destination = ?
              AND price_usd IS NOT NULL
-             AND substr(observed_at, 1, 10) >= ?
-             AND substr(observed_at, 1, 10) < ?
+             AND observed_at >= ? AND observed_at < ?
              AND CAST(julianday(return_date) - julianday(depart_date)
                       AS INTEGER) = ?
              AND CAST(julianday(depart_date)
@@ -80,7 +84,7 @@ def baseline(db, watch_id, group_cfg, origin, destination, depart_date,
         return None
     nights = (date.fromisoformat(return_date)
               - date.fromisoformat(depart_date)).days
-    key = bucket_key(watch_id, origin, destination, win["name"], nights)
+    key = bucket_key(watch_id, origin, destination, win, nights)
     row = db.execute("SELECT * FROM baselines WHERE bucket = ? AND day = ?",
                      (key, today.isoformat())).fetchone()
     if row is None:
@@ -123,33 +127,30 @@ def threshold(db, watch: dict, group_cfg: dict, origin, destination,
 
 def bucket_status(db, watch: dict, group_cfg: dict,
                   now: datetime | None = None) -> list[dict]:
-    """Every route bucket with fares in the lookback: samples, distinct days
-    and whether it is armed (for ``run.py coverage``)."""
+    """Every CONFIGURED route bucket (origin x destination x window x
+    nights), with today's stored baseline -- the same numbers alerting
+    uses -- including buckets with no samples yet (for ``run.py
+    coverage``)."""
     today = _day(now)
-    since = (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
-    seen = {}
-    for r in db.execute(
-            """SELECT origin, destination, depart_date, return_date,
-                      substr(observed_at, 1, 10) AS day
-               FROM observations
-               WHERE watch_id = ? AND price_usd IS NOT NULL
-                 AND substr(observed_at, 1, 10) >= ?
-                 AND substr(observed_at, 1, 10) < ?""",
-            (watch["id"], since, today.isoformat())):
-        win = window_for(group_cfg, r["depart_date"],
-                         date.fromisoformat(r["day"]))
-        if win is None:
-            continue
-        nights = (date.fromisoformat(r["return_date"])
-                  - date.fromisoformat(r["depart_date"])).days
-        key = (r["origin"], r["destination"], win["name"], nights)
-        s = seen.setdefault(key, {"samples": set(), "days": set()})
-        s["samples"].add((r["day"], r["depart_date"]))
-        s["days"].add(r["day"])
     out = []
-    for (o, d, w, n), s in sorted(seen.items()):
-        out.append({"origin": o, "destination": d, "window": w, "nights": n,
-                    "samples": len(s["samples"]), "days": len(s["days"]),
-                    "armed": (len(s["samples"]) >= MIN_SAMPLES
-                              and len(s["days"]) >= MIN_DAYS)})
+    for win in group_cfg.get("windows") or []:
+        if win.get("return_weekday") is not None:
+            nights_list = sorted({(int(win["return_weekday"]) - int(d)) % 7
+                                  or 7 for d in win.get("weekdays") or []})
+        else:
+            nights_list = group_cfg.get("nights") or []
+        # A departure inside this window today, for the baseline lookup.
+        probe = today + timedelta(days=win["lo"])
+        for o in group_cfg["origins"]:
+            for d in group_cfg["destinations"]:
+                for n in nights_list:
+                    base = baseline(db, watch["id"], group_cfg, o, d,
+                                    probe.isoformat(),
+                                    (probe + timedelta(days=n)).isoformat(),
+                                    now)
+                    out.append({"origin": o, "destination": d,
+                                "window": win["name"], "nights": n,
+                                "samples": base["samples"],
+                                "days": base["days"],
+                                "armed": bool(base["armed"])})
     return out
