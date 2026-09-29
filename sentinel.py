@@ -705,12 +705,29 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
         order = [bursts, background, lambda: sentinels(sentinel_share),
                  lambda: sentinels(allowance)]
     if windowed:
-        # Named windows (redesign): every overdue sentinel first, with the
+        # Named windows (redesign): only DUE sentinels are checked, with the
         # whole allowance; then bursts from what is left (they wait while
-        # any sentinel is still due); then the plain rotation. No slot
-        # parity: the refresh targets, not alternation, decide priority.
+        # any sentinel is still due). Fresh cells are not re-checked early,
+        # so daily use follows the refresh targets (~71/day for Stage A),
+        # not the ceiling. No slot parity: the targets decide priority.
+        # Legacy watches in a mixed config keep their plain rotation (their
+        # cells have no refresh target, so the due-only pass skips them),
+        # and their always-due cells count as due for the stall rule.
+        legacy = {g: c for g, c in groups_cfg.items()
+                  if not c.get("windows")}
+        result["overdue_at_start"] = (
+            store.overdue_sentinels(db, slot, groups_cfg)
+            + (1 if legacy and store.due_cells(db, "sentinel", 1,
+                                               group_ids=legacy) else 0))
+
+        def legacy_rotation():
+            _collect_phase(db, guard, legacy, slot, run_start, "sentinel",
+                           SENTINEL_TOP_N, "sentinel", result, allowance,
+                           "sentinels", deadline_fn, checked,
+                           collect_groups)
+
         order = [lambda: sentinels(allowance, overdue_only=True), bursts,
-                 background, lambda: sentinels(allowance)]
+                 background] + ([legacy_rotation] if legacy else [])
     result["allowance"] = allowance
     for step in order:
         if not phase(step):

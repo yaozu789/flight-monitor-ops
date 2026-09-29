@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import json
 import zlib
+
+import budget
 from datetime import datetime, timedelta, timezone
 
 DASHBOARD_URL = "https://yaozu789.github.io/flight-monitor/dashboard/"
@@ -53,7 +55,11 @@ def payload(db, watches, now: datetime | None = None) -> dict:
                      ORDER BY checked_at DESC LIMIT 20""",
                   (run_since.isoformat(),))]
     return {"v": 1, "at": now.isoformat(timespec="minutes"),
-            "watches": [[w["id"], w["absolute_cap_usd"]] for w in watches],
+            # A cap is only an alert rule in cap mode; otherwise null, and
+            # the page draws no cap line.
+            "watches": [[w["id"], (w["absolute_cap_usd"]
+                                   if budget.alert_mode(w) == "cap"
+                                   else None)] for w in watches],
             "prices": prices, "run0": first_slot, "runs": runs,
             "spend": spend, "events": events}
 

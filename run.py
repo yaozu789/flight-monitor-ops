@@ -653,8 +653,13 @@ def _stalled(guard, collected) -> bool:
     """True when collection sent nothing although the run could afford a
     full sentinel or background check: its cost fits the allowance, the
     daily headroom and that category's cap (their cells are always due).
-    A 0-attempt run that could afford neither is not stalled."""
+    A 0-attempt run that could afford neither is not stalled.
+
+    Named-window runs check only due cells, so a 0-attempt run with no
+    sentinel due at its start is idle by design, not stalled."""
     if collected["attempts"]:
+        return False
+    if collected.get("overdue_at_start") == 0:
         return False
     allowance = min(collected.get("allowance", 0),
                     sentinel.daily_headroom(guard))
@@ -758,7 +763,9 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         }
 
         record_run_stats(db, slot, collected["attempts"],
-                         _stalled(guard, collected))
+                         _stalled(guard, collected),
+                         idle=(not collected["attempts"]
+                               and collected.get("overdue_at_start") == 0))
 
         # 6. Same-slot verify: this run's own collection output. collect()
         # narrowed the per-run allowance to its paced share; verification is

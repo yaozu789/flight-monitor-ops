@@ -71,5 +71,19 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(d["runs"], [])
 
 
+class CapTests(unittest.TestCase):
+    def test_cap_only_for_cap_mode_watches(self):
+        """Collect-only watches send no cap, so the page draws no cap line."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        db = store.init_db(path)
+        self.addCleanup(lambda: (db.close(), os.unlink(path)))
+        watches = [{"id": "japan", "absolute_cap_usd": 500,
+                    "alert_mode": "collect"},
+                   {"id": "nyc", "absolute_cap_usd": 250, "alert_mode": "cap"}]
+        self.assertEqual(dashboard.payload(db, watches, NOW)["watches"],
+                         [["japan", None], ["nyc", 250]])
+
+
 if __name__ == "__main__":
     unittest.main()
