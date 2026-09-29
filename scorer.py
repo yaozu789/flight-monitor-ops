@@ -45,6 +45,7 @@ def score_new_observations(db, watch, run_start, cooldown_hours=24) -> list[dict
             "price_usd": price,
             "booking_url": r.get("booking_url"),
             "observed_at": r.get("observed_at"),
+            "outbound_hours": r.get("outbound_hours"),
             "reason": "absolute",
         })
     candidates.sort(key=lambda c: c["price_usd"])

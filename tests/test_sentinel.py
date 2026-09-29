@@ -1443,9 +1443,11 @@ class TestNamedWindows(SentinelTestBase):
                           out.time_restrictions.latest_departure), (5, 12))
         self.assertIsNone(back.time_restrictions)
 
-    def test_rechecks_and_off_window_bursts_keep_the_morning_limit(self):
-        """The verify/retry recheck and a burst neighbour outside today's
-        window bounds search with the same Saturday limit."""
+    def test_rechecks_repeat_the_stored_morning_limit(self):
+        """The limit a fare was searched with is stored on its observation;
+        the verify recheck (candidate) and a retry recheck days later (via
+        the fingerprint) repeat exactly that search, whatever the window
+        bounds are by then. A window without a limit never borrows one."""
         import run
         import verifier
         watch = {"id": "la", "origins": ["SFO"], "destinations": ["LAX"],
@@ -1453,31 +1455,39 @@ class TestNamedWindows(SentinelTestBase):
                                       "return_weekday": 6,
                                       "refresh_hours": 48,
                                       "depart_hours": {5: "5-11"}}}}
-        # A fare seen 16 days before a Saturday was in the near window:
-        # its recheck keeps the limit even when run weeks later.
-        sat = date.fromisoformat(TODAY) + timedelta(days=60)
+        gcfg = run.group_cfg_for(watch)
+        sat = date.fromisoformat(TODAY) + timedelta(days=9)
         sat += timedelta(days=(5 - sat.weekday()) % 7)
-        seen = (sat - timedelta(days=16)).isoformat() + "T10:00:00+00:00"
-        cfg = verifier._cfg_for(watch, "SFO", "LAX", sat.isoformat(), seen)
-        self.assertEqual(cfg.get("outbound_hours"), "5-11")
-        self.assertIsNone(verifier._cfg_for(
-            watch, "SFO", "LAX", (sat - timedelta(days=1)).isoformat(), seen
-        ).get("outbound_hours"))
+
+        def fake_query(origin, dest, depart, ret, qcfg, **kw):
+            return [_row(99.0, depart, ret)]
+
+        self.patch(sentinel, "narrow_query", fake_query)
+        sentinel.check_cell(self.db, {"id": None, "depart_date":
+                                      sat.isoformat(), "duration": 1,
+                                      "window_name": "near"},
+                            self.guard(), "la", gcfg, top_n=1,
+                            category="sentinel", slot=1,
+                            run_start=store.utcnow_iso())
+        row = self.db.execute("SELECT fingerprint, outbound_hours FROM "
+                              "observations").fetchone()
+        self.assertEqual(row["outbound_hours"], "5-11")
+        self.assertEqual(store.outbound_hours_for(self.db, row["fingerprint"]),
+                         "5-11")
+        self.assertEqual(verifier._cfg_for(watch, "SFO", "LAX", "5-11")
+                         .get("outbound_hours"), "5-11")
+        self.assertIsNone(verifier._cfg_for(watch, "SFO", "LAX", None)
+                          .get("outbound_hours"))
         # A burst step names its trigger's window.
-        self.assertEqual(sentinel._outbound_hours(
-            run.group_cfg_for(watch), "near", sat.isoformat()), "5-11")
+        self.assertEqual(sentinel._outbound_hours(gcfg, "near",
+                                                  sat.isoformat()), "5-11")
         # Another window with no limit that day never borrows one.
         two = dict(watch, nights=[1, 2], windows=dict(
             watch["windows"], far={"months": [3, 9], "refresh_hours": 72}))
-        gcfg = run.group_cfg_for(two)
-        self.assertIsNone(sentinel._outbound_hours(gcfg, "far",
-                                                   sat.isoformat()))
-        far_seen = (sat - timedelta(days=120)).isoformat() + "T10:00:00+00:00"
-        self.assertIsNone(verifier._cfg_for(
-            two, "SFO", "LAX", sat.isoformat(), far_seen
-        ).get("outbound_hours"))
+        self.assertIsNone(sentinel._outbound_hours(run.group_cfg_for(two),
+                                                   "far", sat.isoformat()))
         # depart_hours must not disturb the window's own day bounds.
-        win = run.group_cfg_for(watch)["windows"][0]
+        win = gcfg["windows"][0]
         self.assertEqual((win["lo"], win["hi"]), (7, 42))
 
     def test_bad_depart_hours_rejected(self):

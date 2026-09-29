@@ -34,8 +34,7 @@ def _grouped_endpoints(watch: dict, origin, destination) -> tuple[str, str]:
 
 
 def _cfg_for(watch: dict, origin: str | None, destination: str | None,
-             depart_date: str | None = None, seen_at: str | None = None
-             ) -> dict:
+             outbound_hours: str | None = None) -> dict:
     cfg = {
         "origins": [origin],
         "destinations": [destination],
@@ -43,19 +42,11 @@ def _cfg_for(watch: dict, origin: str | None, destination: str | None,
         "seat": watch.get("cabin", "economy"),
         "pax": {"adults": 1},
     }
-    # A recheck searches with the same outbound departure-time limit as the
-    # sentinel that found the fare (e.g. Saturday morning), or fli could
-    # expand a different set of outbound flights and miss the candidate.
-    if depart_date and seen_at and watch.get("windows"):
-        import run
-        import sentinel
-        from datetime import date as _date
-        gcfg = run.group_cfg_for(watch)
-        win = sentinel.window_seen_in(gcfg, depart_date,
-                                      _date.fromisoformat(seen_at[:10]))
-        hours = sentinel._outbound_hours(gcfg, win, depart_date)
-        if hours:
-            cfg["outbound_hours"] = hours
+    # A recheck repeats the search that found the fare, including its
+    # outbound departure-time limit (e.g. Saturday morning, stored with the
+    # observation), or fli could expand different outbound flights.
+    if outbound_hours:
+        cfg["outbound_hours"] = outbound_hours
     return cfg
 
 
@@ -112,7 +103,7 @@ def verify(db, watch, candidate, guard, *, top_n=3) -> tuple[bool, dict | None]:
     rows = poller.narrow_query(
         q_from, q_to, depart, return_,
         _cfg_for(watch, candidate["origin"], candidate["destination"],
-                 depart, candidate.get("observed_at")),
+                 candidate.get("outbound_hours")),
         top_n=top_n, attempt_category="verify")
     if not rows:
         return False, None  # unknown -- do NOT alert
@@ -144,7 +135,8 @@ def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | Non
     rows = poller.narrow_query(
         q_from, q_to, depart, return_,
         _cfg_for(watch, alert_row["origin"], alert_row["destination"],
-                 depart, alert_row.get("created_at")),
+                 (store.outbound_hours_for(db, alert_row["fingerprint"])
+                  if db is not None else None)),
         top_n=3, attempt_category="retry_reserve")
     if not rows:
         return "unknown", None

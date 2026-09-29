@@ -206,7 +206,8 @@ def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
     """The outbound departure-time limit ("HH-HH") that the departure's OWN
     window sets for its weekday, or None (unknown window, or a window with
     no limit that day). Callers name the window: sentinels from the cell,
-    bursts from their trigger, rechecks via ``window_seen_in``."""
+    bursts from their trigger. Rechecks reuse the limit stored with the
+    fare (``observations.outbound_hours``)."""
     wins = (group_cfg or {}).get("windows") or []
     own = next((w for w in wins if w["name"] == window_name), None)
     if own is None:
@@ -214,16 +215,6 @@ def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
     wd = date.fromisoformat(depart_date).weekday()
     return (own.get("depart_hours") or {}).get(wd)
 
-
-def window_seen_in(group_cfg, depart_date, seen_day: date) -> str | None:
-    """Name of the window a departure fell in on the day it was seen (a
-    recheck uses the observation's day, not today, so the answer does not
-    drift as the window moves)."""
-    offset = (date.fromisoformat(depart_date) - seen_day).days
-    for win in (group_cfg or {}).get("windows") or []:
-        if win["lo"] <= offset <= win["hi"]:
-            return win["name"]
-    return None
 
 
 def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
@@ -480,7 +471,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
         if rows:
             normed = [_normalize_row(r, depart_date, return_date)
                       for r in rows]
-            normed = [r for r in normed if r["price_usd"] is not None]
+            normed = [dict(r, outbound_hours=hours) for r in normed
+                      if r["price_usd"] is not None]
             if normed and run_start is not None:
                 store.save_observations(db, group_id, normed, run_start)
             prices = [r["price_usd"] for r in normed]

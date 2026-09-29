@@ -325,6 +325,9 @@ _RUN_SLOTS_COLUMNS = [
 _OBS_V3_COLUMNS = [
     ("flight_numbers", "TEXT"),
     ("depart_times", "TEXT"),
+    # The outbound departure-time limit the fare was searched with ("5-11"),
+    # so verify and retry rechecks repeat exactly the same search.
+    ("outbound_hours", "TEXT"),
 ]
 
 # Named departure windows (redesign PR A1): which window minted a cell and
@@ -486,7 +489,8 @@ def add_observation(db: sqlite3.Connection, *, watch_id: str, origin: str,
                     price_usd: float | None, booking_url: str | None,
                     observed_at: str | None = None,
                     flight_numbers: list[str] | None = None,
-                    depart_times: list[str] | None = None) -> int:
+                    depart_times: list[str] | None = None,
+                    outbound_hours: str | None = None) -> int:
     # v3: every new fli result populates the leg fields; old callers omit
     # them and get the Phase-1 fingerprint verbatim (compat).
     fp = make_fingerprint(origin, destination, depart_date, return_date,
@@ -495,12 +499,13 @@ def add_observation(db: sqlite3.Connection, *, watch_id: str, origin: str,
         """INSERT INTO observations
            (watch_id, fingerprint, origin, destination, depart_date, return_date,
             airline, stops, cabin, price_usd, booking_url, observed_at,
-            flight_numbers, depart_times)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            flight_numbers, depart_times, outbound_hours)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (watch_id, fp, origin, destination, depart_date, return_date, airline,
          stops, cabin, price_usd, booking_url, observed_at or utcnow_iso(),
          json.dumps(flight_numbers) if flight_numbers else None,
-         json.dumps(depart_times) if depart_times else None),
+         json.dumps(depart_times) if depart_times else None,
+         outbound_hours),
     )
     db.commit()
     return cur.lastrowid
@@ -521,9 +526,20 @@ def save_observations(db: sqlite3.Connection, watch_id: str,
             price_usd=o.get("price_usd"), booking_url=o.get("booking_url"),
             observed_at=run_start,
             flight_numbers=o.get("flight_numbers"),
-            depart_times=o.get("depart_times"))
+            depart_times=o.get("depart_times"),
+            outbound_hours=o.get("outbound_hours"))
         n += 1
     return n
+
+
+def outbound_hours_for(db: sqlite3.Connection, fingerprint: str) -> str | None:
+    """The departure-time limit the latest fare with this fingerprint was
+    searched with (retry rechecks repeat it)."""
+    row = db.execute(
+        """SELECT outbound_hours FROM observations WHERE fingerprint = ?
+           ORDER BY observed_at DESC, id DESC LIMIT 1""",
+        (fingerprint,)).fetchone()
+    return row["outbound_hours"] if row else None
 
 
 def add_broad_scan(db: sqlite3.Connection, *, watch_id: str, depart_date: str,
