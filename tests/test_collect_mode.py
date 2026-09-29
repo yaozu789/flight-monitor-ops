@@ -548,10 +548,50 @@ class Phase2ConfigTests(unittest.TestCase):
         # Spec: 197.3-201.3 attempts/day for all seven groups.
         self.assertTrue(197 <= demand <= 202, demand)
         self.assertLess(demand, 0.9 * (300 - 24 - 12))
-        weekend = {r["weekday"] for r in db.execute(
-            "SELECT weekday FROM cells WHERE group_id IN ('la', 'sd')")}
-        self.assertEqual(weekend, {4, 5})
-        self.assertEqual(cfg["la"]["windows"][0]["depart_hours"], {5: "5-12"})
+        per = {}
+        for r in db.execute(
+                """SELECT group_id, window_name, weekday, duration, COUNT(*) AS n
+                   FROM cells WHERE active = 1
+                   GROUP BY 1, 2, 3, 4"""):
+            g = per.setdefault((r["group_id"], r["window_name"]),
+                               {"n": 0, "wd": set(), "dur": set()})
+            g["n"] += r["n"]
+            g["wd"].add(r["weekday"])
+            g["dur"].add(r["duration"])
+        for gid in ("la", "sd"):  # every Fri (2 nights) and Sat (1 night)
+            g = per.pop((gid, "near"))
+            self.assertEqual((g["wd"], g["dur"]), ({4, 5}, {1, 2}))
+            self.assertTrue(10 <= g["n"] <= 12, (gid, g["n"]))
+            self.assertEqual(cfg[gid]["windows"][0]["depart_hours"],
+                             {5: "5-11"})
+        for gid in ("japan", "hkg", "shanghai", "beijing"):
+            self.assertEqual(per.pop((gid, "near"))["n"], 18)
+            far = per.pop((gid, "far"))
+            self.assertTrue(24 <= far["n"] <= 27 and far["dur"] == {28},
+                            (gid, far))
+        nyc = per.pop(("nyc", "near"))
+        self.assertEqual((nyc["n"], nyc["dur"]), (36, {7, 14}))
+        self.assertEqual(per, {})
+
+    def test_disabled_watch_queued_alert_is_retired_not_relayed(self):
+        """A watch switched off after it alerted must not relay its queued
+        alert on the next run."""
+        db = fresh_db(self)
+        aid = _enqueue(db, "la", "old")
+        self.assertIn("la", fm_run.disabled_watch_ids())
+
+        def collect_nothing(db_, guard_, groups, slot, run_start, **kw):
+            return {"attempts": 0, "bursts": [], "sentinels": 0,
+                    "background": 0, "drop_triggers": 0, "allowance": 0,
+                    "overdue_at_start": 0}
+
+        rc, docs = CollectRunTests._run(self, db, [COLLECT], collect_nothing,
+                                        lambda *a, **k: (False, None))
+        self.assertEqual(rc, 0)
+        relayed = [a for d in docs
+                   for a in d.get("handoff", {}).get("alerts", [])]
+        self.assertEqual(relayed, [])
+        self.assertEqual(_state(db, aid), "retired")
 
 
 if __name__ == "__main__":
