@@ -779,14 +779,24 @@ def collect(db, guard, groups_cfg, slot, run_start, deadline_fn=None,
             # fresh cell never takes the explore budget.
             explorers = {g: c for g, c in groups_cfg.items()
                          if c.get("windows") and c.get("explore_per_day")}
-            if explorers:
-                _collect_phase(db, guard, explorers, slot, run_start,
+            # Each watch spends only its OWN explore_per_day (today's
+            # exploration attempts per watch come from the query log): one
+            # pass per watch, its allowance capped at what it has left.
+            for g, c in sorted(explorers.items()):
+                left = int(c["explore_per_day"]) - store.explore_spent_today(
+                    db, g)
+                if left < 1 + SENTINEL_TOP_N:
+                    continue
+                _collect_phase(db, guard, {g: c}, slot, run_start,
                                "background", SENTINEL_TOP_N, "background",
-                               result, allowance, "background", deadline_fn,
-                               checked, collect_groups, overdue_only=True)
+                               result, min(allowance, result["attempts"] + left),
+                               "background", deadline_fn, checked,
+                               collect_groups, overdue_only=True)
 
-        order = [lambda: sentinels(allowance, overdue_only=True), bursts,
-                 explore] + ([legacy_rotation] if legacy else [])
+        # Legacy sentinels (mixed config) rotate BEFORE exploration, so
+        # exploration only ever gets what is left after priority work.
+        order = [lambda: sentinels(allowance, overdue_only=True), bursts] + (
+            [legacy_rotation] if legacy else []) + [explore]
     result["allowance"] = allowance
     for step in order:
         if not phase(step):

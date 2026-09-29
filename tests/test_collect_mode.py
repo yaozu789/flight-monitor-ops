@@ -643,6 +643,63 @@ class ExploreReviewTests(unittest.TestCase):
             "SELECT refresh_hours FROM cells WHERE role = 'background' AND "
             "active = 1 AND window_name = 'near'")}, {72})
 
+    def test_each_watch_spends_only_its_own_explore_allowance(self):
+        db = fresh_db(self)
+        w1 = ExploreTests.WATCH
+        w2 = dict(w1, id="hkg", destinations=["HKG"], explore_per_day=4)
+        cfg = {"japan": fm_run.group_cfg_for(w1),
+               "hkg": fm_run.group_cfg_for(w2)}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'sentinel'", (slot,))
+        db.commit()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={"background": 14})
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            store.log_query(db_, slot=slot, group_id=group_id,
+                            window_name=cell.get("window_name"),
+                            category=category, outcome="ok")
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 2)
+
+        with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: 80):
+            for _ in range(3):
+                fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
+        self.assertEqual(store.explore_spent_today(db, "hkg"), 4)
+        self.assertEqual(store.explore_spent_today(db, "japan"), 10)
+
+    def test_legacy_sentinels_before_exploration_in_mixed_config(self):
+        db = fresh_db(self)
+        cfg = {"japan": fm_run.group_cfg_for(ExploreTests.WATCH),
+               "old": {"origins": ["SFO"], "destinations": ["JFK"]}}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        db.execute("UPDATE cells SET last_checked_slot=? WHERE role = "
+                   "'sentinel' AND group_id = 'japan'", (slot,))
+        db.commit()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={})
+        roles = []
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            roles.append((group_id, category))
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 2)
+
+        with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                mock.patch.object(fm_sentinel, "per_run_allowance",
+                                  lambda *a, **k: 4):
+            fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
+        self.assertEqual(roles, [("old", "sentinel"), ("old", "sentinel")])
+
     def test_explore_budget_never_makes_a_stall(self):
         guard = BudgetGuard(fresh_db(self), verify_reserve=0,
                             category_caps={"sentinel": 0, "background": 20})

@@ -1470,6 +1470,17 @@ def refresh_ages(db: sqlite3.Connection, group_ids, now_iso: str | None = None
     return out
 
 
+def explore_spent_today(db: sqlite3.Connection, group_id: str) -> int:
+    """Attempts spent on trip-length exploration (background checks) by one
+    watch today (UTC), from the query log: 2 attempts per completed or
+    cancelled top_n=1 check."""
+    n = db.execute(
+        """SELECT COUNT(*) AS c FROM query_log
+           WHERE group_id = ? AND category = 'background' AND at >= ?""",
+        (group_id, today_str())).fetchone()["c"]
+    return 2 * n
+
+
 def overdue_sentinels(db: sqlite3.Connection, slot: int, group_ids) -> int:
     """Active named-window sentinels of ``group_ids`` at or past their
     refresh target (or never checked) at ``slot``. Only groups this run can
