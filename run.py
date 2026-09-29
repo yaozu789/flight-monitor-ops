@@ -264,7 +264,8 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
         # Collect-only watches retire their queued alerts and bursts BEFORE
         # the drain, so an alert queued under the old cap rule is never
         # relayed.
-        enter_collect_mode(db, collect_watch_ids(watches))
+        enter_collect_mode(db, collect_watch_ids(watches)
+                           | disabled_watch_ids())
         # Drain FIRST (no network): must run before the backoff / slot
         # early-returns below so stranded handoffs are never stuck behind a
         # skipped collection.
@@ -409,6 +410,19 @@ def load_config() -> tuple[dict, list[dict]]:
             continue
         watches.append(merged)
     return defaults, watches
+
+
+def disabled_watch_ids() -> set[str]:
+    """Watches written in watches.yaml with ``enabled: false``. Their queued
+    alerts and bursts are retired before every drain (a watch switched off
+    after it alerted must not relay anything)."""
+    try:
+        with open(BASE / "watches.yaml") as f:
+            cfg = yaml.safe_load(f) or {}
+    except OSError:
+        return set()
+    return {w["id"] for w in cfg.get("watches", [])
+            if w.get("enabled", True) is False}
 
 
 def cadence_slots(watches: list[dict]) -> int:
@@ -738,7 +752,7 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
     # 2. Hand off ready alerts BEFORE collecting. run_guarded already
     # drained (drain-first); direct callers drain here.
     if drained is None:
-        enter_collect_mode(db, collect_ids)
+        enter_collect_mode(db, collect_ids | disabled_watch_ids())
         drained = drain_pending(db, slot)
     drained_ids = [r["alert_id"] for r in drained]
 

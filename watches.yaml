@@ -61,7 +61,7 @@ watches:
     alert_mode: collect
     windows:                     # weekend: Fri any time or Sat morning, back Sun
       near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
-             depart_hours: {5: "5-12"}, refresh_hours: 48}
+             depart_hours: {5: "5-11"}, refresh_hours: 48}
   - id: sd
     enabled: false
     destinations: [SAN]
@@ -69,7 +69,7 @@ watches:
     alert_mode: collect
     windows:
       near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
-             depart_hours: {5: "5-12"}, refresh_hours: 48}
+             depart_hours: {5: "5-11"}, refresh_hours: 48}
   - id: hkg
     enabled: false
     destinations: [HKG]
