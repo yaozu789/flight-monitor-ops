@@ -96,7 +96,8 @@ function render(d) {
   card("Last run", last ? `${last.status}, ${last.attempts ?? "?"} req` : "—",
        last && last.status !== "completed" ? "bad" : "");
   card("Runs, last 24h", String(runs24.length));
-  card("Requests today (UTC)", `${spentToday} / 150`);
+  const ceiling = d.ceiling || 150;
+  card("Requests today (UTC)", `${spentToday} / ${ceiling}`);
   card(`Stalled runs, ${Math.round((Date.now() - d.run0 * 1800000) / DAY)}d`,
        String(stalls), stalls ? "bad" : "ok");
   app.append(cards);
@@ -184,7 +185,7 @@ function render(d) {
       datasets: cats.map((c, i) => ({ label: c, data: days.map(x => d.spend[x][c] || 0),
         backgroundColor: palette[i % palette.length], stack: "s" })) },
     options: { maintainAspectRatio: false,
-      scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true, suggestedMax: 150 } } },
+      scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true, suggestedMax: ceiling } } },
   });
 
   // Events.

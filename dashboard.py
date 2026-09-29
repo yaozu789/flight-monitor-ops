@@ -61,6 +61,7 @@ def payload(db, watches, now: datetime | None = None) -> dict:
                                    if budget.alert_mode(w) == "cap"
                                    else None)] for w in watches],
             "prices": prices, "run0": first_slot, "runs": runs,
+            "ceiling": budget.daily_ceiling(watches),
             "spend": spend, "events": events}
 
 

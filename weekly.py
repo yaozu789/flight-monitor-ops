@@ -321,7 +321,7 @@ def build_report(db, watches, now: datetime, week: str) -> str:
         "SELECT COUNT(*) AS n FROM health WHERE check_name = 'throttle' "
         "AND ok = 0 AND checked_at >= ?", (since.isoformat(),)).fetchone()["n"]
     lines.append(f"Google requests: {used:,} in 7 days (limit "
-                 f"{budget.DAILY_CEILING}/day); throttles: {throttles}")
+                 f"{budget.daily_ceiling(watches)}/day); throttles: {throttles}")
     url = chart_url(db, watches, now)
     if url:
         lines.append(f"Chart (daily lows, last {CHART_DAYS} days): {url}")

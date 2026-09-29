@@ -504,12 +504,18 @@ class DueOnlyReviewTests(_DueOnlyBase, unittest.TestCase):
 
 class StageAConfigTests(unittest.TestCase):
     def test_stage_a_config(self):
-        """The shipped watches.yaml: Japan + NYC, collect-only, 71.3
-        sentinel attempts/day at the refresh targets, all under 150."""
+        """The shipped watches.yaml: Japan + NYC on relative alerts (each
+        route turns itself on once armed), 71.3 sentinel attempts/day at
+        the refresh targets, inside the mixed-mode gate at the configured
+        150/day ceiling."""
         _, watches = fm_run.load_config()
         self.assertEqual({w["id"] for w in watches}, {"japan", "nyc"})
-        self.assertTrue(all(w["alert_mode"] == "collect" for w in watches))
-        self.assertEqual(budget.effective_verify_reserve(watches), 0)
+        self.assertTrue(all(w["alert_mode"] == "relative" for w in watches))
+        self.assertEqual(budget.daily_ceiling(watches), 150)
+        self.assertEqual(budget.effective_verify_reserve(watches), 24)
+        caps = budget.effective_category_caps(watches,
+                                              budget.daily_ceiling(watches))
+        self.assertEqual((caps["sentinel"], caps["background"]), (114, 0))
         db = fresh_db(self)
         cfg = {w["id"]: fm_run.group_cfg_for(w) for w in watches}
         fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 9, 28))
@@ -517,7 +523,7 @@ class StageAConfigTests(unittest.TestCase):
                      for r in db.execute(
                          "SELECT refresh_hours FROM cells WHERE active=1"))
         self.assertAlmostEqual(demand, 71.33, places=1)
-        self.assertLess(demand, 0.9 * budget.DAILY_CEILING)
+        self.assertLess(demand, 0.9 * (150 - 24 - 12))
 
 
 class ExploreTests(unittest.TestCase):

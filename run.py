@@ -40,6 +40,7 @@ import baseline  # noqa: E402
 import budget  # noqa: E402
 import dashboard  # noqa: E402
 import heartbeat  # noqa: E402
+import notices  # noqa: E402
 import sentinel  # noqa: E402
 import transport  # noqa: E402
 import weekly  # noqa: E402
@@ -127,6 +128,8 @@ RELAY_INSTRUCTION = (
     "--by <your name>."
     " If weekly_report is present, relay its message VERBATIM too, then "
     "record it with: python run.py report-mark --week <week>."
+    " For each entry in notices, relay its message VERBATIM too, then "
+    "record it with: python run.py notice-mark --key <key>."
 )
 
 
@@ -155,6 +158,7 @@ def _handoff_payload(db, slot, alert_ids, **extra) -> dict:
                    for r in batch],
         **({"weekly_report": report}
            if (report := _claim_report(db, slot)) else {}),
+        **({"notices": found} if (found := _claim_notices(db, slot)) else {}),
         **extra,
         "agent_instruction": RELAY_INSTRUCTION,
     }
@@ -167,6 +171,15 @@ def _claim_report(db, slot):
     except Exception as e:  # noqa: BLE001
         _note(db, "weekly_report", f"{type(e).__name__}: {e}")
         return None
+
+
+def _claim_notices(db, slot):
+    """Milestone notices armed for this run, if any; never blocks alerts."""
+    try:
+        return notices.claim(db, slot)
+    except Exception as e:  # noqa: BLE001
+        _note(db, "notices", f"{type(e).__name__}: {e}")
+        return []
 
 
 def _noop(reason: str, **extra) -> int:
@@ -215,7 +228,8 @@ def _stop_handoff(exc, db=None, slot=None, drained=None) -> dict:
             payload = _handoff_payload(db, slot, _ids(drained))
         except Exception:  # noqa: BLE001 - never mask the stop
             payload = None
-    if payload and (payload["alerts"] or payload.get("weekly_report")):
+    if payload and (payload["alerts"] or payload.get("weekly_report")
+                    or payload.get("notices")):
         return {"handoff": payload}
     return {}
 
@@ -281,6 +295,10 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             except Exception as e:  # noqa: BLE001 - never block collection
                 add_health(db, "weekly_report", False,
                            f"{type(e).__name__}: {e}")
+            try:
+                notices.prepare(db, watches, guard)
+            except Exception as e:  # noqa: BLE001 - never block collection
+                add_health(db, "notices", False, f"{type(e).__name__}: {e}")
         bo = get_backoff(db)
         if bo is not None:
             add_health(db, "throttle_backoff", True,
@@ -1097,6 +1115,9 @@ def main() -> int:
                    help="the alert's event number, from the relay batch")
     p.add_argument("--by", required=True, help="actor name, recorded for audit")
 
+    p = sub.add_parser("notice-mark",
+                       help="record that a milestone notice was relayed")
+    p.add_argument("--key", required=True)
     p = sub.add_parser("report-mark",
                        help="record the relayed weekly report (agent use)")
     p.add_argument("--week", required=True,
@@ -1125,9 +1146,11 @@ def main() -> int:
         # collecting command, so even manual runs count against the ceilings.
         # While every watch only collects, the verify reserve and the
         # alert-path category caps are released to sentinels (redesign A2).
+        ceiling = budget.daily_ceiling(watches)
         guard = BudgetGuard(
-            db, verify_reserve=budget.effective_verify_reserve(watches),
-            category_caps=budget.effective_category_caps(watches))
+            db, daily_ceiling=ceiling,
+            verify_reserve=budget.effective_verify_reserve(watches),
+            category_caps=budget.effective_category_caps(watches, ceiling))
         guard.reset_run()
         if args.cmd in ("broad", "narrow", "canary", "check"):
             transport.install_transport_guard(guard)
@@ -1148,6 +1171,12 @@ def main() -> int:
             return cmd_outbox_list(args, db, watches, guard)
         if args.cmd == "outbox-confirm":
             return cmd_outbox_confirm(args, db, watches, guard)
+        if args.cmd == "notice-mark":
+            if not notices.mark(db, args.key):
+                raise SystemExit(f"notice-mark failed: no unrelayed notice "
+                                 f"{args.key!r}")
+            print(json.dumps({"status": "ok", "notice": args.key}))
+            return 0
         if args.cmd == "report-mark":
             return cmd_report_mark(args, db, watches, guard)
         if args.cmd == "dashboard-link":
