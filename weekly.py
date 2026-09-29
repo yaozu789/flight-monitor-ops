@@ -140,11 +140,11 @@ def _window_cheapest(db, watch_id, win, lo_date, hi_date, nights, since,
     params = [watch_id, since, until, lo_date, hi_date, *nights]
     # Only itineraries the watch actually tracks: its airports and stop
     # limit (older rows can carry a layover as the destination, or more
-    # stops than allowed).
+    # stops than allowed; an unknown stop count cannot be shown to fit).
     for col, codes in (("origin", origins), ("destination", destinations)):
         where.append(f"{col} IN ({','.join('?' * len(codes))})")
         params += list(codes)
-    where.append("(stops IS NULL OR stops <= ?)")
+    where.append("stops IS NOT NULL AND stops <= ?")
     params.append(int(max_stops))
     if win.get("weekdays"):
         days = [_sqlite_wd(d) for d in win["weekdays"]]

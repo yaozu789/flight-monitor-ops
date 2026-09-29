@@ -316,6 +316,7 @@ _OUTBOX_V2_COLUMNS = [
 _RUN_SLOTS_COLUMNS = [
     ("attempts", "INTEGER"),
     ("stalled", "INTEGER"),
+    ("idle", "INTEGER"),   # 1 = nothing was due (named windows); ends a stall streak
 ]
 
 # v3 columns on the observations table: per-leg flight numbers and departure
@@ -1070,24 +1071,27 @@ def deadline_streak(db: sqlite3.Connection, max_gap: int = 1) -> int:
 
 
 def record_run_stats(db: sqlite3.Connection, slot: int, attempts: int,
-                     stalled: bool) -> None:
-    db.execute("UPDATE run_slots SET attempts=?, stalled=? WHERE slot_id=?",
-               (attempts, int(stalled), slot))
+                     stalled: bool, idle: bool = False) -> None:
+    db.execute("UPDATE run_slots SET attempts=?, stalled=?, idle=? "
+               "WHERE slot_id=?", (attempts, int(stalled), int(idle), slot))
     db.commit()
 
 
 def stall_streak(db: sqlite3.Connection, max_gap: int = 1) -> int:
     """Stalled runs back to back, ending at the most recent run (same gap
     rule as deadline_streak). A neutral run -- 0 attempts because nothing
-    was affordable -- neither counts nor breaks the streak; any other run
-    (progress, or no stats recorded: stop or crash) ends it."""
+    was affordable -- neither counts nor breaks the streak; an idle run
+    (nothing was due: the collector was healthy) ends it, as does any other
+    run (progress, or no stats recorded: stop or crash)."""
     streak = 0
     prev = None
-    for r in db.execute("SELECT slot_id, attempts, stalled FROM run_slots "
-                        "ORDER BY slot_id DESC"):
+    for r in db.execute("SELECT slot_id, attempts, stalled, idle "
+                        "FROM run_slots ORDER BY slot_id DESC"):
         if prev is not None and prev - r["slot_id"] > max_gap:
             break
         prev = r["slot_id"]
+        if r["idle"]:
+            break
         if r["stalled"]:
             streak += 1
         elif r["attempts"] == 0 and r["stalled"] == 0:

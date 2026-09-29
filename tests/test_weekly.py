@@ -244,7 +244,7 @@ class DigestReviewTests(_ObsMixin, unittest.TestCase):
         db = fresh_db(self)
         dep, ret = _d(10, 7)
         for dest, stops, price in (("ATL", 1, 150), ("JFK", 2, 200),
-                                   ("JFK", 1, 343)):
+                                   ("JFK", None, 120), ("JFK", 1, 343)):
             store.add_observation(
                 db, watch_id="nyc", origin="SFO", destination=dest,
                 depart_date=dep, return_date=ret, airline="F9", stops=stops,
@@ -255,6 +255,7 @@ class DigestReviewTests(_ObsMixin, unittest.TestCase):
         self.assertIn("  Next 1-6 weeks: $343 SFO -> JFK", text)
         self.assertNotIn("ATL", text)
         self.assertNotIn("$200", text)
+        self.assertNotIn("$120", text)  # unknown stop count
 
     def test_prior_week_low_shown_without_this_week(self):
         db = fresh_db(self)

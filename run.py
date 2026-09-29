@@ -763,7 +763,9 @@ def cmd_check(args, db, watches, guard, *, drained=None, deadline_fn=None,
         }
 
         record_run_stats(db, slot, collected["attempts"],
-                         _stalled(guard, collected))
+                         _stalled(guard, collected),
+                         idle=(not collected["attempts"]
+                               and collected.get("overdue_at_start") == 0))
 
         # 6. Same-slot verify: this run's own collection output. collect()
         # narrowed the per-run allowance to its paced share; verification is

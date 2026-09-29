@@ -418,11 +418,7 @@ class BurstSurplusTests(unittest.TestCase):
         self.assertEqual(len(self._collect(db, cfg, slot, 10)), 1)
 
 
-class DueOnlyTests(unittest.TestCase):
-    """Follow-up to the 240b629 deploy: named-window runs check only DUE
-    cells (daily use follows the refresh targets, ~71/day, not the 150
-    ceiling), and an idle run with nothing due is not a stall."""
-
+class _DueOnlyBase:
     def _cfg(self):
         return {"g1": fm_run.group_cfg_for({
             "id": "g1", "origins": ["SFO"], "destinations": ["JFK"],
@@ -448,6 +444,12 @@ class DueOnlyTests(unittest.TestCase):
                                       store.utcnow_iso())
         return res, calls, guard
 
+
+class DueOnlyTests(_DueOnlyBase, unittest.TestCase):
+    """Follow-up to the 240b629 deploy: named-window runs check only DUE
+    cells (daily use follows the refresh targets, ~71/day, not the 150
+    ceiling), and an idle run with nothing due is not a stall."""
+
     def test_fresh_cells_are_not_rechecked(self):
         db = fresh_db(self)
         cfg = self._cfg()
@@ -467,6 +469,37 @@ class DueOnlyTests(unittest.TestCase):
         # ...but sending nothing while cells ARE due is still a stall.
         self.assertTrue(fm_run._stalled(guard, dict(res, overdue_at_start=3,
                                                     allowance=6)))
+
+
+class DueOnlyReviewTests(_DueOnlyBase, unittest.TestCase):
+    """Codex review of PR #38: legacy watches in a mixed config still
+    collect, and an idle run ends a stall streak."""
+
+    def test_mixed_config_still_collects_legacy_watches(self):
+        db = fresh_db(self)
+        cfg = dict(self._cfg(),
+                   old={"origins": ["SFO"], "destinations": ["NRT"]})
+        fm_sentinel.mint_sentinels(db, cfg)
+        slot = store.slot_id()
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE window_name IS NOT NULL", (slot,))
+        db.commit()
+        res, calls, guard = self._collect(db, cfg, slot, 4)
+        groups = {r["group_id"] for r in db.execute(
+            f"SELECT group_id FROM cells WHERE id IN "
+            f"({','.join(str(c) for c in calls) or 'NULL'})")}
+        self.assertEqual(groups, {"old"})
+        self.assertGreater(res["overdue_at_start"], 0)
+
+    def test_idle_run_ends_a_stall_streak(self):
+        db = fresh_db(self)
+        for slot, attempts, stalled, idle in ((1, 0, 1, 0), (2, 0, 1, 0),
+                                              (3, 0, 0, 1), (4, 0, 1, 0),
+                                              (5, 0, 1, 0)):
+            store.claim_slot(db, slot, "check")
+            store.record_run_stats(db, slot, attempts, bool(stalled),
+                                   idle=bool(idle))
+        self.assertEqual(store.stall_streak(db), 2)
 
 
 class StageAConfigTests(unittest.TestCase):
