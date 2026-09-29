@@ -445,11 +445,23 @@ def _window_cfg(name: str, spec: dict) -> dict:
         days.append(spec["return_weekday"])
     if any(not 0 <= int(d) <= 6 for d in days):
         raise ValueError(f"window {name!r}: weekdays run 0 (Mon) .. 6 (Sun)")
+    # depart_hours: {weekday: "HH-HH"} limits the OUTBOUND departure time
+    # on that weekday (e.g. {5: "5-12"} = Saturday morning only).
+    depart_hours = {}
+    for day, hours in (spec.get("depart_hours") or {}).items():
+        day = int(day)
+        if day not in {int(d) for d in spec.get("weekdays") or []}:
+            raise ValueError(f"window {name!r}: depart_hours day {day} is "
+                             "not one of its weekdays")
+        from fli.core.parsers import parse_time_range
+        parse_time_range(str(hours))  # raises on a malformed range
+        depart_hours[day] = str(hours)
     return {"name": name, "lo": lo, "hi": hi,
             "refresh_hours": int(spec["refresh_hours"]),
             "step_days": spec.get("step_days"),
             "weekdays": spec.get("weekdays"),
-            "return_weekday": spec.get("return_weekday")}
+            "return_weekday": spec.get("return_weekday"),
+            "depart_hours": depart_hours}
 
 
 def group_cfg_for(w: dict) -> dict:

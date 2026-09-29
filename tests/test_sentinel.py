@@ -1389,6 +1389,71 @@ class TestNamedWindows(SentinelTestBase):
             ret = date.fromisoformat(d) + timedelta(days=n)
             self.assertEqual(ret.weekday(), 6)
 
+    def test_saturday_morning_limits_only_the_outbound_flight(self):
+        """depart_hours {5: "5-12"}: a Saturday departure searches only
+        morning outbound flights; Friday is unrestricted and the Sunday
+        return is never restricted."""
+        import run
+        import poller
+        cfg = run.group_cfg_for({
+            "id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+            "windows": {"near": {"days": [7, 42], "weekdays": [4, 5],
+                                 "return_weekday": 6, "refresh_hours": 48,
+                                 "depart_hours": {5: "5-12"}}}})
+        seen = {}
+
+        def fake_query(origin, dest, depart, ret, qcfg, **kw):
+            seen[depart] = qcfg.get("outbound_hours")
+            return []
+
+        self.patch(sentinel, "narrow_query", fake_query)
+        guard = self.guard()
+        sat = date.fromisoformat(TODAY) + timedelta(days=16)
+        sat += timedelta(days=(5 - sat.weekday()) % 7)
+        fri = sat - timedelta(days=1)
+        for d in (fri, sat):
+            sentinel.check_cell(self.db, {"id": None, "depart_date":
+                                          d.isoformat(), "duration": 1,
+                                          "window_name": "near"},
+                                guard, "la", cfg, top_n=1,
+                                category="sentinel", slot=1)
+        self.assertEqual(seen, {fri.isoformat(): None, sat.isoformat(): "5-12"})
+
+        captured = {}
+
+        class Client:
+            def search(self, filters, **kw):
+                captured["segs"] = filters.flight_segments
+                return []
+
+        orig = (poller.SearchFlights, poller.time.sleep, poller._polite)
+        poller.SearchFlights = Client
+        poller.time.sleep = lambda s: None
+        poller._polite = lambda: None
+        try:
+            poller.narrow_query("SFO", "LAX", sat.isoformat(),
+                                (sat + timedelta(days=1)).isoformat(),
+                                {"origins": ["SFO"], "destinations": ["LAX"],
+                                 "outbound_hours": "5-12"},
+                                top_n=1, require_guard=False)
+        finally:
+            poller.SearchFlights, poller.time.sleep, poller._polite = orig
+        out, back = captured["segs"]
+        self.assertEqual((out.time_restrictions.earliest_departure,
+                          out.time_restrictions.latest_departure), (5, 12))
+        self.assertIsNone(back.time_restrictions)
+
+    def test_bad_depart_hours_rejected(self):
+        import run
+        for hours in ({5: "25-3"}, {2: "5-12"}):
+            with self.assertRaises(Exception):
+                run.group_cfg_for({
+                    "id": "la", "origins": ["SFO"], "destinations": ["LAX"],
+                    "windows": {"near": {"days": [7, 42], "weekdays": [4, 5],
+                                         "return_weekday": 6,
+                                         "refresh_hours": 48,
+                                         "depart_hours": hours}}})
+
     def test_migration_adds_window_columns(self):
         path = os.path.join(self.tmpdir, "old.db")
         old = store.get_db(path)

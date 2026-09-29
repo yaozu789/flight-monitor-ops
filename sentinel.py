@@ -202,6 +202,23 @@ def _fixed_return_nights(win: dict | None, d: date) -> int | None:
     return (int(win["return_weekday"]) - d.weekday()) % 7 or 7
 
 
+def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
+    """The outbound departure-time limit ("HH-HH") for this departure, from
+    its window's ``depart_hours`` for that weekday, or None. A burst's
+    one-off check has no window name, so its window is found by date."""
+    wins = (group_cfg or {}).get("windows") or []
+    dep = date.fromisoformat(depart_date)
+    win = next((w for w in wins if w["name"] == window_name), None)
+    if win is None:
+        today_d = _coerce_today(None)
+        win = next((w for w in wins
+                    if _window_bounds(w, today_d)[0] <= dep
+                    <= _window_bounds(w, today_d)[1]), None)
+    if win is None:
+        return None
+    return (win.get("depart_hours") or {}).get(dep.weekday())
+
+
 def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
     return (today_d + timedelta(days=int(win["lo"])),
             today_d + timedelta(days=int(win["hi"])))
@@ -413,6 +430,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
                 "duration= kwargs")
 
     spent_before = guard.spent_run()
+    hours = _outbound_hours(group_cfg, (cell or {}).get("window_name"),
+                            depart_date)
     origin = ",".join(group_cfg["origins"])
     destination = ",".join(group_cfg["destinations"])
     return_date = (date.fromisoformat(depart_date)
@@ -420,6 +439,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
     cfg = {"origins": list(group_cfg["origins"]),
            "destinations": list(group_cfg["destinations"]),
            "stops": [0, 1], "seat": "economy", "pax": {"adults": 1}}
+    if hours:
+        cfg["outbound_hours"] = hours
     window_name = cell.get("window_name") if cell is not None else None
 
     def _log(outcome):
