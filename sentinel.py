@@ -943,12 +943,20 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
 
     trig_win = _trigger_window(trigger, group_cfg)
 
-    def _one_off(d_date: str, dur: int, category: str):
+    # A relative burst's revalidation searches ONLY the trigger's own route,
+    # so a cheaper fare on another airport pair cannot keep it alive.
+    route_cfg = group_cfg
+    if (group_cfg.get("alert_mode") == "relative" and trigger.get("origin")
+            and trigger.get("destination")):
+        route_cfg = dict(group_cfg, origins=[trigger["origin"]],
+                         destinations=[trigger["destination"]])
+
+    def _one_off(d_date: str, dur: int, category: str, cfg=None):
         # The trigger's window (bounds frozen when it was queued) names the
         # window for every step, so its departure-time limit carries over.
         cell = {"id": None, "depart_date": d_date, "duration": dur,
                 "window_name": trig_win["name"] if trig_win else None}
-        return check_cell(db, cell, guard, group_id, group_cfg,
+        return check_cell(db, cell, guard, group_id, cfg or group_cfg,
                           top_n=SENTINEL_TOP_N, category=category,
                           slot=slot, run_start=run_start)
 
@@ -980,7 +988,9 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
             if deadline_fn is not None and deadline_fn():
                 raise store.DeadlineExceeded("burst phase deadline exceeded")
             category = "verify" if kind == "revalidate" else "burst"
-            price, used = _one_off(d_date, dur, category)
+            price, used = _one_off(
+                d_date, dur, category,
+                route_cfg if kind == "revalidate" else None)
             total += used
             cumulative += used
             if redo:

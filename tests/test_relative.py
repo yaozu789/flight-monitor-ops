@@ -252,6 +252,63 @@ class ReviewFixTests(unittest.TestCase):
         self.assertFalse(sentinel._still_eligible(self.db, self._trigger(),
                                                   cap, 261.0))
 
+    def test_burst_revalidates_only_the_trigger_route(self):
+        seed_history(self.db)
+        dep = TODAY + timedelta(days=16)
+        tid = store.queue_trigger(
+            self.db, kind="under_cap", group_id="nyc",
+            depart_week=store.depart_week(dep.isoformat()),
+            depart_date=dep.isoformat(), duration=7, price_usd=270.0,
+            fingerprint="fp", slot=5, window_name="near", origin="SFO",
+            destination="JFK")
+        trig = [t for t in store.due_triggers(self.db, 5)
+                if t["id"] == tid][0]
+        routes = []
+
+        def fake_check(db, cell, guard, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            routes.append((category, tuple(group_cfg["origins"])))
+            return (100.0, 2)
+
+        cfg = dict(self.cfg, origins=["SFO", "OAK"])
+        guard = BudgetGuard(self.db, per_run_max=10_000, verify_reserve=0,
+                            category_caps={})
+        with mock.patch.object(sentinel, "check_cell", fake_check):
+            sentinel.execute_burst(self.db, trig, guard, cfg, slot=5,
+                                   run_start=store.utcnow_iso())
+        self.assertEqual(routes[0], ("verify", ("SFO",)))
+        self.assertTrue(all(o == ("SFO", "OAK") for _, o in routes[1:]))
+
+    def test_backlog_deal_needs_todays_eligibility_to_hand_off(self):
+        """Scored and verified against yesterday's baseline, but today the
+        route no longer qualifies: no alert."""
+        seed_history(self.db, days=20)
+        yesterday = NOW - timedelta(days=1)
+        dep = yesterday.date() + timedelta(days=14)
+        obs(self.db, yesterday, dep, 250.0)
+        watch = dict(WATCH, max_alert_usd=None)
+        cands = scorer.score_new_observations(
+            self.db, watch, (yesterday - timedelta(minutes=1)).isoformat())
+        self.assertEqual(len(cands), 1)  # passes yesterday's threshold
+
+        def confirm(db, w, c, guard, **kw):
+            return True, {"price_usd": c["price_usd"],
+                          "depart_date": c["depart_date"],
+                          "return_date": c["return_date"], "airline": "UA",
+                          "stops": 0, "booking_url": "", "origin": "SFO",
+                          "destination": "JFK",
+                          "observed_at": store.utcnow_iso()}
+
+        new_ids, deals = [], []
+        low = dict(watch, max_alert_usd=200)   # today's limit drops to 200
+        with mock.patch.object(fm_run, "verify", confirm), \
+                mock.patch.object(fm_run, "score_new_observations",
+                                  lambda *a, **k: cands):
+            fm_run._verify_each(self.db, [low], BudgetGuard(self.db),
+                                yesterday.isoformat(), new_ids, deals, None,
+                                {})
+        self.assertEqual((new_ids, deals), ([], []))
+
     def test_relative_first_time_is_by_recent_burst_not_old_prices(self):
         seed_history(self.db)
         dep = TODAY + timedelta(days=16)

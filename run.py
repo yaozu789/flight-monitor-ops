@@ -660,6 +660,16 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 return  # leave the rest of the verify cap for bursts
             _check_deadline(deadline_fn)
             ok, conf = verify(db, w, c, guard)
+            if ok and c.get("reason") == "relative":
+                # Scored against the day it was seen; handed off only if the
+                # confirmed fare also passes TODAY's threshold for its route
+                # (a backlog candidate whose route has since become unarmed,
+                # or whose threshold fell, is not news any more).
+                today_limit, _ = baseline.threshold(
+                    db, w, group_cfg_for(w), c["origin"], c["destination"],
+                    c["depart_date"], c["return_date"])
+                ok = (today_limit is not None
+                      and conf["price_usd"] <= today_limit)
             if not ok:
                 log_verify(db, w["id"], c["fingerprint"], c["observed_at"],
                            "not_confirmed")
