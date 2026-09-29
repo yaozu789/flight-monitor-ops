@@ -1462,6 +1462,9 @@ class TestNamedWindows(SentinelTestBase):
         ).get("outbound_hours"))
         self.assertEqual(sentinel._outbound_hours(
             run.group_cfg_for(watch), None, sat.isoformat()), "5-11")
+        # depart_hours must not disturb the window's own day bounds.
+        win = run.group_cfg_for(watch)["windows"][0]
+        self.assertEqual((win["lo"], win["hi"]), (7, 42))
 
     def test_bad_depart_hours_rejected(self):
         import run

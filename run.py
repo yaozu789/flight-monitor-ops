@@ -455,10 +455,10 @@ def _window_cfg(name: str, spec: dict) -> dict:
                              "not one of its weekdays")
         from fli.core.parsers import parse_time_range
         parse_time_range(str(hours))  # raises on a malformed range
-        lo, hi = (int(x) for x in str(hours).split("-"))
+        first, last = (int(x) for x in str(hours).split("-"))
         # fli silently swaps a reversed range and rejects 24: require an
         # explicit earliest < latest within 0..23 (hours are inclusive).
-        if not 0 <= lo < hi <= 23:
+        if not 0 <= first < last <= 23:
             raise ValueError(f"window {name!r}: depart_hours {hours!r} must "
                              "be 'earliest-latest' with 0 <= earliest < "
                              "latest <= 23")
