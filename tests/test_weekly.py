@@ -238,6 +238,24 @@ class DigestReviewTests(_ObsMixin, unittest.TestCase):
         self.assertIn("seen 42h ago", text)
         self.assertNotIn("(stale)", text)
 
+    def test_digest_only_tracked_airports_and_stops(self):
+        """An old row with the layover stored as the destination, or with
+        more stops than the watch allows, is not a fare the watch tracks."""
+        db = fresh_db(self)
+        dep, ret = _d(10, 7)
+        for dest, stops, price in (("ATL", 1, 150), ("JFK", 2, 200),
+                                   ("JFK", 1, 343)):
+            store.add_observation(
+                db, watch_id="nyc", origin="SFO", destination=dest,
+                depart_date=dep, return_date=ret, airline="F9", stops=stops,
+                cabin="economy", price_usd=price, booking_url="",
+                observed_at=(MON_DUE - timedelta(hours=5)).isoformat(
+                    timespec="seconds"))
+        text = weekly.build_report(db, [NYC_W], MON_DUE, "2026-W40")
+        self.assertIn("  Next 1-6 weeks: $343 SFO -> JFK", text)
+        self.assertNotIn("ATL", text)
+        self.assertNotIn("$200", text)
+
     def test_prior_week_low_shown_without_this_week(self):
         db = fresh_db(self)
         self._obs(db, 10, 830, seen_h=24 * 9)

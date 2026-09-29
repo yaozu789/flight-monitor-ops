@@ -129,7 +129,7 @@ def _sqlite_wd(python_weekday: int) -> str:
 
 
 def _window_cheapest(db, watch_id, win, lo_date, hi_date, nights, since,
-                     until):
+                     until, origins, destinations, max_stops):
     """Cheapest stored fare whose departure is inside the window NOW, on
     one of its weekdays (if any), with a stay the watch tracks and, for a
     fixed-return window, returning on that weekday."""
@@ -138,6 +138,14 @@ def _window_cheapest(db, watch_id, win, lo_date, hi_date, nights, since,
              "CAST(julianday(return_date) - julianday(depart_date) AS INTEGER)"
              f" IN ({','.join('?' * len(nights))})"]
     params = [watch_id, since, until, lo_date, hi_date, *nights]
+    # Only itineraries the watch actually tracks: its airports and stop
+    # limit (older rows can carry a layover as the destination, or more
+    # stops than allowed).
+    for col, codes in (("origin", origins), ("destination", destinations)):
+        where.append(f"{col} IN ({','.join('?' * len(codes))})")
+        params += list(codes)
+    where.append("(stops IS NULL OR stops <= ?)")
+    params.append(int(max_stops))
     if win.get("weekdays"):
         days = [_sqlite_wd(d) for d in win["weekdays"]]
         where.append("strftime('%w', depart_date) IN "
@@ -165,10 +173,11 @@ def _windowed_lines(db, w, cfg, now) -> list[str]:
     for win in cfg["windows"]:
         lo_date = (today + timedelta(days=win["lo"])).isoformat()
         hi_date = (today + timedelta(days=win["hi"])).isoformat()
+        track = (cfg["origins"], cfg["destinations"], w.get("max_stops", 1))
         best = _window_cheapest(db, w["id"], win, lo_date, hi_date,
-                                cfg["nights"], since, until)
+                                cfg["nights"], since, until, *track)
         before = _window_cheapest(db, w["id"], win, lo_date, hi_date,
-                                  cfg["nights"], prior, since)
+                                  cfg["nights"], prior, since, *track)
         label = _window_label(win)
         if best is None:
             lines.append(f"  {label}: no fares stored this week")

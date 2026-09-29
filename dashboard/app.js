@@ -88,8 +88,10 @@ function render(d) {
   for (const [id, cap] of d.watches) {
     const pts = d.prices[id] || [];
     const lastLow = pts.length ? pts[pts.length - 1][1] : null;
-    card(`${id} latest daily low (cap $${cap})`,
-         lastLow === null ? "—" : `$${lastLow}`, lastLow !== null && lastLow <= cap ? "ok" : "");
+    // cap is null when the watch does not alert on a cap (collect mode).
+    card(cap === null ? `${id} latest daily low` : `${id} latest daily low (cap $${cap})`,
+         lastLow === null ? "—" : `$${lastLow}`,
+         cap !== null && lastLow !== null && lastLow <= cap ? "ok" : "");
   }
   card("Last run", last ? `${last.status}, ${last.attempts ?? "?"} req` : "—",
        last && last.status !== "completed" ? "bad" : "");
@@ -107,7 +109,7 @@ function render(d) {
   const pc = $("div", { class: "chart" }); const pcv = $("canvas"); pc.append(pcv); ps.append(pc);
   ps.append($("div", { class: "hint" },
     "Lowest stored fare per day, any dates and trip lengths in the window. " +
-    "Drag or pinch to zoom, swipe to slide; tap for values. Dashed = cap."));
+    "Drag or pinch to zoom, swipe to slide; tap for values. Dashed = cap (cap-alert watches only)."));
   app.append(ps);
   const priceSets = [];
   let pMin = Infinity, pMax = -Infinity;
@@ -119,7 +121,7 @@ function render(d) {
     const color = palette[i % palette.length];
     priceSets.push({ label: id, data: pts, borderColor: color, backgroundColor: color,
                      pointRadius: 2, tension: 0.2 });
-    if (pts.length) priceSets.push({ label: `${id} cap`, borderColor: color, borderDash: [6, 4],
+    if (pts.length && cap !== null) priceSets.push({ label: `${id} cap`, borderColor: color, borderDash: [6, 4],
       borderWidth: 1, pointRadius: 0,
       data: [{ x: pts[0].x, y: cap }, { x: pts[pts.length - 1].x, y: cap }] });
   });
