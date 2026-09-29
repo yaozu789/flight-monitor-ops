@@ -520,5 +520,79 @@ class StageAConfigTests(unittest.TestCase):
         self.assertLess(demand, 0.9 * budget.DAILY_CEILING)
 
 
+class Phase2ConfigTests(unittest.TestCase):
+    """The Phase 2 destinations are written in watches.yaml but switched
+    off; switched on, all seven fit the spec's budget."""
+
+    def _all(self):
+        import yaml
+        with open(_PROJECT_ROOT / "watches.yaml") as f:
+            cfg = yaml.safe_load(f)
+        d = cfg.get("defaults", {})
+        return [{**d, **w} for w in cfg["watches"]]
+
+    def test_disabled_watches_are_not_loaded(self):
+        _, watches = fm_run.load_config()
+        self.assertEqual({w["id"] for w in watches}, {"japan", "nyc"})
+        off = {w["id"] for w in self._all() if w.get("enabled") is False}
+        self.assertEqual(off, {"la", "sd", "hkg", "shanghai", "beijing"})
+
+    def test_all_seven_parse_and_fit_the_300_stage(self):
+        from datetime import date
+        db = fresh_db(self)
+        watches = self._all()
+        cfg = {w["id"]: fm_run.group_cfg_for(w) for w in watches}
+        fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 10, 1))
+        demand = sum(2 * 24 / r["refresh_hours"] for r in db.execute(
+            "SELECT refresh_hours FROM cells WHERE active = 1"))
+        # Spec: 197.3-201.3 attempts/day for all seven groups.
+        self.assertTrue(197 <= demand <= 202, demand)
+        self.assertLess(demand, 0.9 * (300 - 24 - 12))
+        per = {}
+        for r in db.execute(
+                """SELECT group_id, window_name, weekday, duration, COUNT(*) AS n
+                   FROM cells WHERE active = 1
+                   GROUP BY 1, 2, 3, 4"""):
+            g = per.setdefault((r["group_id"], r["window_name"]),
+                               {"n": 0, "wd": set(), "dur": set()})
+            g["n"] += r["n"]
+            g["wd"].add(r["weekday"])
+            g["dur"].add(r["duration"])
+        for gid in ("la", "sd"):  # every Fri (2 nights) and Sat (1 night)
+            g = per.pop((gid, "near"))
+            self.assertEqual((g["wd"], g["dur"]), ({4, 5}, {1, 2}))
+            self.assertTrue(10 <= g["n"] <= 12, (gid, g["n"]))
+            self.assertEqual(cfg[gid]["windows"][0]["depart_hours"],
+                             {5: "5-11"})
+        for gid in ("japan", "hkg", "shanghai", "beijing"):
+            self.assertEqual(per.pop((gid, "near"))["n"], 18)
+            far = per.pop((gid, "far"))
+            self.assertTrue(24 <= far["n"] <= 27 and far["dur"] == {28},
+                            (gid, far))
+        nyc = per.pop(("nyc", "near"))
+        self.assertEqual((nyc["n"], nyc["dur"]), (36, {7, 14}))
+        self.assertEqual(per, {})
+
+    def test_disabled_watch_queued_alert_is_retired_not_relayed(self):
+        """A watch switched off after it alerted must not relay its queued
+        alert on the next run."""
+        db = fresh_db(self)
+        aid = _enqueue(db, "la", "old")
+        self.assertIn("la", fm_run.disabled_watch_ids())
+
+        def collect_nothing(db_, guard_, groups, slot, run_start, **kw):
+            return {"attempts": 0, "bursts": [], "sentinels": 0,
+                    "background": 0, "drop_triggers": 0, "allowance": 0,
+                    "overdue_at_start": 0}
+
+        rc, docs = CollectRunTests._run(self, db, [COLLECT], collect_nothing,
+                                        lambda *a, **k: (False, None))
+        self.assertEqual(rc, 0)
+        relayed = [a for d in docs
+                   for a in d.get("handoff", {}).get("alerts", [])]
+        self.assertEqual(relayed, [])
+        self.assertEqual(_state(db, aid), "retired")
+
+
 if __name__ == "__main__":
     unittest.main()

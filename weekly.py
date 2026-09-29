@@ -291,10 +291,13 @@ def build_report(db, watches, now: datetime, week: str) -> str:
     if budget.all_collect(watches):
         lines.append("Deal alerts: off while price history builds up")
     else:
+        ids = [w["id"] for w in watches]
         alerts = db.execute(
-            """SELECT watch_id, COUNT(*) AS n FROM outbox
-               WHERE prepared_at >= ? GROUP BY watch_id ORDER BY watch_id""",
-            (since.isoformat(),)).fetchall()
+            f"""SELECT watch_id, COUNT(*) AS n FROM outbox
+                WHERE prepared_at >= ?
+                  AND watch_id IN ({','.join('?' * len(ids))})
+                GROUP BY watch_id ORDER BY watch_id""",
+            (since.isoformat(), *ids)).fetchall()
         lines.append("Deal alerts handed off this week: " + (", ".join(
             f"{r['watch_id']} {r['n']}" for r in alerts) or "none"))
     used = db.execute(
