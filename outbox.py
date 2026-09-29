@@ -197,7 +197,7 @@ def enqueue_from_confirmation(db, watch, candidate, confirmation) -> tuple[str, 
             destination=(confirmation.get("destination")
                          or candidate.get("destination"))))
     return store.enqueue_alert(
-        db,
+        db, outbound_hours=candidate.get("outbound_hours"),
         alert_id=alert_id,
         watch_id=watch_id,
         fingerprint=candidate["fingerprint"],

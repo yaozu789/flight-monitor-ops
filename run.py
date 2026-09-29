@@ -660,7 +660,12 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 "watch_id": w["id"], "fingerprint": c["fingerprint"],
                 "price_usd": conf["price_usd"],
                 "depart_date": conf["depart_date"], "duration": duration,
-                "cap": w["absolute_cap_usd"]})
+                "cap": w["absolute_cap_usd"],
+                # the window the fare came from (burst steps get its limits)
+                "window_name": (sentinel.window_on(
+                    group_cfg_for(w), c["depart_date"],
+                    date.fromisoformat(c["observed_at"][:10]))
+                    if w.get("windows") else None)})
 
 
 def collect_watch_ids(watches) -> set[str]:

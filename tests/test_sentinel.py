@@ -1472,10 +1472,44 @@ class TestNamedWindows(SentinelTestBase):
         row = self.db.execute("SELECT fingerprint, outbound_hours FROM "
                               "observations").fetchone()
         self.assertEqual(row["outbound_hours"], "5-11")
-        self.assertEqual(store.outbound_hours_for(self.db, row["fingerprint"]),
-                         "5-11")
         self.assertEqual(verifier._cfg_for(watch, "SFO", "LAX", "5-11")
                          .get("outbound_hours"), "5-11")
+        # The alert keeps the limit its fare was found with, and a retry
+        # recheck repeats exactly that search (whatever other watches saw).
+        aid, _ = store.enqueue_alert(
+            self.db, alert_id="la:w", watch_id="la",
+            fingerprint=row["fingerprint"], price_usd=99.0,
+            depart_date=sat.isoformat(),
+            return_date=(sat + timedelta(days=1)).isoformat(), airline="JL",
+            stops=0, booking_url="", message_text="m", origin="SFO",
+            destination="LAX", outbound_hours="5-11")
+        alert = store.outbox_get(self.db, aid)
+        self.assertEqual(alert["outbound_hours"], "5-11")
+        seen = {}
+
+        def fake_recheck(q_from, q_to, dep, ret, qcfg, **kw):
+            seen["hours"] = qcfg.get("outbound_hours")
+            return []
+
+        import verifier as _v
+        orig = _v.poller.narrow_query
+        _v.poller.narrow_query = fake_recheck
+        try:
+            _v.recheck_alert_detailed(alert, self.db,
+                                      dict(watch, absolute_cap_usd=500), None)
+        finally:
+            _v.poller.narrow_query = orig
+        self.assertEqual(seen["hours"], "5-11")
+        # A burst trigger remembers its source window: after midnight, when
+        # the departure is no longer inside today's bounds, the burst still
+        # resolves that window (and each step its weekday's limit).
+        trig = {"depart_date": (date.fromisoformat(TODAY)
+                                + timedelta(days=7)).isoformat(),
+                "duration": 1, "window_name": "near",
+                "created_at": (date.fromisoformat(TODAY)
+                               + timedelta(days=1)).isoformat()
+                + "T01:00:00+00:00"}
+        self.assertEqual(sentinel._trigger_window(trig, gcfg)["name"], "near")
         self.assertIsNone(verifier._cfg_for(watch, "SFO", "LAX", None)
                           .get("outbound_hours"))
         # A burst step names its trigger's window.

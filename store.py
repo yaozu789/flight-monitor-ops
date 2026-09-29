@@ -308,6 +308,15 @@ _OUTBOX_V2_COLUMNS = [
     ("last_price_usd", "REAL"),
     ("confirmed_by", "TEXT"),
     ("unknown_count", "INTEGER NOT NULL DEFAULT 0"),  # v3: unknown rechecks
+    # The outbound departure-time limit the alerted fare was found with
+    # ("5-11"); retry rechecks repeat exactly that search.
+    ("outbound_hours", "TEXT"),
+]
+
+# Burst triggers remember the window they came from, so every burst step
+# (a Friday or a Saturday neighbour) gets its own weekday's limit from it.
+_TRIGGER_COLUMNS = [
+    ("window_name", "TEXT"),
 ]
 
 # Per-run collection stats on run_slots (NULL for runs before they existed):
@@ -401,6 +410,11 @@ def migrate_db(db: sqlite3.Connection) -> None:
         for name, ddl in _OBS_V3_COLUMNS:
             if name not in obs_cols:
                 db.execute(f"ALTER TABLE observations ADD COLUMN {name} {ddl}")
+    trig_cols = {r["name"] for r in db.execute("PRAGMA table_info(triggers)")}
+    if trig_cols:
+        for name, ddl in _TRIGGER_COLUMNS:
+            if name not in trig_cols:
+                db.execute(f"ALTER TABLE triggers ADD COLUMN {name} {ddl}")
     cell_cols = {r["name"] for r in db.execute("PRAGMA table_info(cells)")}
     if cell_cols:
         for name, ddl in _CELLS_WINDOW_COLUMNS:
@@ -530,16 +544,6 @@ def save_observations(db: sqlite3.Connection, watch_id: str,
             outbound_hours=o.get("outbound_hours"))
         n += 1
     return n
-
-
-def outbound_hours_for(db: sqlite3.Connection, fingerprint: str) -> str | None:
-    """The departure-time limit the latest fare with this fingerprint was
-    searched with (retry rechecks repeat it)."""
-    row = db.execute(
-        """SELECT outbound_hours FROM observations WHERE fingerprint = ?
-           ORDER BY observed_at DESC, id DESC LIMIT 1""",
-        (fingerprint,)).fetchone()
-    return row["outbound_hours"] if row else None
 
 
 def add_broad_scan(db: sqlite3.Connection, *, watch_id: str, depart_date: str,
@@ -721,7 +725,8 @@ def enqueue_alert(db: sqlite3.Connection, *, alert_id: str, watch_id: str,
                   return_date: str, airline: str | None, stops: int | None,
                   booking_url: str | None, message_text: str,
                   origin: str | None = None,
-                  destination: str | None = None) -> tuple[str, str]:
+                  destination: str | None = None,
+                  outbound_hours: str | None = None) -> tuple[str, str]:
     """Durably queue an alert as pending.
 
     Idempotent on alert_id. An existing week re-arms to pending as a new
@@ -740,11 +745,12 @@ def enqueue_alert(db: sqlite3.Connection, *, alert_id: str, watch_id: str,
                (alert_id, watch_id, fingerprint, origin, destination, price_usd,
                 depart_date, return_date, airline, stops, booking_url,
                 message_text, state, handoff_count, last_price_usd,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)""",
+                created_at, updated_at, outbound_hours)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?,
+                       ?)""",
             (alert_id, watch_id, fingerprint, origin, destination, price_usd,
              depart_date, return_date, airline, stops, booking_url, message_text,
-             price_usd, now, now))
+             price_usd, now, now, outbound_hours))
         db.commit()
         return alert_id, "inserted"
     baseline = row["last_price_usd"] if row["last_price_usd"] is not None \
@@ -776,11 +782,11 @@ def enqueue_alert(db: sqlite3.Connection, *, alert_id: str, watch_id: str,
                price_usd=?, booking_url=?, message_text=?,
                last_price_usd=?, handoff_count=0, prepared_slot=NULL,
                prepared_at=NULL, unknown_count=0, confirmed_by=NULL,
-               event_no=event_no + 1, updated_at=?
+               event_no=event_no + 1, updated_at=?, outbound_hours=?
            WHERE alert_id=?""",
         (fingerprint, origin, destination, depart_date, return_date,
          airline, stops, price_usd, booking_url, message_text,
-         price_usd, now, alert_id))
+         price_usd, now, outbound_hours, alert_id))
     db.commit()
     return alert_id, "rearmed"
 
@@ -1467,15 +1473,16 @@ def retire_cell(db: sqlite3.Connection, cell_id: int) -> None:
 def queue_trigger(db: sqlite3.Connection, *, kind: str, group_id: str,
                   depart_week: str, depart_date: str, duration: int,
                   price_usd: float, fingerprint: str | None,
-                  slot: int) -> int | None:
-    """Queue a burst trigger. Deduped per (kind, group, week) per UTC day."""
+                  slot: int, window_name: str | None = None) -> int | None:
+    """Queue a burst trigger. Deduped per (kind, group, week) per UTC day.
+    ``window_name`` is the window the triggering fare came from."""
     cur = db.execute(
         """INSERT OR IGNORE INTO triggers
            (kind, group_id, depart_week, depart_date, duration, price_usd,
-            fingerprint, day, created_slot, created_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')""",
+            fingerprint, day, created_slot, created_at, status, window_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
         (kind, group_id, depart_week, depart_date, duration, price_usd,
-         fingerprint, today_str(), slot, utcnow_iso()))
+         fingerprint, today_str(), slot, utcnow_iso(), window_name))
     db.commit()
     return cur.lastrowid or None
 

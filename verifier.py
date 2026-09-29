@@ -135,8 +135,7 @@ def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | Non
     rows = poller.narrow_query(
         q_from, q_to, depart, return_,
         _cfg_for(watch, alert_row["origin"], alert_row["destination"],
-                 (store.outbound_hours_for(db, alert_row["fingerprint"])
-                  if db is not None else None)),
+                 alert_row.get("outbound_hours")),
         top_n=3, attempt_category="retry_reserve")
     if not rows:
         return "unknown", None

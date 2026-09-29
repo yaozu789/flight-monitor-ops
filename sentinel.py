@@ -217,6 +217,16 @@ def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
 
 
 
+def window_on(group_cfg, depart_date: str, day: date) -> str | None:
+    """Name of the window that held *depart_date* on *day* (the day a fare
+    was seen), or None."""
+    offset = (date.fromisoformat(depart_date) - day).days
+    for win in (group_cfg or {}).get("windows") or []:
+        if win["lo"] <= offset <= win["hi"]:
+            return win["name"]
+    return None
+
+
 def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
     return (today_d + timedelta(days=int(win["lo"])),
             today_d + timedelta(days=int(win["hi"])))
@@ -571,7 +581,8 @@ def _queue_drop_trigger(db, cell: dict, price: float, slot: int) -> bool:
         db, kind="drop", group_id=cell["group_id"],
         depart_week=store.depart_week(cell["depart_date"]),
         depart_date=cell["depart_date"], duration=cell["duration"],
-        price_usd=price, fingerprint=None, slot=slot)
+        price_usd=price, fingerprint=None, slot=slot,
+        window_name=cell.get("window_name"))
     # queue_trigger's return value is unreliable on dedup hits (stale
     # lastrowid from INSERT OR IGNORE), so count actual inserts instead.
     return db.total_changes > before
@@ -774,8 +785,10 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             depart_date = deal["depart_date"]
             duration = deal["duration"]
             cap = deal.get("cap")
+            window_name = deal.get("window_name")
         else:
             watch_id, fingerprint, price_usd, depart_date, duration, cap = deal
+            window_name = None
         if cap is None:
             continue
         if store.has_under_cap_before(db, fingerprint, cap, run_start):
@@ -785,7 +798,8 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             db, kind="under_cap", group_id=watch_id,
             depart_week=store.depart_week(depart_date),
             depart_date=depart_date, duration=duration,
-            price_usd=price_usd, fingerprint=fingerprint, slot=slot)
+            price_usd=price_usd, fingerprint=fingerprint, slot=slot,
+            window_name=window_name)
         if db.total_changes > before:
             queued += 1
     return queued
@@ -845,9 +859,14 @@ def _trigger_window(trigger, group_cfg):
         return None
     queued = _parse_ts(trigger["created_at"]).date()
     dep = date.fromisoformat(trigger["depart_date"])
+    # The window the triggering fare came from, when recorded; otherwise
+    # the window that held the departure on the day it was queued.
+    named = trigger.get("window_name")
     for win in group_cfg["windows"]:
+        if named is not None and win["name"] != named:
+            continue
         start, end = _window_bounds(win, queued)
-        if start <= dep <= end:
+        if named is not None or start <= dep <= end:
             return {"name": win["name"], "start": start, "end": end,
                     "weekdays": {int(w) for w in win.get("weekdays") or []},
                     "return_weekday": win.get("return_weekday")}
