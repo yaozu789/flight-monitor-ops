@@ -202,6 +202,21 @@ def _fixed_return_nights(win: dict | None, d: date) -> int | None:
     return (int(win["return_weekday"]) - d.weekday()) % 7 or 7
 
 
+def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
+    """The outbound departure-time limit ("HH-HH") that the departure's OWN
+    window sets for its weekday, or None (unknown window, or a window with
+    no limit that day). Callers name the window: sentinels from the cell,
+    bursts from their trigger. Rechecks reuse the limit stored with the
+    fare (``observations.outbound_hours``)."""
+    wins = (group_cfg or {}).get("windows") or []
+    own = next((w for w in wins if w["name"] == window_name), None)
+    if own is None:
+        return None
+    wd = date.fromisoformat(depart_date).weekday()
+    return (own.get("depart_hours") or {}).get(wd)
+
+
+
 def _window_bounds(win: dict, today_d: date) -> tuple[date, date]:
     return (today_d + timedelta(days=int(win["lo"])),
             today_d + timedelta(days=int(win["hi"])))
@@ -413,6 +428,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
                 "duration= kwargs")
 
     spent_before = guard.spent_run()
+    hours = _outbound_hours(group_cfg, (cell or {}).get("window_name"),
+                            depart_date)
     origin = ",".join(group_cfg["origins"])
     destination = ",".join(group_cfg["destinations"])
     return_date = (date.fromisoformat(depart_date)
@@ -420,6 +437,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
     cfg = {"origins": list(group_cfg["origins"]),
            "destinations": list(group_cfg["destinations"]),
            "stops": [0, 1], "seat": "economy", "pax": {"adults": 1}}
+    if hours:
+        cfg["outbound_hours"] = hours
     window_name = cell.get("window_name") if cell is not None else None
 
     def _log(outcome):
@@ -452,7 +471,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
         if rows:
             normed = [_normalize_row(r, depart_date, return_date)
                       for r in rows]
-            normed = [r for r in normed if r["price_usd"] is not None]
+            normed = [dict(r, outbound_hours=hours, window_name=window_name)
+                      for r in normed if r["price_usd"] is not None]
             if normed and run_start is not None:
                 store.save_observations(db, group_id, normed, run_start)
             prices = [r["price_usd"] for r in normed]
@@ -551,7 +571,8 @@ def _queue_drop_trigger(db, cell: dict, price: float, slot: int) -> bool:
         db, kind="drop", group_id=cell["group_id"],
         depart_week=store.depart_week(cell["depart_date"]),
         depart_date=cell["depart_date"], duration=cell["duration"],
-        price_usd=price, fingerprint=None, slot=slot)
+        price_usd=price, fingerprint=None, slot=slot,
+        window_name=cell.get("window_name"))
     # queue_trigger's return value is unreliable on dedup hits (stale
     # lastrowid from INSERT OR IGNORE), so count actual inserts instead.
     return db.total_changes > before
@@ -754,8 +775,10 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             depart_date = deal["depart_date"]
             duration = deal["duration"]
             cap = deal.get("cap")
+            window_name = deal.get("window_name")
         else:
             watch_id, fingerprint, price_usd, depart_date, duration, cap = deal
+            window_name = None
         if cap is None:
             continue
         if store.has_under_cap_before(db, fingerprint, cap, run_start):
@@ -765,7 +788,8 @@ def detect_under_cap_triggers(db, verified_deals, run_start, slot) -> int:
             db, kind="under_cap", group_id=watch_id,
             depart_week=store.depart_week(depart_date),
             depart_date=depart_date, duration=duration,
-            price_usd=price_usd, fingerprint=fingerprint, slot=slot)
+            price_usd=price_usd, fingerprint=fingerprint, slot=slot,
+            window_name=window_name)
         if db.total_changes > before:
             queued += 1
     return queued
@@ -825,10 +849,15 @@ def _trigger_window(trigger, group_cfg):
         return None
     queued = _parse_ts(trigger["created_at"]).date()
     dep = date.fromisoformat(trigger["depart_date"])
+    # The window the triggering fare came from, when recorded; otherwise
+    # the window that held the departure on the day it was queued.
+    named = trigger.get("window_name")
     for win in group_cfg["windows"]:
+        if named is not None and win["name"] != named:
+            continue
         start, end = _window_bounds(win, queued)
-        if start <= dep <= end:
-            return {"start": start, "end": end,
+        if named is not None or start <= dep <= end:
+            return {"name": win["name"], "start": start, "end": end,
                     "weekdays": {int(w) for w in win.get("weekdays") or []},
                     "return_weekday": win.get("return_weekday")}
     return None
@@ -885,8 +914,13 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
     run_spent_entry = guard.spent_run()
     group_id = trigger["group_id"]
 
+    trig_win = _trigger_window(trigger, group_cfg)
+
     def _one_off(d_date: str, dur: int, category: str):
-        cell = {"id": None, "depart_date": d_date, "duration": dur}
+        # The trigger's window (bounds frozen when it was queued) names the
+        # window for every step, so its departure-time limit carries over.
+        cell = {"id": None, "depart_date": d_date, "duration": dur,
+                "window_name": trig_win["name"] if trig_win else None}
         return check_cell(db, cell, guard, group_id, group_cfg,
                           top_n=SENTINEL_TOP_N, category=category,
                           slot=slot, run_start=run_start)
@@ -901,8 +935,7 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                            depart_week=trigger["depart_week"],
                            attempts=total, status=status)
 
-    steps = list(_burst_steps(trigger, _durations(group_cfg),
-                              _trigger_window(trigger, group_cfg)))
+    steps = list(_burst_steps(trigger, _durations(group_cfg), trig_win))
     # Resuming on a later UTC day: recheck the trigger fare first, before
     # spending a new day's budget on a deal that may already be gone.
     revalidated = prog.get("revalidated_at") or ""

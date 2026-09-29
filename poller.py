@@ -24,6 +24,7 @@ from datetime import date, timedelta
 from fli.core import (
     build_date_search_segments,
     build_flight_segments,
+    build_time_restrictions,
     parse_cabin_class,
     parse_max_stops,
     resolve_airports,
@@ -157,6 +158,12 @@ def narrow_query(origin: str, dest: str, depart: str, ret: str, watch: dict, *,
     d = resolve_airports(dest)
     segments, _ = build_flight_segments(
         origin=o, destination=d, departure_date=depart, return_date=ret)
+    # "outbound_hours" (e.g. "5-12" for a Saturday-morning departure)
+    # restricts only the OUTBOUND flight; fli's builder would apply it to
+    # both legs, so it is set on the first segment here.
+    if watch.get("outbound_hours"):
+        segments[0].time_restrictions = build_time_restrictions(
+            departure_window=watch["outbound_hours"])
     filters = FlightSearchFilters(
         trip_type=TripType.ROUND_TRIP, passenger_info=pax,
         flight_segments=segments, stops=stops, seat_type=seat)

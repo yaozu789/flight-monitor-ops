@@ -445,11 +445,30 @@ def _window_cfg(name: str, spec: dict) -> dict:
         days.append(spec["return_weekday"])
     if any(not 0 <= int(d) <= 6 for d in days):
         raise ValueError(f"window {name!r}: weekdays run 0 (Mon) .. 6 (Sun)")
+    # depart_hours: {weekday: "HH-HH"} limits the OUTBOUND departure time
+    # on that weekday (e.g. {5: "5-12"} = Saturday morning only).
+    depart_hours = {}
+    for day, hours in (spec.get("depart_hours") or {}).items():
+        day = int(day)
+        if day not in {int(d) for d in spec.get("weekdays") or []}:
+            raise ValueError(f"window {name!r}: depart_hours day {day} is "
+                             "not one of its weekdays")
+        from fli.core.parsers import parse_time_range
+        parse_time_range(str(hours))  # raises on a malformed range
+        first, last = (int(x) for x in str(hours).split("-"))
+        # fli silently swaps a reversed range and rejects 24: require an
+        # explicit earliest < latest within 0..23 (hours are inclusive).
+        if not 0 <= first < last <= 23:
+            raise ValueError(f"window {name!r}: depart_hours {hours!r} must "
+                             "be 'earliest-latest' with 0 <= earliest < "
+                             "latest <= 23")
+        depart_hours[day] = str(hours)
     return {"name": name, "lo": lo, "hi": hi,
             "refresh_hours": int(spec["refresh_hours"]),
             "step_days": spec.get("step_days"),
             "weekdays": spec.get("weekdays"),
-            "return_weekday": spec.get("return_weekday")}
+            "return_weekday": spec.get("return_weekday"),
+            "depart_hours": depart_hours}
 
 
 def group_cfg_for(w: dict) -> dict:
@@ -641,7 +660,10 @@ def _verify_each(db, targets, guard, since_iso, new_ids, verified_deals,
                 "watch_id": w["id"], "fingerprint": c["fingerprint"],
                 "price_usd": conf["price_usd"],
                 "depart_date": conf["depart_date"], "duration": duration,
-                "cap": w["absolute_cap_usd"]})
+                "cap": w["absolute_cap_usd"],
+                # the window whose check found the fare (stored with the
+                # observation; burst steps get its limits)
+                "window_name": c.get("window_name")})
 
 
 def collect_watch_ids(watches) -> set[str]:
