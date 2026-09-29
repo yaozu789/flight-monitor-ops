@@ -203,18 +203,26 @@ def _fixed_return_nights(win: dict | None, d: date) -> int | None:
 
 
 def _outbound_hours(group_cfg, window_name, depart_date) -> str | None:
-    """The outbound departure-time limit ("HH-HH") for this departure's
-    weekday, or None. Its own window's ``depart_hours`` wins; otherwise any
-    window of the watch that sets hours for that weekday. This never
-    depends on today's window bounds, so burst neighbours, resumed bursts
-    and verify/retry rechecks all get the same limit as the sentinel."""
+    """The outbound departure-time limit ("HH-HH") that the departure's OWN
+    window sets for its weekday, or None (unknown window, or a window with
+    no limit that day). Callers name the window: sentinels from the cell,
+    bursts from their trigger, rechecks via ``window_seen_in``."""
     wins = (group_cfg or {}).get("windows") or []
-    wd = date.fromisoformat(depart_date).weekday()
     own = next((w for w in wins if w["name"] == window_name), None)
-    for win in ([own] if own else []) + wins:
-        hours = (win.get("depart_hours") or {}).get(wd)
-        if hours:
-            return hours
+    if own is None:
+        return None
+    wd = date.fromisoformat(depart_date).weekday()
+    return (own.get("depart_hours") or {}).get(wd)
+
+
+def window_seen_in(group_cfg, depart_date, seen_day: date) -> str | None:
+    """Name of the window a departure fell in on the day it was seen (a
+    recheck uses the observation's day, not today, so the answer does not
+    drift as the window moves)."""
+    offset = (date.fromisoformat(depart_date) - seen_day).days
+    for win in (group_cfg or {}).get("windows") or []:
+        if win["lo"] <= offset <= win["hi"]:
+            return win["name"]
     return None
 
 
@@ -848,7 +856,7 @@ def _trigger_window(trigger, group_cfg):
     for win in group_cfg["windows"]:
         start, end = _window_bounds(win, queued)
         if start <= dep <= end:
-            return {"start": start, "end": end,
+            return {"name": win["name"], "start": start, "end": end,
                     "weekdays": {int(w) for w in win.get("weekdays") or []},
                     "return_weekday": win.get("return_weekday")}
     return None
@@ -905,8 +913,13 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
     run_spent_entry = guard.spent_run()
     group_id = trigger["group_id"]
 
+    trig_win = _trigger_window(trigger, group_cfg)
+
     def _one_off(d_date: str, dur: int, category: str):
-        cell = {"id": None, "depart_date": d_date, "duration": dur}
+        # The trigger's window (bounds frozen when it was queued) names the
+        # window for every step, so its departure-time limit carries over.
+        cell = {"id": None, "depart_date": d_date, "duration": dur,
+                "window_name": trig_win["name"] if trig_win else None}
         return check_cell(db, cell, guard, group_id, group_cfg,
                           top_n=SENTINEL_TOP_N, category=category,
                           slot=slot, run_start=run_start)
@@ -921,8 +934,7 @@ def execute_burst(db, trigger, guard, group_cfg, slot, run_start=None,
                            depart_week=trigger["depart_week"],
                            attempts=total, status=status)
 
-    steps = list(_burst_steps(trigger, _durations(group_cfg),
-                              _trigger_window(trigger, group_cfg)))
+    steps = list(_burst_steps(trigger, _durations(group_cfg), trig_win))
     # Resuming on a later UTC day: recheck the trigger fare first, before
     # spending a new day's budget on a deal that may already be gone.
     revalidated = prog.get("revalidated_at") or ""

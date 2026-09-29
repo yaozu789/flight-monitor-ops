@@ -1453,15 +1453,29 @@ class TestNamedWindows(SentinelTestBase):
                                       "return_weekday": 6,
                                       "refresh_hours": 48,
                                       "depart_hours": {5: "5-11"}}}}
-        sat = date.fromisoformat(TODAY) + timedelta(days=60)  # off-window
+        # A fare seen 16 days before a Saturday was in the near window:
+        # its recheck keeps the limit even when run weeks later.
+        sat = date.fromisoformat(TODAY) + timedelta(days=60)
         sat += timedelta(days=(5 - sat.weekday()) % 7)
-        cfg = verifier._cfg_for(watch, "SFO", "LAX", sat.isoformat())
+        seen = (sat - timedelta(days=16)).isoformat() + "T10:00:00+00:00"
+        cfg = verifier._cfg_for(watch, "SFO", "LAX", sat.isoformat(), seen)
         self.assertEqual(cfg.get("outbound_hours"), "5-11")
         self.assertIsNone(verifier._cfg_for(
-            watch, "SFO", "LAX", (sat - timedelta(days=1)).isoformat()
+            watch, "SFO", "LAX", (sat - timedelta(days=1)).isoformat(), seen
         ).get("outbound_hours"))
+        # A burst step names its trigger's window.
         self.assertEqual(sentinel._outbound_hours(
-            run.group_cfg_for(watch), None, sat.isoformat()), "5-11")
+            run.group_cfg_for(watch), "near", sat.isoformat()), "5-11")
+        # Another window with no limit that day never borrows one.
+        two = dict(watch, nights=[1, 2], windows=dict(
+            watch["windows"], far={"months": [3, 9], "refresh_hours": 72}))
+        gcfg = run.group_cfg_for(two)
+        self.assertIsNone(sentinel._outbound_hours(gcfg, "far",
+                                                   sat.isoformat()))
+        far_seen = (sat - timedelta(days=120)).isoformat() + "T10:00:00+00:00"
+        self.assertIsNone(verifier._cfg_for(
+            two, "SFO", "LAX", sat.isoformat(), far_seen
+        ).get("outbound_hours"))
         # depart_hours must not disturb the window's own day bounds.
         win = run.group_cfg_for(watch)["windows"][0]
         self.assertEqual((win["lo"], win["hi"]), (7, 42))

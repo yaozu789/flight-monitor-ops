@@ -34,7 +34,8 @@ def _grouped_endpoints(watch: dict, origin, destination) -> tuple[str, str]:
 
 
 def _cfg_for(watch: dict, origin: str | None, destination: str | None,
-             depart_date: str | None = None) -> dict:
+             depart_date: str | None = None, seen_at: str | None = None
+             ) -> dict:
     cfg = {
         "origins": [origin],
         "destinations": [destination],
@@ -45,11 +46,14 @@ def _cfg_for(watch: dict, origin: str | None, destination: str | None,
     # A recheck searches with the same outbound departure-time limit as the
     # sentinel that found the fare (e.g. Saturday morning), or fli could
     # expand a different set of outbound flights and miss the candidate.
-    if depart_date and watch.get("windows"):
+    if depart_date and seen_at and watch.get("windows"):
         import run
         import sentinel
-        hours = sentinel._outbound_hours(run.group_cfg_for(watch), None,
-                                         depart_date)
+        from datetime import date as _date
+        gcfg = run.group_cfg_for(watch)
+        win = sentinel.window_seen_in(gcfg, depart_date,
+                                      _date.fromisoformat(seen_at[:10]))
+        hours = sentinel._outbound_hours(gcfg, win, depart_date)
         if hours:
             cfg["outbound_hours"] = hours
     return cfg
@@ -108,7 +112,7 @@ def verify(db, watch, candidate, guard, *, top_n=3) -> tuple[bool, dict | None]:
     rows = poller.narrow_query(
         q_from, q_to, depart, return_,
         _cfg_for(watch, candidate["origin"], candidate["destination"],
-                 depart),
+                 depart, candidate.get("observed_at")),
         top_n=top_n, attempt_category="verify")
     if not rows:
         return False, None  # unknown -- do NOT alert
@@ -140,7 +144,7 @@ def recheck_alert_detailed(alert_row, db, watch, guard) -> tuple[str, dict | Non
     rows = poller.narrow_query(
         q_from, q_to, depart, return_,
         _cfg_for(watch, alert_row["origin"], alert_row["destination"],
-                 depart),
+                 depart, alert_row.get("created_at")),
         top_n=3, attempt_category="retry_reserve")
     if not rows:
         return "unknown", None
