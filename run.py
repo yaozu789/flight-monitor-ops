@@ -522,10 +522,17 @@ def group_cfg_for(w: dict) -> dict:
                         | {(int(x["return_weekday"]) - int(d)) % 7 or 7
                            for x in windows if x["return_weekday"] is not None
                            for d in x["weekdays"]})
+        explore = sorted({int(n) for n in w.get("explore_nights") or []}
+                         - set(nights))
+        per_day = int(w.get("explore_per_day", 0) or 0)
+        if per_day < 0 or any(n <= 0 for n in explore):
+            raise ValueError(f"watch {w['id']!r}: explore_nights must be "
+                             "positive and explore_per_day >= 0")
         return {"origins": w["origins"], "destinations": w["destinations"],
                 "id": w["id"], "alert_mode": budget.alert_mode(w),
                 "absolute_cap_usd": w.get("absolute_cap_usd"),
                 "max_alert_usd": w.get("max_alert_usd"),
+                "explore_nights": explore, "explore_per_day": per_day,
                 "windows": windows, "nights": nights,
                 "window_days": (min(x["lo"] for x in windows),
                                 max(x["hi"] for x in windows)),

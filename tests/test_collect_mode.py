@@ -520,6 +520,82 @@ class StageAConfigTests(unittest.TestCase):
         self.assertLess(demand, 0.9 * budget.DAILY_CEILING)
 
 
+class ExploreTests(unittest.TestCase):
+    """Trip-length exploration: extra stays on the window's dates, only from
+    leftover budget (no sentinel due), cheap checks, capped per day; off
+    unless a watch sets explore_nights and explore_per_day."""
+
+    WATCH = {"id": "japan", "origins": ["SFO"], "destinations": ["NRT"],
+             "absolute_cap_usd": 500, "alert_mode": "collect", "nights": [28],
+             "explore_nights": [14, 21, 28], "explore_per_day": 10,
+             "windows": {"near": {"days": [7, 42], "step_days": 2,
+                                  "refresh_hours": 48},
+                         "far": {"months": [3, 9], "refresh_hours": 72}}}
+
+    def test_grid_caps_and_off_by_default(self):
+        db = fresh_db(self)
+        cfg = {"japan": fm_run.group_cfg_for(self.WATCH)}
+        self.assertEqual(cfg["japan"]["explore_nights"], [14, 21])  # 28 is main
+        fm_sentinel.ensure_background_grid(db, cfg)
+        rows = db.execute(
+            "SELECT window_name, duration, refresh_hours, COUNT(*) AS n "
+            "FROM cells WHERE role = 'background' AND active = 1 "
+            "GROUP BY 1, 2, 3").fetchall()
+        got = {(r["window_name"], r["duration"], r["refresh_hours"]): r["n"]
+               for r in rows}
+        self.assertEqual(got[("near", 14, 144)], 18)
+        self.assertEqual(got[("near", 21, 144)], 18)
+        self.assertTrue(24 <= got[("far", 14, 216)] <= 27)
+        self.assertEqual(budget.effective_category_caps([self.WATCH])
+                         ["background"], 10)
+        off = dict(self.WATCH, explore_per_day=0)
+        fm_sentinel.ensure_background_grid(
+            db, {"japan": fm_run.group_cfg_for(off)})
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) AS c FROM cells WHERE role = 'background' AND "
+            "active = 1").fetchone()["c"], 0)
+        self.assertEqual(budget.effective_category_caps([off])["background"], 0)
+
+    def test_explores_only_when_nothing_is_due_within_its_cap(self):
+        db = fresh_db(self)
+        cfg = {"japan": fm_run.group_cfg_for(self.WATCH)}
+        fm_sentinel.mint_sentinels(db, cfg)
+        fm_sentinel.ensure_background_grid(db, cfg)
+        slot = store.slot_id()
+        guard = BudgetGuard(db, per_run_max=10_000, verify_reserve=0,
+                            category_caps=budget.effective_category_caps(
+                                [self.WATCH]))
+        calls = []
+
+        def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
+                       category, slot, run_start=None):
+            calls.append((cell["role"], category, top_n))
+            guard_.reserve(category)
+            guard_.reserve(category)
+            store.record_cell_check(db_, cell["id"], slot, True, 900.0)
+            return (900.0, 2)
+
+        def run_once(allowance):
+            calls.clear()
+            with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
+                    mock.patch.object(fm_sentinel, "per_run_allowance",
+                                      lambda *a, **k: allowance):
+                fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
+            return list(calls)
+
+        # Sentinels are due: the run spends everything on them.
+        first = run_once(6)
+        self.assertEqual({c[0] for c in first}, {"sentinel"})
+        # Nothing due: leftover goes to cheap exploration checks...
+        db.execute("UPDATE cells SET last_checked_slot=? "
+                   "WHERE role = 'sentinel'", (slot,))
+        db.commit()
+        second = run_once(40)
+        self.assertEqual(set(second), {("background", "background", 1)})
+        # ...but never past the daily explore cap (10 attempts = 5 checks).
+        self.assertEqual(guard.spent_today("background"), 10)
+
+
 class Phase2ConfigTests(unittest.TestCase):
     """The Phase 2 destinations are written in watches.yaml but switched
     off; switched on, all seven fit the spec's budget."""
