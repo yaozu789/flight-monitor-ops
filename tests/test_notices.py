@@ -96,12 +96,17 @@ class NoticeTests(unittest.TestCase):
     def test_hold_only_after_history_and_alerts_live_only_for_relative(self):
         self._prepare(report(passed=False, history=False, throttles=False))
         self.assertEqual(notices.claim(self.db, 10), [])
-        self._prepare(report(passed=False, throttles=False, routes={
+        rep = report(passed=False, throttles=False, routes={
             "japan": {"armed": 3, "routes": 18},
-            "nyc": {"armed": 5, "routes": 18}}))
-        keys = [n["key"] for n in notices.claim(self.db, 11)]
-        self.assertEqual(keys, ["alerts_live:japan",
-                                "gate_hold:150:no_throttles"])
+            "nyc": {"armed": 5, "routes": 18}})
+        rep["gate"]["checks"]["refresh_p95"] = False
+        self._prepare(rep)
+        got = notices.claim(self.db, 11)
+        self.assertEqual([n["key"] for n in got],
+                         ["alerts_live:japan", "gate_hold:150"])
+        hold = got[1]["message"]  # one notice naming both failing checks
+        self.assertIn("throttled", hold)
+        self.assertIn("not being rechecked in time", hold)
 
     def test_unarmed_run_carries_nothing(self):
         self._prepare(report())

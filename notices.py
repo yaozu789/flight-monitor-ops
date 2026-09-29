@@ -62,13 +62,15 @@ def prepare(db, watches, guard, now: datetime | None = None) -> None:
              "Ask Claude to prepare the switch; nothing changes until you "
              "approve it.")
     elif checks.get("history_days"):
-        for check, why in HOLD_CHECKS.items():
-            if not checks.get(check, True):
-                _add(db, f"gate_hold:{ceiling}:{check}",
-                     f"Flight monitor: hold at {ceiling} requests/day -- "
-                     f"{why} in the last {report['days']} days. No action "
-                     "needed unless it keeps happening; `run.py coverage` "
-                     "has the details.")
+        # One hold notice per stage, naming every failing check.
+        reasons = [why for check, why in HOLD_CHECKS.items()
+                   if not checks.get(check, True)]
+        if reasons:
+            _add(db, f"gate_hold:{ceiling}",
+                 f"Flight monitor: hold at {ceiling} requests/day -- "
+                 f"{'; '.join(reasons)} (last {report['days']} days). No "
+                 "action needed unless it keeps happening; `run.py "
+                 "coverage` has the details.")
     by_id = {w["id"]: w for w in watches}
     for wid, r in (report.get("relative_routes") or {}).items():
         if (r["armed"] and by_id.get(wid, {}).get("alert_mode")
