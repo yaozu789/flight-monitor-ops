@@ -464,7 +464,8 @@ def check_cell(db, cell, guard, group_id, group_cfg, *, top_n, category, slot,
         store.log_query(db, slot=slot, group_id=group_id,
                         window_name=window_name, category=category,
                         outcome=outcome,
-                        ceiling=getattr(guard, "daily_ceiling", None))
+                        ceiling=getattr(guard, "daily_ceiling", None),
+                        attempts=guard.spent_run() - spent_before)
 
     poller.LAST_OUTCOME = None
     outcome = None

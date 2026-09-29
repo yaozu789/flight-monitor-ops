@@ -660,19 +660,26 @@ class ExploreReviewTests(unittest.TestCase):
 
         def fake_check(db_, cell, guard_, group_id, group_cfg, *, top_n,
                        category, slot, run_start=None):
+            # A retry/redirect: this check really cost 3 attempts.
             store.log_query(db_, slot=slot, group_id=group_id,
                             window_name=cell.get("window_name"),
-                            category=category, outcome="ok")
+                            category=category, outcome="ok", attempts=3)
             store.record_cell_check(db_, cell["id"], slot, True, 900.0)
-            return (900.0, 2)
+            return (900.0, 3)
 
         with mock.patch.object(fm_sentinel, "check_cell", fake_check), \
                 mock.patch.object(fm_sentinel, "per_run_allowance",
                                   lambda *a, **k: 80):
             for _ in range(3):
                 fm_sentinel.collect(db, guard, cfg, slot, store.utcnow_iso())
-        self.assertEqual(store.explore_spent_today(db, "hkg"), 4)
-        self.assertEqual(store.explore_spent_today(db, "japan"), 10)
+        # Spend stops at or just under each watch's allowance counted in
+        # REAL attempts (a check starts only if 2 attempts still fit).
+        real = {r["group_id"]: r["n"] for r in db.execute(
+            "SELECT group_id, SUM(attempts) AS n FROM query_log "
+            "WHERE category = 'background' GROUP BY group_id")}
+        # At most one check's retry overrun past the allowance.
+        self.assertTrue(3 <= real["hkg"] <= 4 + 1, real)
+        self.assertTrue(9 <= real["japan"] <= 10 + 1, real)
 
     def test_legacy_sentinels_before_exploration_in_mixed_config(self):
         db = fresh_db(self)
