@@ -162,12 +162,15 @@ class BudgetGuard:
 
     def __init__(self, db, *, per_run_max=PER_RUN_MAX,
                  daily_ceiling=DAILY_CEILING, category_caps=None, day=None,
-                 verify_reserve=VERIFY_RESERVE):
+                 verify_reserve=VERIFY_RESERVE, busy_timeout_ms=2000):
         self._db = db
         self._db_path = self._resolve_db_path(db)
         self._per_run_max = per_run_max
         self._daily_ceiling = daily_ceiling
         self._verify_reserve = int(verify_reserve)
+        # How long reserve() waits for the database lock. 2 s suits the
+        # monitor (one request at a time); stress tests pass a longer wait.
+        self._busy_timeout_ms = int(busy_timeout_ms)
         self._category_caps = (dict(CATEGORY_CAPS) if category_caps is None
                                else dict(category_caps))
         # A fixed day only when given (tests); otherwise the UTC day is
@@ -230,7 +233,7 @@ class BudgetGuard:
         if self._reserve_db is None:
             if self._db_path:
                 conn = store.get_db(self._db_path)
-                conn.execute("PRAGMA busy_timeout=2000;")
+                conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms};")
                 self._reserve_db = conn
                 self._reserve_owns_conn = True
             else:

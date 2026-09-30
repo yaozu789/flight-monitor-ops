@@ -77,7 +77,12 @@ class BudgetTransportTest(unittest.TestCase):
                 # No category caps: the DAILY ceiling is what must bind.
                 # Category "verify" is exempt from the v3 verify reserve,
                 # so the ceiling is proved atomic without interference.
-                g = budget.BudgetGuard(conn, day=self.day, category_caps={})
+                # A long lock wait: 151 writers queue on one database, and
+                # on a slow CI runner the default 2 s wait let a few give up
+                # with "database is locked" (147 results instead of 151).
+                # This test is about the ceiling being atomic, not timing.
+                g = budget.BudgetGuard(conn, day=self.day, category_caps={},
+                                       busy_timeout_ms=120_000)
                 try:
                     g.reserve("verify")
                     outcome = "ok"
