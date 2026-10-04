@@ -12,7 +12,7 @@ defaults:
   currency: USD
   run_every_minutes: 30         # must match the Muse schedule; drives budget pacing
   alert_mode: collect           # a new watch only collects until switched on
-  daily_ceiling: 150            # Google requests/day; the budget step (150 -> 225 -> 300)
+  daily_ceiling: 225            # Google requests/day; the budget step (150 -> 225 -> 300)
 
 # Named departure windows (redesign, docs: Redesign_spec.md). A watch with
 # `windows:` lists its exact trip lengths in `nights:` and ignores the
@@ -58,31 +58,28 @@ watches:
     windows:
       near: {days: [7, 42], step_days: 2, refresh_hours: 48}
 
-  # ---- Phase 2: written, switched OFF (enabled: false). Each budget step
-  # (150 -> 225 -> 300/day) switches some on, after `run.py coverage` passes
-  # and Yaozu approves. Caps are unused in collect mode (kept for the schema).
-  # 225/day step: la, sd, hkg. 300/day step: shanghai, beijing.
+  # ---- Phase 2. Each budget step (150 -> 225 -> 300/day) switches some on,
+  # after `run.py coverage` passes and Yaozu approves. Caps are unused outside
+  # cap mode (kept for the schema).
+  # 225/day step (2026-10-03): la, sd, hkg ON. 300/day step: shanghai, beijing.
   - id: la
-    enabled: false
     destinations: [LAX, BUR, LGB, SNA, ONT]
     absolute_cap_usd: 120
-    alert_mode: collect
+    alert_mode: relative         # alerts start by themselves as routes arm
     windows:                     # weekend: Fri any time or Sat morning, back Sun
       near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
              depart_hours: {5: "5-11"}, refresh_hours: 48}
   - id: sd
-    enabled: false
     destinations: [SAN]
     absolute_cap_usd: 150
-    alert_mode: collect
+    alert_mode: relative         # alerts start by themselves as routes arm
     windows:
       near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
              depart_hours: {5: "5-11"}, refresh_hours: 48}
   - id: hkg
-    enabled: false
     destinations: [HKG]
     absolute_cap_usd: 500
-    alert_mode: collect
+    alert_mode: relative         # alerts start by themselves as routes arm
     nights: [28]
     windows:
       near: {days: [7, 42], step_days: 2, refresh_hours: 48}

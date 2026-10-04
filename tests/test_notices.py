@@ -139,7 +139,7 @@ class CeilingTests(unittest.TestCase):
 
     def test_shipped_config_ceiling(self):
         _, watches = fm_run.load_config()
-        self.assertEqual(budget.daily_ceiling(watches), 150)
+        self.assertEqual(budget.daily_ceiling(watches), 225)
 
 
 if __name__ == "__main__":
