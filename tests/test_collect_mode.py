@@ -503,28 +503,27 @@ class DueOnlyReviewTests(_DueOnlyBase, unittest.TestCase):
 
 
 class StageAConfigTests(unittest.TestCase):
-    def test_stage_a_config(self):
-        """The shipped watches.yaml: Japan + NYC on relative alerts (each
-        route turns itself on once armed), 71.3 sentinel attempts/day at
-        the refresh targets, inside the mixed-mode gate at the configured
-        150/day ceiling."""
+    def test_shipped_config(self):
+        """The shipped watches.yaml (225 stage, 2026-10-03): Japan, NYC,
+        LA, SD and HKG on relative alerts (each route turns itself on once
+        armed); demand at the refresh targets fits the mixed-mode gate at
+        the configured 225/day ceiling."""
         _, watches = fm_run.load_config()
-        self.assertEqual({w["id"] for w in watches}, {"japan", "nyc"})
+        self.assertEqual({w["id"] for w in watches},
+                         {"japan", "nyc", "la", "sd", "hkg"})
         self.assertTrue(all(w["alert_mode"] == "relative" for w in watches))
-        self.assertEqual(budget.daily_ceiling(watches), 150)
+        ceiling = budget.daily_ceiling(watches)
+        self.assertEqual(ceiling, 225)
         self.assertEqual(budget.effective_verify_reserve(watches), 24)
-        caps = budget.effective_category_caps(watches,
-                                              budget.daily_ceiling(watches))
-        self.assertEqual((caps["sentinel"], caps["background"]), (114, 0))
+        caps = budget.effective_category_caps(watches, ceiling)
+        self.assertEqual((caps["sentinel"], caps["background"]), (189, 0))
         db = fresh_db(self)
         cfg = {w["id"]: fm_run.group_cfg_for(w) for w in watches}
-        fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 9, 28))
-        demand = sum(r["refresh_hours"] and 2 * 24 / r["refresh_hours"]
-                     for r in db.execute(
-                         "SELECT refresh_hours FROM cells WHERE active=1"))
-        self.assertAlmostEqual(demand, 71.33, places=1)
-        self.assertLess(demand, 0.9 * (150 - 24 - 12))
-
+        fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 10, 4))
+        demand = sum(2 * 24 / r["refresh_hours"] for r in db.execute(
+            "SELECT refresh_hours FROM cells WHERE active=1"))
+        self.assertTrue(120 <= demand <= 132, demand)
+        self.assertLess(demand, 0.9 * (ceiling - 24 - 12))
 
 class ExploreTests(unittest.TestCase):
     """Trip-length exploration: extra stays on the window's dates, only from
@@ -734,9 +733,10 @@ class Phase2ConfigTests(unittest.TestCase):
 
     def test_disabled_watches_are_not_loaded(self):
         _, watches = fm_run.load_config()
-        self.assertEqual({w["id"] for w in watches}, {"japan", "nyc"})
+        self.assertEqual({w["id"] for w in watches},
+                         {"japan", "nyc", "la", "sd", "hkg"})
         off = {w["id"] for w in self._all() if w.get("enabled") is False}
-        self.assertEqual(off, {"la", "sd", "hkg", "shanghai", "beijing"})
+        self.assertEqual(off, {"shanghai", "beijing"})
 
     def test_all_seven_parse_and_fit_the_300_stage(self):
         from datetime import date
@@ -778,8 +778,8 @@ class Phase2ConfigTests(unittest.TestCase):
         """A watch switched off after it alerted must not relay its queued
         alert on the next run."""
         db = fresh_db(self)
-        aid = _enqueue(db, "la", "old")
-        self.assertIn("la", fm_run.disabled_watch_ids())
+        aid = _enqueue(db, "shanghai", "old")
+        self.assertIn("shanghai", fm_run.disabled_watch_ids())
 
         def collect_nothing(db_, guard_, groups, slot, run_start, **kw):
             return {"attempts": 0, "bursts": [], "sentinels": 0,
