@@ -1073,8 +1073,14 @@ class RealFliShapePipelineTests(unittest.TestCase):
         guard = BudgetGuard(db)
         install_fake_transport(guard)
         self.addCleanup(uninstall_fake_transport)
+        # Real fli request building rejects past travel dates, so this one
+        # end-to-end test uses dates relative to today (a fixed DEP turned
+        # it into a time bomb once 2026-10-01 passed).
+        from datetime import date, timedelta
+        dep = date.today() + timedelta(days=30)
         rows = poller.narrow_query(
-            "SFO", "JFK", DEP, RET,
+            "SFO", "JFK", dep.isoformat(),
+            (dep + timedelta(days=7)).isoformat(),
             {"origins": ["SFO"], "destinations": ["JFK"], "stops": [0, 1],
              "seat": "economy", "pax": {"adults": 1}, "trip_days": (7, 7)},
             top_n=3, attempt_category="manual")

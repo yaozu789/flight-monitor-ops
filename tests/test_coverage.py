@@ -12,7 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -144,8 +144,11 @@ class PollerOutcomeTests(unittest.TestCase):
         with mock.patch.object(poller, "SearchFlights", client_cls), \
                 mock.patch.object(poller.time, "sleep", lambda s: None), \
                 mock.patch.object(poller, "_polite", lambda: None):
+            # fli's request builder rejects past dates: stay in the future.
+            dep = date.today() + timedelta(days=30)
             return poller.narrow_query(
-                "SFO", "JFK", "2026-11-01", "2026-11-08",
+                "SFO", "JFK", dep.isoformat(),
+                (dep + timedelta(days=7)).isoformat(),
                 {"origins": ["SFO"], "destinations": ["JFK"]},
                 top_n=1, require_guard=False)
 

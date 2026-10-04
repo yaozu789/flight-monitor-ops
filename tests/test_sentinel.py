@@ -1408,7 +1408,9 @@ class TestNamedWindows(SentinelTestBase):
 
         self.patch(sentinel, "narrow_query", fake_query)
         guard = self.guard()
-        sat = date.fromisoformat(TODAY) + timedelta(days=16)
+        # Relative to the real today: the poller call below goes through
+        # fli's request builder, which rejects past travel dates.
+        sat = date.today() + timedelta(days=16)
         sat += timedelta(days=(5 - sat.weekday()) % 7)
         fri = sat - timedelta(days=1)
         for d in (fri, sat):
