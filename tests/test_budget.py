@@ -8,6 +8,7 @@ Run from the project root, e.g.:
 The project root is put first on sys.path so ``import store`` resolves to
 the project's store.py.
 """
+from datetime import date, timedelta
 import os
 import shutil
 import subprocess
@@ -602,7 +603,10 @@ class BudgetV3Test(BudgetTransportTest):
         watch = {"origins": ["JFK"], "destinations": ["LHR"],
                  "max_stops": 0, "cabin": "economy"}
         with self.assertRaises(budget.BudgetExhausted) as cm:
-            poller.narrow_query("JFK", "LHR", "2026-12-01", "2026-12-08",
+            # fli's request builder rejects past dates: stay in the future.
+            dep = date.today() + timedelta(days=30)
+            poller.narrow_query("JFK", "LHR", dep.isoformat(),
+                                (dep + timedelta(days=7)).isoformat(),
                                 watch, top_n=3, attempt_category="sentinel")
         self.assertEqual(cm.exception.scope, "per_run")
         self.assertFalse(isinstance(cm.exception, Exception))
