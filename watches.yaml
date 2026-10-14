@@ -48,15 +48,15 @@ watches:
     alert_mode: relative         # alerts start by themselves as routes arm
     nights: [28]                 # about a month
     windows:
-      near: {days: [7, 42], step_days: 2, refresh_hours: 48}
-      far: {months: [3, 9], refresh_hours: 72}
+      near: {days: [7, 42], step_days: 2, refresh_hours: 72}
+      far: {months: [3, 9], refresh_hours: 120}
   - id: nyc
     destinations: [EWR, JFK, LGA]
     absolute_cap_usd: 250
     alert_mode: relative         # alerts start by themselves as routes arm
     nights: [7, 14]              # one or two weeks
     windows:
-      near: {days: [7, 42], step_days: 2, refresh_hours: 48}
+      near: {days: [7, 42], step_days: 2, refresh_hours: 72}
 
   # ---- Phase 2. Each budget step (150 -> 225 -> 300/day) switches some on,
   # after `run.py coverage` passes and Yaozu approves. Caps are unused outside
@@ -68,22 +68,22 @@ watches:
     alert_mode: relative         # alerts start by themselves as routes arm
     windows:                     # weekend: Fri any time or Sat morning, back Sun
       near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
-             depart_hours: {5: "5-11"}, refresh_hours: 48}
+             depart_hours: {5: "5-11"}, refresh_hours: 72}
   - id: sd
     destinations: [SAN]
     absolute_cap_usd: 150
     alert_mode: relative         # alerts start by themselves as routes arm
     windows:
       near: {days: [7, 42], weekdays: [4, 5], return_weekday: 6,
-             depart_hours: {5: "5-11"}, refresh_hours: 48}
+             depart_hours: {5: "5-11"}, refresh_hours: 72}
   - id: hkg
     destinations: [HKG]
     absolute_cap_usd: 500
     alert_mode: relative         # alerts start by themselves as routes arm
     nights: [28]
     windows:
-      near: {days: [7, 42], step_days: 2, refresh_hours: 48}
-      far: {months: [3, 9], refresh_hours: 72}
+      near: {days: [7, 42], step_days: 2, refresh_hours: 72}
+      far: {months: [3, 9], refresh_hours: 120}
   - id: shanghai
     enabled: false
     destinations: [PVG, SHA]
@@ -91,8 +91,8 @@ watches:
     alert_mode: collect
     nights: [28]
     windows:
-      near: {days: [7, 42], step_days: 2, refresh_hours: 48}
-      far: {months: [3, 9], refresh_hours: 72}
+      near: {days: [7, 42], step_days: 2, refresh_hours: 72}
+      far: {months: [3, 9], refresh_hours: 120}
   - id: beijing
     enabled: false
     destinations: [PEK, PKX]
@@ -100,5 +100,5 @@ watches:
     alert_mode: collect
     nights: [28]
     windows:
-      near: {days: [7, 42], step_days: 2, refresh_hours: 48}
-      far: {months: [3, 9], refresh_hours: 72}
+      near: {days: [7, 42], step_days: 2, refresh_hours: 72}
+      far: {months: [3, 9], refresh_hours: 120}

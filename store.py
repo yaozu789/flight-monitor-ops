@@ -1290,6 +1290,14 @@ def set_backoff(db: sqlite3.Connection, kind: str, until_ts: float,
     add_health(db, "throttle", False, f"{kind}: {detail}")
 
 
+def throttles_since(db: sqlite3.Connection, since_iso: str) -> int:
+    """Throttles persisted by set_backoff since *since_iso* (one health row
+    each; a backoff-gate refusal persists nothing)."""
+    return db.execute(
+        "SELECT COUNT(*) AS n FROM health WHERE check_name = 'throttle' "
+        "AND ok = 0 AND checked_at >= ?", (since_iso,)).fetchone()["n"]
+
+
 def clear_backoff_if_unchanged(db: sqlite3.Connection, seen: dict) -> bool:
     """Delete the throttle row only if it is still exactly the row *seen*
     (same until_ts and updated_at), so a stale success cannot erase a newer

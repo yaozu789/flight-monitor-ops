@@ -274,6 +274,22 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate["checks"]["no_deadline_stops"])
         self.assertFalse(gate["checks"]["no_throttles"])
 
+    def test_one_mid_run_throttle_counts_once(self):
+        """One scheduled CAPTCHA leaves a throttle query row, a throttled
+        slot and one transport health row: one event, not two."""
+        db = self._db(outcomes={"ok": 99, "throttle": 1})
+        db.execute("""INSERT INTO run_slots (slot_id, command, status,
+                      claimed_at) VALUES (2, 'check', 'throttled', ?)""",
+                   ((self.NOW - timedelta(hours=3)).isoformat(),))
+        store.set_backoff(db, "captcha", 0.0, None, "mid-run")
+        db.execute("UPDATE health SET checked_at=? WHERE check_name='throttle'",
+                   ((self.NOW - timedelta(hours=3)).isoformat(
+                       timespec="seconds"),))
+        db.commit()
+        report = fm_run.coverage_report(db, [{"id": "nyc"}], BudgetGuard(db),
+                                        now=self.NOW)
+        self.assertEqual(report["throttle_records"], 1)
+
     def test_manual_search_throttle_blocks_the_step(self):
         """A 429 during a manual narrow/canary search writes no query_log
         or run_slots row, only the transport's health record."""

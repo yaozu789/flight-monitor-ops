@@ -34,6 +34,7 @@ DB contract: budget ledger, run slots, throttle state).
 from __future__ import annotations
 
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import store  # shared DB contract (project store.py)
@@ -293,6 +294,13 @@ class BudgetGuard:
         """The persisted throttle row, active or expired (backoff history)."""
         with self._reserve_lock:
             return store.get_throttle_state(self._reserve_conn())
+
+    def throttles_last_day(self) -> int:
+        """Throttles persisted in the trailing 24 hours."""
+        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(
+            timespec="seconds")
+        with self._reserve_lock:
+            return store.throttles_since(self._reserve_conn(), since)
 
     def clear_throttle_state(self, seen: dict) -> None:
         """A successful response ends a run of consecutive throttles -- but

@@ -129,6 +129,22 @@ class RunLifecycleTests(unittest.TestCase):
         self.assertEqual([a["alert_id"] for a in doc["handoff"]["alerts"]],
                          ["w1:drain1"])
 
+    def test_mid_run_throttle_counts_once(self):
+        """The transport records each throttle in health; the run's own
+        stop note must not count as a second throttle."""
+        db, guard = self._ctx()
+
+        def fn(*a, **k):
+            guard.persist_throttle("captcha", time.time() + 900, None, "x")
+            raise transport.ThrottleDetected("captcha")
+
+        rc = fm_run.run_guarded("check", args_for("check", True), db,
+                                [WATCH], guard, fn)
+        self.assertEqual(rc, 0)
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) AS n FROM health WHERE check_name = 'throttle'"
+        ).fetchone()["n"], 1)
+
     def test_drain_runs_before_slot_noop(self):
         """An already-claimed slot short-circuits collection, but the
         drain already ran."""
