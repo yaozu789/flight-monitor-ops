@@ -479,6 +479,34 @@ class BudgetV3Test(BudgetTransportTest):
         self.assertAlmostEqual(backoff2["until_ts"], t1 + 1800, delta=120)
         self.assertEqual(fake.sends, sends_before + 1)
 
+    def test_third_throttle_in_a_day_holds_six_hours(self):
+        """Google blocks on and off: a clean response between blocks resets
+        the doubling, so the 3rd throttle within 24 h holds at least 6 h."""
+        g = self.make_guard()
+        install_fake_transport(g, mode="http429")  # no retry_after
+        for _ in range(2):  # two earlier blocks, each cleared by a success
+            store.set_backoff(self.db, "captcha", time.time() - 1, None, "x")
+            store.clear_backoff(self.db)
+        t0 = time.time()
+        with self.assertRaises(transport.ThrottleDetected):
+            Session().get("http://example.invalid")
+        self.assertAlmostEqual(store.get_backoff(self.db)["until_ts"],
+                               t0 + 6 * 3600, delta=60)
+
+    def test_throttles_older_than_a_day_do_not_hold(self):
+        g = self.make_guard()
+        install_fake_transport(g, mode="http429")
+        for _ in range(2):
+            store.set_backoff(self.db, "captcha", time.time() - 1, None, "x")
+            store.clear_backoff(self.db)
+        self.db.execute("UPDATE health SET checked_at = '2000-01-01T00:00:00+00:00'")
+        self.db.commit()
+        t0 = time.time()
+        with self.assertRaises(transport.ThrottleDetected):
+            Session().get("http://example.invalid")
+        self.assertAlmostEqual(store.get_backoff(self.db)["until_ts"],
+                               t0 + 900, delta=60)
+
     def test_clean_response_resets_throttle_history(self):
         g = self.make_guard()
         install_fake_transport(g, mode="ok")

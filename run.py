@@ -338,7 +338,8 @@ def run_guarded(cmd_name: str, args, db, watches, guard: BudgetGuard, fn) -> int
             raise
         except ThrottleDetected as e:  # BaseException: caught explicitly
             finish_slot(db, slot, "throttled")
-            add_health(db, "throttle", False,
+            # Not "throttle": the transport already recorded this throttle.
+            add_health(db, "throttle_stop", False,
                        f"throttle mid-run ({e.kind}); backoff persisted")
             rc = _noop("throttle_backoff", kind=e.kind,
                        retry_after_s=e.retry_after_s, slot_id=slot,

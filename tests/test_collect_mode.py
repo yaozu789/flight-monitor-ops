@@ -507,7 +507,8 @@ class StageAConfigTests(unittest.TestCase):
         """The shipped watches.yaml (225 stage, 2026-10-03): Japan, NYC,
         LA, SD and HKG on relative alerts (each route turns itself on once
         armed); demand at the refresh targets fits the mixed-mode gate at
-        the configured 225/day ceiling."""
+        the configured 225/day ceiling. Refresh targets slowed to 72 h near /
+        120 h far (2026-10-14, Google throttling): about 82/day, not 125."""
         _, watches = fm_run.load_config()
         self.assertEqual({w["id"] for w in watches},
                          {"japan", "nyc", "la", "sd", "hkg"})
@@ -522,7 +523,7 @@ class StageAConfigTests(unittest.TestCase):
         fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 10, 4))
         demand = sum(2 * 24 / r["refresh_hours"] for r in db.execute(
             "SELECT refresh_hours FROM cells WHERE active=1"))
-        self.assertTrue(120 <= demand <= 132, demand)
+        self.assertTrue(78 <= demand <= 86, demand)
         self.assertLess(demand, 0.9 * (ceiling - 24 - 12))
 
 class ExploreTests(unittest.TestCase):
@@ -746,8 +747,9 @@ class Phase2ConfigTests(unittest.TestCase):
         fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 10, 1))
         demand = sum(2 * 24 / r["refresh_hours"] for r in db.execute(
             "SELECT refresh_hours FROM cells WHERE active = 1"))
-        # Spec: 197.3-201.3 attempts/day for all seven groups.
-        self.assertTrue(197 <= demand <= 202, demand)
+        # Spec: 197.3-201.3 attempts/day for all seven groups at 48 h/72 h;
+        # about 127 at the slower 72 h/120 h targets.
+        self.assertTrue(122 <= demand <= 132, demand)
         self.assertLess(demand, 0.9 * (300 - 24 - 12))
         per = {}
         for r in db.execute(

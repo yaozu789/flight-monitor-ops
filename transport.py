@@ -51,6 +51,10 @@ from curl_cffi.requests import Session
 import store  # shared DB contract (project store.py)
 
 CAPTCHA_MARKERS = ("unusual traffic", "captcha", "recaptcha")
+# The DAILY_THROTTLE_LIMIT-th throttle within 24 h backs off at least
+# THROTTLE_HOLD_S, whatever the curve or Retry-After says.
+DAILY_THROTTLE_LIMIT = 3
+THROTTLE_HOLD_S = 6 * 3600
 # v3 item 4: body marker identifying a suspect-403 throttle response.
 SUSPECT_403_MARKERS = ("rate-limit", "rate limit", "too many requests")
 
@@ -441,6 +445,10 @@ def _record_throttle(guard, kind, headers, detail="") -> float | None:
         backoff_s = retry_after_s
     else:
         backoff_s = min(900 * 2 ** (consecutive - 1), 14400)
+    # Google blocks on and off: a clean response resets the doubling above,
+    # so repeated blocks in one day also earn a long hold.
+    if guard.throttles_last_day() + 1 >= DAILY_THROTTLE_LIMIT:
+        backoff_s = max(backoff_s, THROTTLE_HOLD_S)
     until = time.time() + backoff_s
     guard.persist_throttle(kind, until, retry_after_s, detail or kind)
     return retry_after_s
