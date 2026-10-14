@@ -1025,13 +1025,14 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
     deadline_stops = stops.get("deadline", 0)
     # Every throttle the transport sees is logged to health (store.
     # set_backoff), including manual narrow/canary searches that write no
-    # query_log or run_slots row; throttled runs and query rows count too.
+    # query_log or run_slots row. One mid-run throttle also leaves a throttle
+    # query row AND a throttled slot, so take the largest single count.
     health_throttles = db.execute(
         """SELECT COUNT(*) AS c FROM health
            WHERE check_name = 'throttle' AND ok = 0 AND checked_at >= ?""",
         (since,)).fetchone()["c"]
-    throttles = max(health_throttles,
-                    queries["throttle"] + stops.get("throttled", 0))
+    throttles = max(health_throttles, queries["throttle"],
+                    stops.get("throttled", 0))
     # History counts only since the CURRENT stage began: the first query at
     # this ceiling after the last query at any other ceiling (a lowered and
     # restored ceiling restarts the clock).
