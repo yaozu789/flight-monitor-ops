@@ -1,5 +1,5 @@
 # Cheap Flight Monitor — watch configuration (Phase 1: japan + nyc)
-# Phase 2 adds: hkg, shanghai, beijing, la, san-diego
+# Phase 2 adds: hkg, shanghai, beijing, la, san-diego; later hawaii
 
 defaults:
   origins: [SFO, OAK, SJC]
@@ -81,6 +81,15 @@ watches:
     absolute_cap_usd: 500
     alert_mode: relative         # alerts start by themselves as routes arm
     nights: [28]
+    windows:
+      near: {days: [7, 42], step_days: 2, refresh_hours: 72}
+      far: {months: [3, 9], refresh_hours: 120}
+  # Island of Hawaii (2026-10-29, Yaozu): Kona + Hilo, a week, near + far.
+  # About 22 requests/day at these refresh targets (82 -> 104).
+  - id: hawaii
+    destinations: [KOA, ITO]
+    alert_mode: relative         # alerts start by themselves as routes arm
+    nights: [7]
     windows:
       near: {days: [7, 42], step_days: 2, refresh_hours: 72}
       far: {months: [3, 9], refresh_hours: 120}

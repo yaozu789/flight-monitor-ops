@@ -508,11 +508,15 @@ class StageAConfigTests(unittest.TestCase):
         LA, SD and HKG on relative alerts (each route turns itself on once
         armed); demand at the refresh targets fits the mixed-mode gate at
         the configured 225/day ceiling. Refresh targets slowed to 72 h near /
-        120 h far (2026-10-14, Google throttling): about 82/day, not 125."""
+        120 h far (2026-10-14, Google throttling): about 82/day, not 125.
+        Hawaii (2026-10-29) adds about 22: about 104/day."""
         _, watches = fm_run.load_config()
         self.assertEqual({w["id"] for w in watches},
-                         {"japan", "nyc", "la", "sd", "hkg"})
+                         {"japan", "nyc", "la", "sd", "hkg", "hawaii"})
         self.assertTrue(all(w["alert_mode"] == "relative" for w in watches))
+        hawaii = next(w for w in watches if w["id"] == "hawaii")
+        self.assertEqual((hawaii["destinations"], hawaii["nights"]),
+                         (["KOA", "ITO"], [7]))
         ceiling = budget.daily_ceiling(watches)
         self.assertEqual(ceiling, 225)
         self.assertEqual(budget.effective_verify_reserve(watches), 24)
@@ -523,7 +527,7 @@ class StageAConfigTests(unittest.TestCase):
         fm_sentinel.mint_sentinels(db, cfg, today=date(2026, 10, 4))
         demand = sum(2 * 24 / r["refresh_hours"] for r in db.execute(
             "SELECT refresh_hours FROM cells WHERE active=1"))
-        self.assertTrue(78 <= demand <= 86, demand)
+        self.assertTrue(100 <= demand <= 109, demand)
         self.assertLess(demand, 0.9 * (ceiling - 24 - 12))
 
 class ExploreTests(unittest.TestCase):
@@ -735,11 +739,11 @@ class Phase2ConfigTests(unittest.TestCase):
     def test_disabled_watches_are_not_loaded(self):
         _, watches = fm_run.load_config()
         self.assertEqual({w["id"] for w in watches},
-                         {"japan", "nyc", "la", "sd", "hkg"})
+                         {"japan", "nyc", "la", "sd", "hkg", "hawaii"})
         off = {w["id"] for w in self._all() if w.get("enabled") is False}
         self.assertEqual(off, {"shanghai", "beijing"})
 
-    def test_all_seven_parse_and_fit_the_300_stage(self):
+    def test_all_eight_parse_and_fit_the_300_stage(self):
         from datetime import date
         db = fresh_db(self)
         watches = self._all()
@@ -748,8 +752,8 @@ class Phase2ConfigTests(unittest.TestCase):
         demand = sum(2 * 24 / r["refresh_hours"] for r in db.execute(
             "SELECT refresh_hours FROM cells WHERE active = 1"))
         # Spec: 197.3-201.3 attempts/day for all seven groups at 48 h/72 h;
-        # about 127 at the slower 72 h/120 h targets.
-        self.assertTrue(122 <= demand <= 132, demand)
+        # about 127 at the slower 72 h/120 h targets; about 149 with Hawaii.
+        self.assertTrue(144 <= demand <= 154, demand)
         self.assertLess(demand, 0.9 * (300 - 24 - 12))
         per = {}
         for r in db.execute(
@@ -772,6 +776,10 @@ class Phase2ConfigTests(unittest.TestCase):
             far = per.pop((gid, "far"))
             self.assertTrue(24 <= far["n"] <= 27 and far["dur"] == {28},
                             (gid, far))
+        near = per.pop(("hawaii", "near"))
+        self.assertEqual((near["n"], near["dur"]), (18, {7}))
+        far = per.pop(("hawaii", "far"))
+        self.assertTrue(24 <= far["n"] <= 27 and far["dur"] == {7}, far)
         nyc = per.pop(("nyc", "near"))
         self.assertEqual((nyc["n"], nyc["dur"]), (36, {7, 14}))
         self.assertEqual(per, {})

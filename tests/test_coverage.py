@@ -340,6 +340,46 @@ class GateTests(unittest.TestCase):
         db.commit()
         self.assertFalse(self._gate(db)["checks"]["history_days"])
 
+    def test_group_added_mid_stage_restarts_the_clock(self):
+        """A new watch's fresh cells pass the refresh check at once, so its
+        own 5 days at this ceiling must count, not the older groups'."""
+        db = self._db(outcomes={"ok": 100})
+        watches = [{"id": "nyc"}, {"id": "hawaii"}]
+        report = fm_run.coverage_report(db, watches, BudgetGuard(db),
+                                        now=self.NOW)
+        self.assertFalse(report["gate"]["checks"]["history_days"])
+        db.execute(
+            """INSERT INTO query_log (at, slot, group_id, window_name,
+               category, outcome, ceiling) VALUES (?, 1, 'hawaii', 'near',
+               'sentinel', 'ok', 150)""",
+            ((self.NOW - timedelta(days=2)).isoformat(timespec="seconds"),))
+        db.commit()
+        report = fm_run.coverage_report(db, watches, BudgetGuard(db),
+                                        now=self.NOW)
+        self.assertFalse(report["gate"]["checks"]["history_days"])
+        db.execute("UPDATE query_log SET at=? WHERE group_id='hawaii'",
+                   ((self.NOW - timedelta(days=6)).isoformat(
+                       timespec="seconds"),))
+        db.commit()
+        report = fm_run.coverage_report(db, watches, BudgetGuard(db),
+                                        now=self.NOW)
+        self.assertTrue(report["gate"]["checks"]["history_days"])
+
+    def test_new_group_query_at_previous_stage_does_not_count(self):
+        """Same second as the stage's first query, but at the old ceiling."""
+        db = self._db(outcomes={"ok": 100}, old_history=False)
+        at = (self.NOW - timedelta(days=6)).isoformat(timespec="seconds")
+        for group, ceiling in (("hawaii", 100), ("nyc", 150)):
+            db.execute(
+                """INSERT INTO query_log (at, slot, group_id, window_name,
+                   category, outcome, ceiling) VALUES (?, 1, ?, 'near',
+                   'sentinel', 'ok', ?)""", (at, group, ceiling))
+        db.commit()
+        report = fm_run.coverage_report(
+            db, [{"id": "nyc"}, {"id": "hawaii"}], BudgetGuard(db),
+            now=self.NOW)
+        self.assertFalse(report["gate"]["checks"]["history_days"])
+
     def test_configured_window_without_cells_fails(self):
         db = self._db(outcomes={"ok": 100})
         watch = {"id": "nyc", "origins": ["SFO"], "destinations": ["JFK"],
