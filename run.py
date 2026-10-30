@@ -1041,7 +1041,14 @@ def coverage_report(db, watches, guard, days: int = GATE_DAYS,
            WHERE ceiling = ? AND id > COALESCE(
                (SELECT MAX(id) FROM query_log WHERE ceiling IS NOT ?), 0)""",
         (guard.daily_ceiling, guard.daily_ceiling)).fetchone()["a"]
-    ratios = [r["p95_ratio"] for r in refresh]
+    # A group added mid-stage (a new watch) restarts the clock as well:
+    # history starts at the latest first query of any configured group.
+    if first:
+        starts = [db.execute(
+            "SELECT MIN(at) AS a FROM query_log WHERE group_id = ? AND at >= ?",
+            (w["id"], first)).fetchone()["a"] for w in watches]
+        first = max([first] + starts) if all(starts) else None
+    ratios =[r["p95_ratio"] for r in refresh]
     worst = (None if not ratios or None in ratios else max(ratios))
     checks = {
         "history_days": bool(first) and first <= since,

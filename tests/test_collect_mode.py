@@ -514,6 +514,9 @@ class StageAConfigTests(unittest.TestCase):
         self.assertEqual({w["id"] for w in watches},
                          {"japan", "nyc", "la", "sd", "hkg", "hawaii"})
         self.assertTrue(all(w["alert_mode"] == "relative" for w in watches))
+        hawaii = next(w for w in watches if w["id"] == "hawaii")
+        self.assertEqual((hawaii["destinations"], hawaii["nights"]),
+                         (["KOA", "ITO"], [7]))
         ceiling = budget.daily_ceiling(watches)
         self.assertEqual(ceiling, 225)
         self.assertEqual(budget.effective_verify_reserve(watches), 24)
