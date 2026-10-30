@@ -365,6 +365,21 @@ class GateTests(unittest.TestCase):
                                         now=self.NOW)
         self.assertTrue(report["gate"]["checks"]["history_days"])
 
+    def test_new_group_query_at_previous_stage_does_not_count(self):
+        """Same second as the stage's first query, but at the old ceiling."""
+        db = self._db(outcomes={"ok": 100}, old_history=False)
+        at = (self.NOW - timedelta(days=6)).isoformat(timespec="seconds")
+        for group, ceiling in (("hawaii", 100), ("nyc", 150)):
+            db.execute(
+                """INSERT INTO query_log (at, slot, group_id, window_name,
+                   category, outcome, ceiling) VALUES (?, 1, ?, 'near',
+                   'sentinel', 'ok', ?)""", (at, group, ceiling))
+        db.commit()
+        report = fm_run.coverage_report(
+            db, [{"id": "nyc"}, {"id": "hawaii"}], BudgetGuard(db),
+            now=self.NOW)
+        self.assertFalse(report["gate"]["checks"]["history_days"])
+
     def test_configured_window_without_cells_fails(self):
         db = self._db(outcomes={"ok": 100})
         watch = {"id": "nyc", "origins": ["SFO"], "destinations": ["JFK"],
