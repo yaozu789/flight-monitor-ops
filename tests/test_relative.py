@@ -197,11 +197,14 @@ class AlertPathTests(unittest.TestCase):
 
 class ReportTests(unittest.TestCase):
     def test_digest_and_coverage_show_route_readiness(self):
+        # Seen earlier TODAY: before 02:00 UTC, "2 h ago" would be yesterday,
+        # which counts as history.
+        seen = max(NOW - timedelta(hours=2),
+                   NOW.replace(hour=0, minute=0, second=0))
         db = fresh_db(self)
         seed_history(db)
-        obs(db, NOW - timedelta(hours=2), TODAY + timedelta(days=16), 390.0)
-        obs(db, NOW - timedelta(hours=2), TODAY + timedelta(days=16), 380.0,
-            origin="OAK")
+        obs(db, seen, TODAY + timedelta(days=16), 390.0)
+        obs(db, seen, TODAY + timedelta(days=16), 380.0, origin="OAK")
         both = dict(WATCH, origins=["SFO", "OAK"])
         text = weekly.build_report(db, [both], NOW, "2026-W41")
         # The cheapest fare is the OAK leg, which has no history of its own.
@@ -210,7 +213,7 @@ class ReportTests(unittest.TestCase):
                       "0/14 days)", text)
         db2 = fresh_db(self)
         seed_history(db2)
-        obs(db2, NOW - timedelta(hours=2), TODAY + timedelta(days=16), 390.0)
+        obs(db2, seen, TODAY + timedelta(days=16), 390.0)
         text = weekly.build_report(db2, [WATCH], NOW, "2026-W41")
         self.assertIn("typical $400 for SFO -> JFK (median of 60 daily lows)",
                       text)
