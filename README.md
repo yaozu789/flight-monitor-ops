@@ -1,6 +1,6 @@
 # Flight Monitor
 
-A personal cheap-flight radar. It watches round trips from the San Francisco Bay Area (SFO/OAK/SJC) and sends an alert only when a fare is **unusually cheap for its route**: at most 70% of that route's typical price over the last 28 days, and still that price on a live recheck of the exact itinerary.
+A personal cheap-flight radar. It watches round trips from the San Francisco Bay Area (SFO/OAK/SJC) and sends an alert only when a fare is **unusually cheap for its route**: at most 70% of that route's typical price over the last 28 days, and still at or below that on a live recheck of the exact itinerary.
 
 - **Destinations and trips** (`watches.yaml`): Japan and Hong Kong for about 4 weeks, departing 1–6 weeks or 3–9 months out; New York for 1 or 2 weeks, departing 1–6 weeks out; LA and San Diego for weekend trips (leave Friday or Saturday morning, back Sunday). Economy, at most 1 stop.
 - **Data:** Google Flights through the [fli](https://github.com/punitarani/fli) library (pinned commit, see `requirements.txt`).
@@ -19,7 +19,7 @@ This is a personal project, shared so the design and engineering can be read. It
 
 ## How the modules connect
 
-An arrow means "is used by". `run.py` imports all 14 modules, so its arrows are left out except for the top layer.
+An arrow means "is used by". Only top-level imports are shown; a few functions import other modules lazily. `run.py` imports all 14 modules, so its arrows are left out except for the top layer.
 
 ```mermaid
 graph TD
@@ -40,7 +40,7 @@ graph TD
 | File | Job |
 |---|---|
 | `run.py` | The CLI and only entry point. `check --scheduled` is the 30-minute cycle: lock, drain queued alerts, collect, score, verify, queue, heartbeat. |
-| `sentinel.py` | Picks which departure dates to search each run: every date in each watch's windows, each rechecked on its own target (72 h near-term, 120 h far-out), most overdue first. A verified deal starts a "burst" that searches nearby dates. |
+| `sentinel.py` | Picks which departure dates to search each run: every 2nd day in near-term windows (Fridays and Saturdays for weekend trips) and about 27 dates spread over far-out windows, each rechecked on its own target (72 h near-term, 120 h far-out), most overdue first. A verified deal starts a "burst" that searches nearby dates. |
 | `poller.py` | Runs the actual Google Flights searches through fli (broad scan and exact-date search). |
 | `transport.py` | Wraps every real HTTP request fli makes: counts it against the budget, and backs off on 429s, CAPTCHAs and blank pages (at least 6 hours after the 3rd block in a day). |
 | `budget.py` | The daily request limit (`daily_ceiling` in `watches.yaml`, now 225/day) with per-category caps. Refuses requests once they are spent. |
