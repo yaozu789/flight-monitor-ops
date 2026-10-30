@@ -59,7 +59,7 @@ Source: Codex + Claude review of your deploy plan (issue #5).
   - Expected: a normal cycle of about 4–12 HTTP attempts, exit 0, a heartbeat success recorded in `health`.
 - **B3. Relay test.**
   - Relay a message that is **clearly labeled TEST, not a real deal**, through the same chat + push path.
-  - Yaozu confirms it reached his phone. Don't insert fake deals into the DB.
+  - Yaozu confirms it reached their phone. Don't insert fake deals into the DB.
 - **B4. Quota measurement.**
   - Do one more hand run at least 30 min after B2, the same way.
   - Report the quota % before and after each run (full agent turns, including relay).
