@@ -1,6 +1,6 @@
 # Flight Monitor: context for Claude Code
 
-Personal cheap-flight radar for Yaozu. It watches SFO/OAK/SJC round trips to destination groups (Japan, NYC, LA, SD and HKG live; Shanghai and Beijing configured but off), in named departure windows with fixed trip lengths (`watches.yaml`), economy, ≤1 stop. It alerts only on **rechecked** fares at or below 70% of the route's typical price (relative mode; the original absolute-cap mode is still supported). Honest framing: best-effort sampled coverage, "price rechecked", never "bookable".
+Personal cheap-flight radar for Yaozu. It watches SFO/OAK/SJC round trips to destination groups (Japan, NYC, LA, SD, HKG and the Island of Hawaii live; Shanghai and Beijing configured but off), in named departure windows with fixed trip lengths (`watches.yaml`), economy, ≤1 stop. It alerts only on **rechecked** fares at or below 70% of the route's typical price (relative mode; the original absolute-cap mode is still supported). Honest framing: best-effort sampled coverage, "price rechecked", never "bookable".
 
 ## Roles (see `WORKFLOW.md`)
 - **Claude Code:** writes code and tests, opens PRs from `claude/<topic>` branches, and merges after CI is green and review has no blocking objections.

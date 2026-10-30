@@ -2,7 +2,7 @@
 
 A personal cheap-flight radar. It watches round trips from the San Francisco Bay Area (SFO/OAK/SJC) and sends an alert only when a fare is **unusually cheap for its route**: at most 70% of that route's typical price over the last 28 days, and still at or below that on a live recheck of the exact itinerary.
 
-- **Destinations and trips** (`watches.yaml`): Japan and Hong Kong for about 4 weeks, departing 1–6 weeks or 3–9 months out; New York for 1 or 2 weeks, departing 1–6 weeks out; LA and San Diego for weekend trips (leave Friday or Saturday morning, back Sunday). Economy, at most 1 stop.
+- **Destinations and trips** (`watches.yaml`): Japan and Hong Kong for about 4 weeks, departing 1–6 weeks or 3–9 months out; New York for 1 or 2 weeks, departing 1–6 weeks out; LA and San Diego for weekend trips (leave Friday or Saturday morning, back Sunday); the Island of Hawaii (Kona or Hilo) for a week, departing 1–6 weeks or 3–9 months out. Economy, at most 1 stop.
 - **Data:** Google Flights through the [fli](https://github.com/punitarani/fli) library (pinned commit, see `requirements.txt`).
 - **Runs on:** Muse's scheduler, as an agent turn every 30 minutes that runs `run.py check --scheduled` and relays alerts verbatim to Yaozu's phone. Requests are capped per day, and the monitor backs off when Google pushes back.
 - **Built by:** Claude Code writes the code, Codex reviews, CI grades, Yaozu approves every deploy. See `WORKFLOW.md`; the deploy runbooks Muse follows are in `ops/muse-inbox/`.
